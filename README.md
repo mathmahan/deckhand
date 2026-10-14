@@ -45,7 +45,7 @@ and keep saves and save states in sync with your server.
 
 ## Getting started
 
-Download the AppImage (Linux, Steam Deck) or the `.exe` (Windows, largely untried) from
+Download the AppImage (Linux, Steam Deck) from
 [Releases](https://github.com/mathmahan/deckhand/releases), then run it:
 
 ```sh
