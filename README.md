@@ -88,18 +88,6 @@ Games play through RetroDECK. Install it from Flathub, then open it once to set 
 flatpak install flathub net.retrodeck.retrodeck
 ```
 
-Without RetroDECK, choose *Your own command…* under Settings ▸ Playing ▸ *Default emulator*. That
-command starts every game. `{rom}` is replaced by the game's file (or added at the end if you
-leave it out), and `{system}` by its ES-DE system name, such as `snes`, `psx` or `gc`. For example:
-
-```sh
-# RetroArch with one core. The -L also tells save sync which core runs the game.
-retroarch -L /usr/lib/libretro/snes9x_libretro.so {rom}
-
-# The RetroArch Flatpak
-flatpak run org.libretro.RetroArch -L /home/deck/.var/app/org.libretro.RetroArch/config/retroarch/cores/mgba_libretro.so {rom}
-```
-
 To give one system its own emulator, such as a PCSX2 you installed yourself, use Settings ▸ Playing ▸
 *Emulator for each system*. Choose the emulator (a program, an AppImage, or a Flatpak) and
 Deckhand fills in the usual options for it, for you to check:
