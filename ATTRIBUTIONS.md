@@ -1,26 +1,24 @@
 # Attributions
 
-Data files bundled into Deckhand that come from elsewhere. Each notice below must be preserved.
+Code and data bundled into Deckhand that come from elsewhere. Each notice below must be preserved.
 
-## PlayStation 2 serial catalogue
+## argosy-sigil
 
-`data/ps2-serials.json` maps PlayStation 2 disc serials to titles, which is how a PCSX2 folder
-memory card's save folders — named by serial — are matched to a RomM game.
+Save sync reads and writes emulator saves through argosy-sigil, RomM's save library, compiled into
+the binary from the `third_party/argosy-sigil` submodule, unmodified.
 
-- Source: **niemasd/GameDB-PS2** — <https://github.com/niemasd/GameDB-PS2>
-- License: **GNU General Public License v3.0 (GPL-3.0)** —
-  <https://github.com/niemasd/GameDB-PS2/blob/main/LICENSE>
-- Modifications: reduced to `serial → title`, by way of the Kotlin Deckhand's copy.
+- Source: **rommapp/argosy-sigil** — <https://github.com/rommapp/argosy-sigil>
+- License: **Mozilla Public License 2.0 (MPL-2.0)** — `third_party/argosy-sigil/LICENSE`. Its source
+  files carry no *Incompatible With Secondary Licenses* notice, so a GPL-3.0 build may include them;
+  the MPL still covers those files, and their source stays available at the link above.
+- Its Sega CD backup RAM reader takes a table from **superctr/buram** (MIT) —
+  `third_party/argosy-sigil/licenses/buram-MIT.txt`.
 
-## PlayStation Portable serial catalogue
+It brings these, compiled in with it:
 
-`data/psp-serials.json` is the PSP counterpart, matching PPSSPP `SAVEDATA` folders to RomM games.
-
-- Source: **niemasd/GameDB-PSP** — <https://github.com/niemasd/GameDB-PSP>
-- License: **GNU General Public License v3.0 (GPL-3.0)** —
-  <https://github.com/niemasd/GameDB-PSP/blob/main/LICENSE>
-- Modifications: reduced to `serial → title`, by way of the Kotlin Deckhand's copy.
-
-> **Copyleft note:** both catalogues are GPL-3.0 and compiled into the binary, so a distributed build
-> carries their obligations. Deckhand is itself GPL-3.0, which is what satisfies them. Relicensing
-> the project to anything permissive would mean unbundling these first.
+- **libchdr** — <https://github.com/rtissera/libchdr> — BSD 3-Clause,
+  `third_party/argosy-sigil/third_party/libchdr/LICENSE.txt`.
+- **zlib** 1.3.1 — zlib License, in `libchdr/deps/zlib-1.3.1`.
+- **Zstandard** 1.5.6 — BSD, `libchdr/deps/zstd-1.5.6/LICENSE`.
+- **LZMA SDK** 24.05 — public domain.
+- **tiny-AES-c** — <https://github.com/kokke/tiny-AES-c> — The Unlicense (public domain).

@@ -1,4 +1,6 @@
-//! Two-way battery-save sync with RomM — RetroArch's `.srm` files, to begin with.
+//! Two-way save sync with RomM. Every game downloaded here has its saves found, packed and put back
+//! by argosy-sigil, whatever runs it — see [`units`]; RetroArch's other `.srm` files, of games
+//! played here that were not downloaded through this app, sync as the files they are.
 //!
 //! A port of the per-game half of the Kotlin app's `SaveSyncEngine` (`syncGameSaves`), the half
 //! that decides from facts rather than from clocks:
@@ -36,6 +38,7 @@ pub mod hash;
 pub mod session;
 pub mod standalone;
 pub mod states;
+pub mod units;
 pub use names::{canonical, format_timestamp, parse_timestamp};
 #[cfg(test)]
 pub use names::format_timestamp_precise;
@@ -116,9 +119,10 @@ pub fn on_device(store: &Path) -> HashSet<i64> {
                 .filter(|(key, entry)| {
                     // A set that lies flat on a card it shares records its own files: a Dolphin
                     // memory card's folder is there as long as Dolphin is, so without them the save
-                    // would read as here long after its `.gci`s were deleted.
+                    // would read as here long after its `.gci`s were deleted. A sigil unit on a PCSX2
+                    // folder card records the card, which is a folder.
                     if let Some(files) = &entry.files {
-                        return files.iter().any(|file| Path::new(file).is_file());
+                        return files.iter().any(|file| Path::new(file).exists());
                     }
                     let key = Path::new(key);
                     // A standalone set is keyed on a name no file has, beside or inside the folder it
@@ -322,6 +326,22 @@ pub async fn run(
     let games: Vec<&crate::launch::Plan> = games.iter().filter(|g| matcher.holds(g)).collect();
     for game in &games {
         let stamp = matcher.stamp(game.rom_id).or_else(|| game.stamp.clone());
+        // Through sigil, whatever runs it — see [`units`]. The engine before is what a game sigil
+        // cannot take keeps.
+        let found = runner(game).map(|runner| units::thread(units::Game::of(game, stamp.as_ref()), runner, Ok(install)));
+        if let Some(found) = found {
+            match found {
+                Ok(thread) => {
+                    // A copy the folders turned up for this game that is not this unit's — another
+                    // core's folder — is set down again, and counted with the rest left as they are.
+                    others += threads.iter().filter(|t| t.rom_id == game.rom_id && !thread.covers(&t.paths())).count();
+                    threads.retain(|t| t.rom_id != game.rom_id);
+                    threads.push(thread);
+                    continue;
+                }
+                Err(why) => notes.push(format!("{}: synced as before sigil, since {why}", game.title)),
+            }
+        }
         match game.emulator.syncs() {
             Some(core) => {
                 let saves = install.for_game(&game.rom, core).game_saves(&game.rom, core);
@@ -444,6 +464,14 @@ async fn changed_states(
     report
 }
 
+/// What runs `game`, as [`units`] takes it — None for an emulator whose saves are not synced.
+fn runner(game: &crate::launch::Plan) -> Option<units::Runner<'_>> {
+    match &game.emulator {
+        crate::launch::Emulator::Other(name) => standalone::Emulator::for_launch(&game.system, name).map(units::Runner::Standalone),
+        emulator => emulator.syncs().map(units::Runner::RetroArch),
+    }
+}
+
 /// The game a local save belongs to: the one it was matched to before, else by its name.
 fn rom_of(matcher: &Matcher, index: &Index, save: &LocalSave) -> Match {
     // A save matched once stays with that game: a rename in the library must not move it. Only while
@@ -468,6 +496,11 @@ fn modified(path: &Path) -> Option<SystemTime> {
 /// `install` is RetroArch's, which only a game RetroArch runs needs — a standalone emulator's game
 /// goes on without one.
 pub fn threads_of(install: Result<&Install, &str>, game: &crate::launch::Plan) -> Result<Vec<Thread>, String> {
+    if let Some(runner) = runner(game)
+        && let Ok(thread) = units::thread(units::Game::of(game, game.stamp.as_ref()), runner, install)
+    {
+        return Ok(vec![thread]);
+    }
     match game.emulator.syncs() {
         Some(core) => {
             let install = install.map_err(str::to_string)?;
@@ -493,14 +526,26 @@ pub async fn restore(
     version: &SaveAsset,
 ) -> Result<Report, String> {
     let threads = threads_of(install, game)?;
-    let thread = threads
+    // A version from before the game moved onto sigil is in the shape before, which the engine
+    // before puts back; the next sync sends the game's unit up from it.
+    let mut places = threads.clone();
+    for thread in &threads {
+        if let Place::Sigil(unit) = &thread.place {
+            places.extend(unit.legacy.iter().cloned());
+            if let Some((emulator, rom, title)) = &unit.legacy_source {
+                let name = names::canonical(&version.file_name);
+                places.extend(standalone::legacy_threads(*emulator, rom, title, thread.rom_id, thread.stamp.as_ref(), &[name]));
+            }
+        }
+    }
+    let thread = places
         .iter()
         .find(|t| session::holds(t, version))
         .ok_or_else(|| format!("there is no place on this device that {} goes", version.file_name))?;
     session::restore(client, connection, store, thread, version).await
 }
 
-/// A RetroArch battery save as a thread of its game's `autosave` slot.
+/// A RetroArch battery save as a thread of its game's `autosave` slot — the engine before sigil.
 fn retroarch_thread(rom_id: i64, stamp: Option<Stamp>, save: &LocalSave) -> Thread {
     Thread {
         rom_id,
@@ -570,7 +615,8 @@ pub async fn sync_game(
     plays: Vec<PlaySession>,
 ) -> Result<Report, String> {
     let rom_id = find_rom(builds, rom)?;
-    sync_rom(client, connection, install, store, rom, core, rom_id, stamp_of(builds, rom_id).as_ref(), plays).await
+    let system = builds.iter().find(|b| b.rom_id == rom_id).map(|b| b.system_id.clone()).unwrap_or_default();
+    sync_rom(client, connection, install, store, rom, &system, core, rom_id, stamp_of(builds, rom_id).as_ref(), plays).await
 }
 
 /// Whether RomM still holds, under `rom_id`, the game `is` recognises — asked of RomM itself before a
@@ -611,7 +657,8 @@ pub fn find_rom(builds: &[Build], rom: &Path) -> Result<i64, String> {
 /// library".
 ///
 /// The save goes through a sync session where RomM holds them ([`session`]), closing it with `plays`
-/// — the play session a launch just ended — and the way before that where RomM does not.
+/// — the play session a launch just ended — and the way before that where RomM does not. `system`
+/// is the game's, ES-DE's name or RomM's: what tells sigil which console's saves these are.
 #[allow(clippy::too_many_arguments)]
 pub async fn sync_rom(
     client: &RommClient,
@@ -619,6 +666,7 @@ pub async fn sync_rom(
     install: &Install,
     store: &Path,
     rom: &Path,
+    system: &str,
     core: Option<&str>,
     rom_id: i64,
     stamp: Option<&Stamp>,
@@ -631,15 +679,31 @@ pub async fn sync_rom(
     let saves = install.game_saves(rom, core);
     let folder = saves.target.as_ref().or(saves.existing.first()).and_then(|s| s.path.parent()).unwrap_or(&install.saves);
 
-    let threads: Vec<Thread> = launched(&saves).map(|save| retroarch_thread(rom_id, stamp.cloned(), save)).into_iter().collect();
+    let title = rom.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let game = units::Game { rom_id, rom, system, title: &title, stamp };
+    let mut notes = Vec::new();
+    let (threads, folder): (Vec<Thread>, PathBuf) = match units::thread(game, units::Runner::RetroArch(core), Ok(install)) {
+        Ok(thread) => {
+            let root = match &thread.place {
+                Place::Sigil(unit) => unit.request.root.clone(),
+                _ => folder.to_path_buf(),
+            };
+            (vec![thread], root)
+        }
+        Err(why) => {
+            notes.push(format!("{name}: synced as before sigil, since {why}"));
+            (launched(&saves).map(|save| retroarch_thread(rom_id, stamp.cloned(), save)).into_iter().collect(), folder.to_path_buf())
+        }
+    };
     let mut report = match session::sync(client, connection, store, threads, &[rom_id], plays, &|_| None).await? {
-        Outcome::Done(report) => Report { folder: folder.to_path_buf(), ..*report },
+        Outcome::Done(report) => Report { folder: folder.clone(), ..*report },
         Outcome::Unsupported(why) => {
-            let mut report = legacy_rom(client, connection, store, folder, &saves, rom_id, stamp).await?;
+            let mut report = legacy_rom(client, connection, store, &folder, &saves, rom_id, stamp).await?;
             report.notes.push(format!("synced without a RomM sync session: {why}"));
             report
         }
     };
+    report.notes.extend(notes);
     if saves.existing.is_empty() && saves.target.is_none() && !std::mem::take(&mut report.homeless).is_empty() {
         report.notes.push(format!(
             "{name} has no save here yet, and RetroArch files saves by core — without knowing which core \

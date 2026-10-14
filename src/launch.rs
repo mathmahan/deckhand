@@ -609,7 +609,7 @@ async fn sync_save(ctx: &Context, conn: &Connection, plan: &Plan, core: Option<&
         Ok(install) => install,
         Err(why) => return (vec![format!("saves not synced: {why}")], 0),
     };
-    match sync::sync_rom(&ctx.client, conn, &install, &ctx.store, &plan.rom, core, plan.rom_id, plan.stamp.as_ref(), plays).await {
+    match sync::sync_rom(&ctx.client, conn, &install, &ctx.store, &plan.rom, &plan.system, core, plan.rom_id, plan.stamp.as_ref(), plays).await {
         Ok(report) => (save_notes(&report), report.plays_recorded),
         Err(why) => (vec![format!("saves not synced: {why}")], 0),
     }

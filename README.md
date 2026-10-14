@@ -33,13 +33,35 @@ and keep saves and save states in sync with your server.
 - **Playing.** Games start through RetroDECK, a command of your own, or an emulator picked per
   system, such as a PCSX2 you installed yourself. They can resume from their newest save state.
   RomM 5.4's web app shows the game as being played on the Deck.
-- **Save sync.** Battery saves and save states sync both ways through RomM: around every launch,
-  and while the window is open, as soon as a save changes. An older save can be restored from a
-  game's Saves page.
+- **Save sync.** Saves and save states sync both ways through RomM: around every launch, and while
+  the window is open, as soon as a save changes. An older save can be restored from a game's Saves
+  page. See [Save sync](#save-sync) for what each system syncs.
 - **Steam and ES-DE.** Downloaded games can be added to Steam with their art, and still sync when
   started there. Games started from ES-DE sync too, through hooks Deckhand installs.
 - **Made for a pad.** The d-pad reaches every page and button, and L1/R1 move between tabs.
 - **Updates itself** from this repository's releases.
+
+## Save sync
+
+Saves go through [argosy-sigil](https://github.com/rommapp/argosy-sigil), RomM's own save library:
+it reads each game's id off its disc and finds that game's saves in the emulator's folders, even on a
+memory card every game shares. A game's saves travel as one file in its `autosave` slot, in the same
+shape RomM's Android app syncs. Saves put on RomM by earlier versions of Deckhand are read and moved
+over on each game's first sync.
+
+| Platform | Emulator | What syncs |
+|---|---|---|
+| Everything RetroArch runs | RetroArch, any core | ✅ Saves and save states, memory cards and backup RAM included |
+| PlayStation 2 | PCSX2 | ✅ The game's saves off a folder or file memory card, save states |
+| PSP | PPSSPP | ✅ Save folders, save states |
+| PlayStation | DuckStation | ✅ Memory cards |
+| PlayStation 3 | RPCS3 | ✅ Save folders |
+| PS Vita | Vita3K | ✅ Save folders |
+| GameCube | Dolphin | ✅ Memory card saves, save states |
+| Wii | Dolphin | ✅ Saves, save states |
+| Wii U | Cemu | ✅ Saves |
+| 3DS | Azahar | ✅ Saves and extra data |
+| Switch, Xbox, Xbox 360 | — | ❌ Not synced yet |
 
 ![Browse](screenshots/browse.jpg)
 
@@ -90,11 +112,16 @@ Deckhand fills in the usual options for it, for you to check:
 /var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu -b -e {rom}
 ```
 
-Saves sync for RetroArch, and on Linux for PCSX2, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar and Cemu.
+Saves sync for RetroArch, and on Linux for PCSX2, DuckStation, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar
+and Cemu — see [Save sync](#save-sync).
 
 ## Building
 
+Save sync is built on [argosy-sigil](https://github.com/rommapp/argosy-sigil), a C library kept as a
+git submodule, so a build needs it checked out, and CMake and a C compiler to build it:
+
 ```sh
+git submodule update --init --recursive
 cargo run                      # the app
 cargo run -- --fixtures=60     # 60 made-up games, no server needed
 cargo test

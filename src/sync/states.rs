@@ -501,7 +501,7 @@ mod tests {
             let install = super::super::retroarch::read(&self.0.join("ra/retroarch.cfg")).unwrap();
             let conn = Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None };
             let rom = self.0.join(format!("games/snes/{CHRONO}.sfc"));
-            super::super::sync_rom(&RommClient::new().unwrap(), &conn, &install, &self.0.join("store"), &rom, Some("snes9x"), 1, None, Vec::new())
+            super::super::sync_rom(&RommClient::new().unwrap(), &conn, &install, &self.0.join("store"), &rom, "snes", Some("snes9x"), 1, None, Vec::new())
                 .await
                 .unwrap()
         }

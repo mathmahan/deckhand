@@ -25,6 +25,9 @@ jobs:
       CARGO_TARGET_DIR: /build/target
     steps:
       - uses: actions/checkout@v6
+        with:
+          # argosy-sigil, the save library build.rs compiles, and the libraries it vendors.
+          submodules: recursive
 
       # The updater compares the tag with the version the binary was built as. A tag ahead of
       # Cargo.toml would be offered again and again, as each install of it is still the old version.
@@ -39,7 +42,7 @@ jobs:
       - name: Install Rust and the libraries it links
         run: |
           apt-get update -qq
-          apt-get install -y -qq libudev-dev pkg-config file jq >/dev/null
+          apt-get install -y -qq libudev-dev pkg-config cmake file jq >/dev/null
           if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
           fi

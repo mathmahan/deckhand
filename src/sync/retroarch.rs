@@ -397,6 +397,35 @@ impl Install {
         Ok(dir)
     }
 
+    /// RetroArch's `system_directory`, where some cores keep their saves too: LRPS2 its memory cards
+    /// under `pcsx2/memcards`, Flycast its VMUs under `dc`.
+    pub fn system_dir(&self) -> Option<PathBuf> {
+        self.settings.get("system_directory").and_then(|raw| resolve(raw, &self.config))
+    }
+
+    /// The core options `core` (an id) runs `rom` with, in RetroArch's own order: the global file,
+    /// then the core's `.opt`, the content folder's and the game's, each over the last. Which file a
+    /// save is in can turn on them — a PS1 core's memory card method, a Sega CD core's backup RAM.
+    pub fn core_options(&self, rom: &Path, core: &str) -> HashMap<String, String> {
+        let global = self
+            .settings
+            .get("core_options_path")
+            .and_then(|raw| resolve(raw, &self.config))
+            .unwrap_or_else(|| self.config.parent().unwrap_or(Path::new(".")).join("retroarch-core-options.cfg"));
+        let mut options = fs::read_to_string(global).map(|text| parse(&text)).unwrap_or_default();
+        if let Some(name) = self.core_name(core) {
+            let dir = self.overrides.join(name);
+            let content = rom.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().into_owned());
+            let stem = rom.file_stem().map(|n| n.to_string_lossy().into_owned());
+            for file in [Some(name.to_string()), content, stem].into_iter().flatten() {
+                if let Ok(text) = fs::read_to_string(dir.join(format!("{file}.opt"))) {
+                    options.extend(parse(&text));
+                }
+            }
+        }
+        options
+    }
+
     /// The folder name RetroArch sorts a core's saves under, from its id.
     pub fn core_name(&self, id: &str) -> Option<&str> {
         self.cores.get(id).map(String::as_str)

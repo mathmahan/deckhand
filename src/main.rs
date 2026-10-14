@@ -28,6 +28,7 @@ mod memory;
 mod qr_pairing;
 mod release;
 mod search;
+mod sigil;
 mod steam;
 mod romm;
 #[cfg(test)]

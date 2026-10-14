@@ -1,6 +1,11 @@
 //! The saves of the standalone emulators RetroDECK runs by default — Dolphin for GameCube and Wii,
 //! PCSX2 for PlayStation 2, PPSSPP for PSP — kept in step with RomM one game at a time.
 //!
+//! **Since sigil**, a game's saves go through [`super::units`], and what this module packs itself is
+//! the shape before: the one a game's first sync through sigil settles RomM's copies in, and the one
+//! a game sigil cannot take still syncs in — see [`sigil_request`] for where each emulator is found.
+//! The rest of these notes are that shape's.
+//!
 //! A port of the Kotlin app's `GameCubeHandler`, `Pcsx2Handler` and `PspHandler`, in the same model
 //! and the same server format, so the two apps sync with each other: **a game's saves are a set of
 //! files, and the set travels as one zip**. RomM gets `<asset>.zip` in the game's save history; what
@@ -35,15 +40,14 @@
 //! often does not; one that will not load is refused by Dolphin with a message, and the game's own
 //! save, synced separately, is untouched.
 //!
-//! A PS2 or PSP folder is named after the disc serial, which nothing in RomM carries, so the bundled
-//! GameDB catalogues (`data/`, GPL-3.0, see `ATTRIBUTIONS.md`) map the serial to a title, matched
-//! against the game's. A folder RomM has for the game and this device does not comes down too.
+//! A PS2 or PSP folder is named after the disc serial, which nothing in RomM carries, so the serial
+//! is read out of the game's own disc — a CHD or a CSO too — by [`crate::sigil`]. A folder RomM has
+//! for the game and this device does not comes down too.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use super::index::Entry;
 use super::session::{self, Outcome, Place, Thread};
@@ -65,6 +69,8 @@ pub enum Emulator {
     Vita3k,
     Azahar,
     Cemu,
+    /// PS1 memory cards. Synced through sigil only: the engine before it never kept them.
+    DuckStation,
 }
 
 impl Emulator {
@@ -81,12 +87,13 @@ impl Emulator {
             "psvita" if label.contains("vita3k") => Some(Emulator::Vita3k),
             "n3ds" if label.contains("azahar") || label.contains("citra") => Some(Emulator::Azahar),
             "wiiu" if label.contains("cemu") => Some(Emulator::Cemu),
+            "psx" if label.contains("duckstation") => Some(Emulator::DuckStation),
             _ => None,
         }
     }
 
     /// RomM's `emulator` for an upload — what the Kotlin app tags these with.
-    fn tag(self) -> &'static str {
+    pub(super) fn tag(self) -> &'static str {
         match self {
             Emulator::Dolphin | Emulator::DolphinWii => "dolphin",
             Emulator::Pcsx2 => "pcsx2",
@@ -95,6 +102,7 @@ impl Emulator {
             Emulator::Vita3k => "vita3k",
             Emulator::Azahar => "azahar",
             Emulator::Cemu => "cemu",
+            Emulator::DuckStation => "duckstation",
         }
     }
 }
@@ -136,9 +144,19 @@ pub async fn sync(
 ) -> Result<Report, String> {
     let _one_at_a_time = session::exclusive(store).await?;
     let keys = title_keys(title, rom);
-    let threads = threads(emulator, rom, title, rom_id, stamp)?;
+    // Through sigil — see [`super::units`] — and the engine before for a game sigil cannot take.
+    let game = super::units::Game { rom_id, rom, system: "", title, stamp };
+    let mut notes = Vec::new();
+    let threads = match super::units::thread(game, super::units::Runner::Standalone(emulator), Err("")) {
+        Ok(thread) => vec![thread],
+        Err(why) => {
+            notes.push(format!("{title}: synced as before sigil, since {why}"));
+            threads(emulator, rom, title, rom_id, stamp)?
+        }
+    };
     let folder = threads.iter().find_map(|t| match &t.place {
         Place::Set(bundle) => Some(bundle.target.clone()),
+        Place::Sigil(unit) => Some(unit.request.root.clone()),
         Place::File(_) => None,
     });
     let late = |op: &SyncOperation| late(emulator, rom, title, rom_id, stamp, op);
@@ -150,10 +168,11 @@ pub async fn sync(
             report
         }
     };
+    report.notes.extend(notes);
 
     // Save states: one file per slot, each a save of its own, uploaded under its own name — the
     // Kotlin app's `SerialStateHandler`.
-    if let Some(states) = state_files(emulator, rom, &keys) {
+    if let Some(states) = state_files(emulator, rom) {
         match states {
             Ok((dir, local, id)) => {
                 let remote: Vec<SaveAsset> = client
@@ -191,6 +210,21 @@ pub(super) fn threads(emulator: Emulator, rom: &Path, title: &str, rom_id: i64, 
     Ok(discover(emulator, rom, title, &keys, &[])?.into_iter().map(|b| thread(emulator, rom_id, stamp, b)).collect())
 }
 
+/// The engine before sigil's threads for the game, as they were, and — named in `server`, RomM's
+/// files for it — the sets RomM has that no card here holds: what is settled in the old shape before
+/// the game's first sync through sigil. See [`super::units`].
+pub(super) fn legacy_threads(
+    emulator: Emulator,
+    rom: &Path,
+    title: &str,
+    rom_id: i64,
+    stamp: Option<&Stamp>,
+    server: &[String],
+) -> Vec<Thread> {
+    let keys = title_keys(title, rom);
+    discover(emulator, rom, title, &keys, server).unwrap_or_default().into_iter().map(|b| thread(emulator, rom_id, stamp, b)).collect()
+}
+
 /// A place for a set RomM offers that no thread names: a save folder for the game that no card here
 /// holds yet.
 pub(super) fn late(emulator: Emulator, rom: &Path, title: &str, rom_id: i64, stamp: Option<&Stamp>, op: &SyncOperation) -> Option<Thread> {
@@ -208,18 +242,19 @@ fn discover(emulator: Emulator, rom: &Path, title: &str, keys: &[String], server
     match emulator {
         Emulator::Dolphin => dolphin(rom),
         Emulator::DolphinWii => wii(rom),
-        Emulator::Pcsx2 => pcsx2(keys, server),
-        Emulator::Ppsspp => ppsspp(keys, server),
+        Emulator::Pcsx2 => pcsx2(rom, server),
+        Emulator::Ppsspp => ppsspp(rom, server),
         Emulator::Rpcs3 => rpcs3(keys, server),
         Emulator::Vita3k => vita3k(rom, title, server),
         Emulator::Azahar => azahar(rom),
         Emulator::Cemu => cemu(rom),
+        Emulator::DuckStation => Ok(Vec::new()),
     }
 }
 
 /// A set as a thread of the game's `autosave` slot, where every client of this library keeps it — one
 /// of several there for an emulator that keeps a folder per save.
-fn thread(emulator: Emulator, rom_id: i64, stamp: Option<&Stamp>, bundle: Bundle) -> Thread {
+pub(super) fn thread(emulator: Emulator, rom_id: i64, stamp: Option<&Stamp>, bundle: Bundle) -> Thread {
     let shared = matches!(emulator, Emulator::Pcsx2 | Emulator::Ppsspp | Emulator::Rpcs3);
     Thread {
         rom_id,
@@ -298,43 +333,72 @@ fn is_state_of(emulator: Emulator, name: &str) -> bool {
 /// by the game's own id — that id, which RomM's states are matched by as well.
 type StateFiles = (PathBuf, Vec<String>, Option<String>);
 
-/// Reads the disc serial out of a file name.
-type SerialOf = fn(&str) -> Option<String>;
-
-/// The folder an emulator keeps states in, and the ones there that are this game's — by serial,
-/// through the catalogue, like its saves, or for Dolphin by the id in the disc's header. None for an
-/// emulator whose states are not synced.
-fn state_files(emulator: Emulator, rom: &Path, keys: &[String]) -> Option<Result<StateFiles, String>> {
+/// The folder an emulator keeps states in, and the ones there that are this game's — by the serial
+/// on its disc, like its saves, or for Dolphin by the id in the disc's header. None for an emulator
+/// whose states are not synced.
+fn state_files(emulator: Emulator, rom: &Path) -> Option<Result<StateFiles, String>> {
     if matches!(emulator, Emulator::Dolphin | Emulator::DolphinWii) {
         return Some(dolphin_states(emulator, rom));
     }
-    let (dir, catalogue, serial): (Result<PathBuf, String>, _, SerialOf) = match emulator {
-        Emulator::Pcsx2 => (pcsx2_states(), catalogue(&PS2, include_str!("../../data/ps2-serials.json")), ps2_serial),
-        Emulator::Ppsspp => (
-            first_dir(installs(
-                "config/ppsspp/PSP/PPSSPP_STATE",
-                ("org.ppsspp.PPSSPP", "config/ppsspp/PSP/PPSSPP_STATE"),
-                ".config/ppsspp/PSP/PPSSPP_STATE",
-            ))
-            .ok_or_else(|| "no PPSSPP_STATE folder found".to_string()),
-            catalogue(&PSP, include_str!("../../data/psp-serials.json")),
-            psp_serial,
-        ),
+    let dir = match emulator {
+        Emulator::Pcsx2 => pcsx2_states(),
+        Emulator::Ppsspp => first_dir(installs(
+            "config/ppsspp/PSP/PPSSPP_STATE",
+            ("org.ppsspp.PPSSPP", "config/ppsspp/PSP/PPSSPP_STATE"),
+            ".config/ppsspp/PSP/PPSSPP_STATE",
+        ))
+        .ok_or_else(|| "no PPSSPP_STATE folder found".to_string()),
         // None of the others has a state format worth carrying to another machine.
         _ => return None,
     };
-    Some(dir.map(|dir| {
+    Some(dir.and_then(|dir| {
+        let serials = disc_serials(emulator, rom)?;
         let mut ours: Vec<String> = fs::read_dir(&dir)
             .into_iter()
             .flatten()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| is_state_of(emulator, name))
-            .filter(|name| serial(name).and_then(|s| catalogue.get(&s)).is_some_and(|t| keys.contains(&normalize(t))))
+            .filter(|name| is_state_of(emulator, name) && of_serials(emulator, name, &serials))
             .collect();
         ours.sort();
-        (dir, ours, None)
+        Ok((dir, ours, None))
     }))
+}
+
+/// The serials on the game's discs — `SLUS-20946` for PCSX2's names, `ULUS10538` for PPSSPP's — read
+/// out of each disc by sigil: every disc an `.m3u` lists, else the file itself.
+fn disc_serials(emulator: Emulator, rom: &Path) -> Result<Vec<String>, String> {
+    let platform = match emulator {
+        Emulator::Pcsx2 => "ps2",
+        Emulator::Ppsspp => "psp",
+        _ => return Ok(Vec::new()),
+    };
+    let mut serials = Vec::new();
+    let mut why = None;
+    for disc in discs(rom) {
+        match crate::sigil::identify(&disc, Some(platform)) {
+            Ok(game) if !game.title_id().is_empty() => serials.push(game.title_id()),
+            Ok(_) => {}
+            Err(e) => why = Some(e),
+        }
+    }
+    serials.sort();
+    serials.dedup();
+    match (serials.is_empty(), why) {
+        (false, _) => Ok(serials),
+        (true, Some(e)) => Err(format!("its disc serial could not be read: {e}")),
+        (true, None) => Err(format!("{} carries no disc serial", rom.display())),
+    }
+}
+
+/// Whether a save folder or state named `name` is of one of `serials`' games, by the serial its name
+/// starts with.
+fn of_serials(emulator: Emulator, name: &str, serials: &[String]) -> bool {
+    match emulator {
+        Emulator::Pcsx2 => ps2_serial(name).is_some_and(|s| serials.contains(&s)),
+        Emulator::Ppsspp => psp_serial(name).is_some_and(|s| serials.iter().any(|id| id.replace('-', "") == s.replace('-', ""))),
+        _ => false,
+    }
 }
 
 /// Dolphin's `StateSaves` folder, and the game's states in it, named by the id in its disc's header.
@@ -743,13 +807,25 @@ pub fn wii_id(disc: &Path) -> Option<String> {
 
 /// The disc a launch target is: the first entry of a multi-disc `.m3u`, else the file itself.
 fn entry_point(rom: &Path) -> PathBuf {
+    discs(rom).into_iter().next().unwrap_or_else(|| rom.to_path_buf())
+}
+
+/// Every disc a launch target is: each entry of a multi-disc `.m3u`, else the file itself.
+pub(crate) fn discs(rom: &Path) -> Vec<PathBuf> {
     if rom.extension().is_some_and(|e| e.eq_ignore_ascii_case("m3u"))
         && let Ok(text) = fs::read_to_string(rom)
-        && let Some(first) = text.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#'))
     {
-        return rom.parent().unwrap_or(Path::new("")).join(first);
+        let listed: Vec<PathBuf> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| rom.parent().unwrap_or(Path::new("")).join(l))
+            .collect();
+        if !listed.is_empty() {
+            return listed;
+        }
     }
-    rom.to_path_buf()
+    vec![rom.to_path_buf()]
 }
 
 /// The 6-character id from a GameCube disc's header: raw ISO/GCM (header at 0, disc magic at
@@ -857,10 +933,10 @@ fn pcsx2_cards() -> Result<Vec<PathBuf>, String> {
     Ok(cards)
 }
 
-fn pcsx2(keys: &[String], server: &[String]) -> Result<Vec<Bundle>, String> {
+fn pcsx2(rom: &Path, server: &[String]) -> Result<Vec<Bundle>, String> {
     let cards = pcsx2_cards()?;
-    let catalogue = catalogue(&PS2, include_str!("../../data/ps2-serials.json"));
-    let ours = |folder: &str| ps2_serial(folder).and_then(|s| catalogue.get(&s)).is_some_and(|t| keys.contains(&normalize(t)));
+    let serials = disc_serials(Emulator::Pcsx2, rom)?;
+    let ours = |folder: &str| of_serials(Emulator::Pcsx2, folder, &serials);
     let mut bundles = Vec::new();
     for card in &cards {
         for entry in fs::read_dir(card).into_iter().flatten().flatten() {
@@ -893,18 +969,18 @@ fn psp_serial(name: &str) -> Option<String> {
         .then(|| format!("{}-{}", &name[..4], &name[4..9]))
 }
 
-fn ppsspp(keys: &[String], server: &[String]) -> Result<Vec<Bundle>, String> {
+fn ppsspp(rom: &Path, server: &[String]) -> Result<Vec<Bundle>, String> {
     let savedata = first_dir(installs(
         "config/ppsspp/PSP/SAVEDATA",
         ("org.ppsspp.PPSSPP", "config/ppsspp/PSP/SAVEDATA"),
         ".config/ppsspp/PSP/SAVEDATA",
     ))
     .ok_or("no PPSSPP SAVEDATA folder found")?;
-    let catalogue = catalogue(&PSP, include_str!("../../data/psp-serials.json"));
+    let serials = disc_serials(Emulator::Ppsspp, rom)?;
     let mut bundles = Vec::new();
     for entry in fs::read_dir(&savedata).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let ours = psp_serial(&name).and_then(|s| catalogue.get(&s)).is_some_and(|t| keys.contains(&normalize(t)));
+        let ours = of_serials(Emulator::Ppsspp, &name, &serials);
         if entry.path().is_dir() && ours && !name.contains("sync-conflict") {
             bundles.push(folder_bundle(&savedata, &name));
         }
@@ -1045,20 +1121,7 @@ fn ini_value(path: &Path, key: &str) -> Option<String> {
 /// low half of the program id in the ROM's NCCH header. Azahar, like Citra before it, uses the
 /// all-zero console ids. One folder, `<program id>.3ds.zip`.
 fn azahar(rom: &Path) -> Result<Vec<Bundle>, String> {
-    let home = dirs::home_dir().unwrap_or_default();
-    let config = [
-        home.join(".var/app").join(crate::launch::RETRODECK).join("config/azahar-emu/qt-config.ini"),
-        home.join(".var/app/org.azahar_emu.Azahar/config/azahar-emu/qt-config.ini"),
-        home.join(".config/azahar-emu/qt-config.ini"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file());
-    let sdmc = config
-        .as_deref()
-        .filter(|c| ini_value(c, "use_custom_storage").is_some_and(|v| v == "true"))
-        .and_then(|c| ini_value(c, "sdmc_directory"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share/azahar-emu/sdmc"));
+    let sdmc = azahar_sdmc();
     let id = program_id(&entry_point(rom)).ok_or_else(|| format!("{} has no 3DS program id Deckhand can read (a .3ds, .cci or .cxi is needed)", rom.display()))?;
     let zeros = "0".repeat(32);
     let target = sdmc
@@ -1076,6 +1139,25 @@ fn azahar(rom: &Path) -> Result<Vec<Bundle>, String> {
         target,
         folder: true,
     }])
+}
+
+/// Azahar's emulated SD card: the one its `qt-config.ini` names when told to use custom storage,
+/// else its own.
+fn azahar_sdmc() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let config = [
+        home.join(".var/app").join(crate::launch::RETRODECK).join("config/azahar-emu/qt-config.ini"),
+        home.join(".var/app/org.azahar_emu.Azahar/config/azahar-emu/qt-config.ini"),
+        home.join(".config/azahar-emu/qt-config.ini"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file());
+    config
+        .as_deref()
+        .filter(|c| ini_value(c, "use_custom_storage").is_some_and(|v| v == "true"))
+        .and_then(|c| ini_value(c, "sdmc_directory"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/azahar-emu/sdmc"))
 }
 
 /// The program id of a 3DS ROM: an NCSD image (`.3ds`, `.cci`) holds its game as partition 0, an
@@ -1107,8 +1189,22 @@ pub fn program_id(rom: &Path) -> Option<u64> {
 /// The game's Wii U save: `<mlc>/usr/save/<high>/<low>/user`, by the title id in an unpacked game's
 /// `meta/meta.xml`. A `.wud`, `.wux` or `.wua` keeps it encrypted or compressed, and is not read.
 fn cemu(rom: &Path) -> Result<Vec<Bundle>, String> {
+    let mlc = cemu_mlc();
+    let id = wiiu_title_id(rom).ok_or_else(|| format!("no meta/meta.xml beside {} to read its title id from", rom.display()))?;
+    let target = mlc.join("usr/save").join(&id[..8]).join(&id[8..]).join("user");
+    Ok(vec![Bundle {
+        asset: format!("{}.wiiu.zip", id.to_uppercase()),
+        key: target.join(".deckhand-set"),
+        files: walk(&target),
+        target,
+        folder: true,
+    }])
+}
+
+/// Cemu's `mlc01`: the `mlc_path` its `settings.xml` names, else its own.
+fn cemu_mlc() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
-    let mlc = [
+    [
         home.join(".var/app").join(crate::launch::RETRODECK).join("config/Cemu/settings.xml"),
         home.join(".var/app/info.cemu.Cemu/config/Cemu/settings.xml"),
         home.join(".config/Cemu/settings.xml"),
@@ -1121,16 +1217,7 @@ fn cemu(rom: &Path) -> Result<Vec<Bundle>, String> {
         Some(xml[start..end].trim().to_string()).filter(|p| !p.is_empty())
     })
     .map(PathBuf::from)
-    .unwrap_or_else(|| home.join(".local/share/Cemu/mlc01"));
-    let id = wiiu_title_id(rom).ok_or_else(|| format!("no meta/meta.xml beside {} to read its title id from", rom.display()))?;
-    let target = mlc.join("usr/save").join(&id[..8]).join(&id[8..]).join("user");
-    Ok(vec![Bundle {
-        asset: format!("{}.wiiu.zip", id.to_uppercase()),
-        key: target.join(".deckhand-set"),
-        files: walk(&target),
-        target,
-        folder: true,
-    }])
+    .unwrap_or_else(|| home.join(".local/share/Cemu/mlc01"))
 }
 
 /// `0005000010101c00` from `<title_id …>0005000010101C00</title_id>` in the game's `meta/meta.xml`,
@@ -1145,7 +1232,7 @@ pub fn wiiu_title_id(rom: &Path) -> Option<String> {
     (id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit())).then_some(id)
 }
 
-fn folder_bundle(parent: &Path, folder: &str) -> Bundle {
+pub(super) fn folder_bundle(parent: &Path, folder: &str) -> Bundle {
     let target = parent.join(folder);
     Bundle {
         asset: format!("{folder}.zip"),
@@ -1156,18 +1243,108 @@ fn folder_bundle(parent: &Path, folder: &str) -> Bundle {
     }
 }
 
-// ---- Matching a serial's title to the game ------------------------------------------------------
+// ---- What sigil is asked -------------------------------------------------------------------------
 
-static PS2: OnceLock<HashMap<String, String>> = OnceLock::new();
-static PSP: OnceLock<HashMap<String, String>> = OnceLock::new();
-
-/// A serial → title catalogue, parsed the first time it is needed.
-fn catalogue(cell: &'static OnceLock<HashMap<String, String>>, json: &str) -> &'static HashMap<String, String> {
-    cell.get_or_init(|| serde_json::from_str(json).unwrap_or_default())
+/// What sigil is asked about the game `rom` runs as on `emulator`: the emulator's layout, the folder
+/// its paths are under — the one holding its `memcards/`, `PSP/`, `dev_hdd0/`, `ux0/`, `sdmc/` or
+/// `mlc01/`, as sigil names them — the settings that move a save, and the game's ids off its discs.
+///
+/// Every emulator is found where [`installs`] looks, RetroDECK's first. A folder the emulator was
+/// told to keep somewhere sigil cannot name — memory cards in a folder not called `memcards` — is
+/// an error, and the game keeps the engine before sigil.
+pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sigil::Request, String> {
+    let named = |dir: &Path, name: &str, what: &str| -> Result<PathBuf, String> {
+        match (dir.file_name().and_then(|n| n.to_str()), dir.parent()) {
+            (Some(n), Some(parent)) if n == name => Ok(parent.to_path_buf()),
+            _ => Err(format!("{what} is in {}, a folder not named {name}, which sigil can't take", dir.display())),
+        }
+    };
+    let (layout, platform, root, settings, profile): (&str, &str, PathBuf, Vec<PathBuf>, Option<&str>) = match emulator {
+        Emulator::Dolphin | Emulator::DolphinWii => {
+            let user = first_dir(installs("data/dolphin-emu", ("org.DolphinEmu.dolphin-emu", "data/dolphin-emu"), ".local/share/dolphin-emu"))
+                .ok_or("no Dolphin folder found")?;
+            let ini = installs(
+                "config/dolphin-emu/Dolphin.ini",
+                ("org.DolphinEmu.dolphin-emu", "config/dolphin-emu/Dolphin.ini"),
+                ".config/dolphin-emu/Dolphin.ini",
+            );
+            let platform = if emulator == Emulator::DolphinWii { "wii" } else { "gamecube" };
+            ("dolphin_standalone", platform, user, ini, None)
+        }
+        Emulator::Pcsx2 => {
+            let (ini, settings) = pcsx2_ini()?;
+            let base = ini.parent().and_then(Path::parent).unwrap_or(Path::new("/"));
+            let cards = settings.get("MemoryCards").map_or_else(|| base.join("memcards"), |m| base.join(m));
+            ("pcsx2_standalone", "ps2", named(&cards, "memcards", "PCSX2's memory cards folder")?, vec![ini], None)
+        }
+        Emulator::Ppsspp => {
+            let savedata = first_dir(installs(
+                "config/ppsspp/PSP/SAVEDATA",
+                ("org.ppsspp.PPSSPP", "config/ppsspp/PSP/SAVEDATA"),
+                ".config/ppsspp/PSP/SAVEDATA",
+            ))
+            .ok_or("no PPSSPP SAVEDATA folder found")?;
+            let psp = named(&savedata, "SAVEDATA", "PPSSPP's SAVEDATA")?;
+            ("ppsspp_standalone", "psp", named(&psp, "PSP", "PPSSPP's memory stick")?, Vec::new(), None)
+        }
+        Emulator::Rpcs3 => {
+            let savedata = rpcs3_savedata()?;
+            // `dev_hdd0/home/<profile>/savedata`
+            let hdd0 = savedata.ancestors().nth(3).ok_or("RPCS3's dev_hdd0 has no folder above it")?.to_path_buf();
+            ("rpcs3", "ps3", named(&hdd0, "dev_hdd0", "RPCS3's dev_hdd0")?, Vec::new(), Some("00000001"))
+        }
+        Emulator::Vita3k => {
+            // `ux0/user/<profile>/savedata`
+            let ux0 = vita3k_savedata().ancestors().nth(3).ok_or("Vita3K's ux0 has no folder above it")?.to_path_buf();
+            ("vita3k", "psvita", named(&ux0, "ux0", "Vita3K's ux0")?, Vec::new(), Some("00"))
+        }
+        Emulator::Azahar => ("azahar", "3ds", named(&azahar_sdmc(), "sdmc", "Azahar's SD card")?, Vec::new(), None),
+        Emulator::Cemu => ("cemu", "wiiu", named(&cemu_mlc(), "mlc01", "Cemu's mlc01")?, Vec::new(), None),
+        Emulator::DuckStation => {
+            let ini = installs(
+                "config/duckstation/settings.ini",
+                ("org.duckstation.DuckStation", "config/duckstation/settings.ini"),
+                ".local/share/duckstation/settings.ini",
+            );
+            let file = ini.iter().find(|p| p.is_file()).ok_or("no DuckStation settings.ini found")?;
+            let cards = ini_value(file, "Directory")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join("memcards"));
+            ("duckstation", "psx", named(&cards, "memcards", "DuckStation's memory cards folder")?, ini, None)
+        }
+    };
+    // The settings sigil says this layout's files turn on, from the emulator's own config.
+    let file = settings.iter().find(|p| p.is_file());
+    let options = crate::sigil::layout(layout)
+        .map(|row| row.options)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|option| Some((option.key.clone(), ini_value(file?, &option.key)?)))
+        .collect();
+    let disc = entry_point(rom);
+    let identity = crate::sigil::identify(&disc, Some(platform)).map_err(|e| format!("its game id could not be read: {e}"))?;
+    let game_ids = discs(rom)
+        .iter()
+        .filter_map(|d| crate::sigil::identify(d, Some(platform)).ok())
+        .map(|i| i.title_id())
+        .filter(|id| !id.is_empty())
+        .collect();
+    Ok(crate::sigil::Request {
+        layout: layout.into(),
+        platform: Some(platform.into()),
+        content: disc,
+        identity: Some(identity),
+        options,
+        root,
+        profile: profile.map(str::to_string),
+        game_ids,
+    })
 }
 
-/// A title as the catalogue and the library are compared: lowercase, no `(…)` tags, every run of
-/// anything else one space — the Kotlin app's `normalizeTitle`.
+// ---- Matching a PS3 save's title to the game ----------------------------------------------------
+
+/// A title as a PS3 save's `PARAM.SFO` and the library are compared: lowercase, no `(…)` tags, every
+/// run of anything else one space — the Kotlin app's `normalizeTitle`.
 pub fn normalize(title: &str) -> String {
     let mut out = String::new();
     let mut depth = 0;
@@ -1183,7 +1360,7 @@ pub fn normalize(title: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// What a catalogue title may equal for this game: its title, and its file's name.
+/// What a save's title may equal for this game: its title, and its file's name.
 fn title_keys(title: &str, rom: &Path) -> Vec<String> {
     let stem = rom.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     [title, &stem].iter().map(|t| normalize(t)).filter(|k| !k.is_empty()).collect()
@@ -1337,13 +1514,33 @@ mod tests {
     }
 
     #[test]
-    fn titles_compare_without_tags_or_punctuation_and_the_catalogues_load() {
+    fn titles_compare_without_tags_or_punctuation() {
         assert_eq!(normalize("Grand Theft Auto: San Andreas (USA) (v1.03)"), "grand theft auto san andreas");
         assert_eq!(normalize("Grand Theft Auto - San Andreas"), "grand theft auto san andreas");
-        let ps2 = catalogue(&PS2, include_str!("../../data/ps2-serials.json"));
-        assert!(ps2.len() > 10_000);
-        assert!(ps2.contains_key("SLUS-20946"));
-        assert!(catalogue(&PSP, include_str!("../../data/psp-serials.json")).len() > 7_000);
+    }
+
+    #[test]
+    fn a_save_folder_or_state_is_a_games_by_the_serial_on_its_disc() {
+        let san_andreas = ["SLUS-20946".to_string()];
+        assert!(of_serials(Emulator::Pcsx2, "BASLUS-20946GTA50000", &san_andreas));
+        assert!(of_serials(Emulator::Pcsx2, "BESLUS-20946GTA50000", &san_andreas), "whatever region prefix the card gave it");
+        assert!(of_serials(Emulator::Pcsx2, "SLUS-20946 (2C6BE434).01.p2s", &san_andreas), "a state");
+        assert!(!of_serials(Emulator::Pcsx2, "BASLUS-20947GTA50000", &san_andreas));
+        let dj_max = ["ULUS10538".to_string()];
+        assert!(of_serials(Emulator::Ppsspp, "ULUS10538", &dj_max));
+        assert!(of_serials(Emulator::Ppsspp, "ULUS10538DATA00", &dj_max));
+        assert!(of_serials(Emulator::Ppsspp, "ULUS10538_2.00_0.ppst", &dj_max));
+        assert!(!of_serials(Emulator::Ppsspp, "ULUS10539", &dj_max));
+    }
+
+    #[test]
+    fn a_multi_disc_playlist_is_every_disc_it_lists() {
+        let dir = temp("m3u");
+        fs::write(dir.join("Game.m3u"), "# discs\nGame (Disc 1).chd\n\nGame (Disc 2).chd\n").unwrap();
+        assert_eq!(discs(&dir.join("Game.m3u")), [dir.join("Game (Disc 1).chd"), dir.join("Game (Disc 2).chd")]);
+        assert_eq!(entry_point(&dir.join("Game.m3u")), dir.join("Game (Disc 1).chd"));
+        assert_eq!(discs(&dir.join("Game.chd")), [dir.join("Game.chd")]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

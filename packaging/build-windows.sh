@@ -6,7 +6,8 @@
 # MinGW's are linked in statically, and the graphics (DirectX 12 or Vulkan) and gamepad (XInput)
 # libraries it opens are part of Windows.
 #
-# Requirements: docker.
+# Requirements: docker, and the argosy-sigil submodule checked out (`git submodule update --init
+# --recursive`), which build.rs cross-compiles with the same MinGW.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,7 +22,7 @@ docker run --rm \
     -v "$ROOT:/src:ro" -v "$BUILD:/build" \
     -v "${CARGO_HOME:-$HOME/.cargo}/registry:/tmp/cargo/registry" \
     -w /src rust:1-bookworm \
-    sh -c "apt-get update -qq && apt-get install -y -qq gcc-mingw-w64-x86-64 >/dev/null \
+    sh -c "apt-get update -qq && apt-get install -y -qq gcc-mingw-w64-x86-64 cmake >/dev/null \
         && rustup target add x86_64-pc-windows-gnu >/dev/null 2>&1 \
         && cargo build --release --locked --target x86_64-pc-windows-gnu; status=\$?; \
         chown -R $(id -u):$(id -g) /build /tmp/cargo/registry; exit \$status"

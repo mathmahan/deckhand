@@ -433,16 +433,17 @@ mod tests {
     #[test]
     fn a_release_reads_its_version_headline_appimage_and_checksum() {
         let arch = std::env::consts::ARCH;
-        let image = format!("Deckhand-0.9.0-{arch}.AppImage");
-        let release = parse(&json("v0.9.0", NOTES, &[("notes.txt", 3, "u1"), (&image, 1234, "https://repo.example/dl")])).unwrap();
-        assert_eq!(release.version, "0.9.0");
+        // A version ahead of any build, so the release reads as newer whatever this one is.
+        let image = format!("Deckhand-99.1.0-{arch}.AppImage");
+        let release = parse(&json("v99.1.0", NOTES, &[("notes.txt", 3, "u1"), (&image, 1234, "https://repo.example/dl")])).unwrap();
+        assert_eq!(release.version, "99.1.0");
         assert_eq!(release.headline.as_deref(), Some("New in 0.9.0: something"));
         let asset = release.appimage.clone().expect("this machine's AppImage");
         assert_eq!((asset.name.as_str(), asset.size, asset.url.as_str()), (image.as_str(), 1234, "https://repo.example/dl"));
         assert_eq!(asset.sha256.as_deref(), Some("d941905e616084021eacfbc530839e5ccf95ed6d34444509dfb367df54fc985f"));
         assert!(release.is_newer());
 
-        let other_arch = parse(&json("v0.9.0", "", &[("Deckhand-0.9.0-riscv128.AppImage", 1, "u")])).unwrap();
+        let other_arch = parse(&json("v99.1.0", "", &[("Deckhand-99.1.0-riscv128.AppImage", 1, "u")])).unwrap();
         assert_eq!(other_arch.appimage, None, "another machine's AppImage is not this one's");
         assert_eq!(other_arch.headline, None);
     }

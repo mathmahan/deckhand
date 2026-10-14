@@ -87,7 +87,7 @@ impl Device {
     async fn launch_with(&self, plays: Vec<PlaySession>) -> Report {
         let install = retroarch::read(&self.root.join("ra/retroarch.cfg")).unwrap();
         let rom = self.root.join("roms/snes").join(format!("{GAME}.sfc"));
-        sync_rom(&RommClient::new().unwrap(), &self.conn, &install, &self.store(), &rom, Some("snes9x"), ROM_ID, None, plays)
+        sync_rom(&RommClient::new().unwrap(), &self.conn, &install, &self.store(), &rom, "snes", Some("snes9x"), ROM_ID, None, plays)
             .await
             .unwrap()
     }
@@ -527,7 +527,7 @@ async fn a_device_romm_forgot_registers_again_rather_than_syncing_blind() {
     deck.play("chapter 1", server.now());
     let install = retroarch::read(&deck.root.join("ra/retroarch.cfg")).unwrap();
     let rom = deck.root.join("roms/snes").join(format!("{GAME}.sfc"));
-    let error = sync_rom(&RommClient::new().unwrap(), &deck.conn, &install, &deck.store(), &rom, Some("snes9x"), ROM_ID, None, Vec::new())
+    let error = sync_rom(&RommClient::new().unwrap(), &deck.conn, &install, &deck.store(), &rom, "snes", Some("snes9x"), ROM_ID, None, Vec::new())
         .await
         .unwrap_err();
     assert!(error.contains("no longer knows this device"), "{error}");
@@ -727,7 +727,7 @@ async fn a_first_launch_with_no_core_known_says_why_nothing_came_down() {
     .unwrap();
     let install = retroarch::read(&pc.root.join("ra/retroarch.cfg")).unwrap();
     let rom = pc.root.join("roms/snes").join(format!("{GAME}.sfc"));
-    let report = sync_rom(&RommClient::new().unwrap(), &pc.conn, &install, &pc.store(), &rom, None, ROM_ID, None, Vec::new()).await.unwrap();
+    let report = sync_rom(&RommClient::new().unwrap(), &pc.conn, &install, &pc.store(), &rom, "snes", None, ROM_ID, None, Vec::new()).await.unwrap();
     assert!(report.pulled.is_empty(), "{report:?}");
     assert!(report.notes.iter().any(|n| n.contains("no save here yet")), "{report:?}");
 }

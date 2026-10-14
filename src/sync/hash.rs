@@ -38,6 +38,11 @@ pub fn of_upload(bytes: &[u8]) -> String {
     }
 }
 
+/// A zip's files by their names in it, folders left out, or None when `bytes` is not a zip.
+pub fn zip_entries(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    entries(bytes).map(|all| all.into_iter().filter(|(name, _)| !name.ends_with('/')).collect())
+}
+
 /// A zip's file entries, or None when `bytes` is not a zip — RomM's `zipfile.is_zipfile`, which goes
 /// by the archive's central directory rather than its first bytes.
 fn entries(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {

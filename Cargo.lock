@@ -928,8 +928,10 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "deckhand"
-version = "0.8.10"
+version = "0.9.0"
 dependencies = [
+ "cc",
+ "cmake",
  "crc32fast",
  "dirs",
  "futures",

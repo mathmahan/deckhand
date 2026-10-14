@@ -51,6 +51,7 @@ use std::time::{Duration, SystemTime};
 
 use super::index::{Entry, Index};
 use super::standalone::{self, Bundle};
+use super::units::Unit;
 use super::{Choice, Report, hash, names};
 use crate::config::Connection;
 use crate::library::Stamp;
@@ -91,6 +92,7 @@ impl Thread {
             Place::Set(bundle) => changed
                 .iter()
                 .any(|p| (bundle.folder && p.starts_with(&bundle.target)) || bundle.files.iter().any(|(_, file)| file == p)),
+            Place::Sigil(unit) => unit.covers(changed),
         }
     }
 }
@@ -101,8 +103,10 @@ pub enum Place {
     /// One file — a RetroArch battery save. It need not exist yet: it is also where one from RomM
     /// goes.
     File(PathBuf),
-    /// A standalone emulator's set of files, which travels as one zip.
+    /// A standalone emulator's set of files, which travels as one zip — the shape before sigil.
     Set(Bundle),
+    /// A game's saves as sigil keeps them — see [`super::units`].
+    Sigil(Box<Unit>),
 }
 
 /// A save as it is on this device right now.
@@ -112,31 +116,48 @@ struct Held {
     hash: String,
     /// A set's hash the way the engine before this one took it — what an index entry from then holds.
     legacy: Option<String>,
+    /// For a sigil unit that is one file of its own, RomM's hash of the file as it is on disk. sigil
+    /// sends some files in a form of its own — a PS1 card with its free blocks zeroed, where
+    /// DuckStation leaves them 0xFF — so the unit's hash is not the file's, and an agreement this
+    /// device or another client recorded with the file as it was is still this content.
+    raw: Option<String>,
     bytes: u64,
     modified: Option<SystemTime>,
 }
 
+impl Held {
+    /// Whether this is the content RomM hashes `hash`: the unit, or the file it was read from.
+    fn is(&self, hash: &str) -> bool {
+        self.hash == hash || self.raw.as_deref() == Some(hash)
+    }
+}
+
 impl Thread {
-    fn key(&self) -> &Path {
+    fn key(&self) -> PathBuf {
         match &self.place {
-            Place::File(path) => path,
-            Place::Set(bundle) => &bundle.key,
+            Place::File(path) => path.clone(),
+            Place::Set(bundle) => bundle.key.clone(),
+            Place::Sigil(unit) => unit.key(),
         }
     }
 
+    /// A unit that is one file of its own keeps the entry a battery save always had; any other is
+    /// kept with the sets.
     fn index_file(&self) -> &'static str {
-        match self.place {
+        match &self.place {
             Place::File(_) => "save-index.json",
-            Place::Set(_) => "standalone-index.json",
+            Place::Sigil(unit) if unit.file().is_some() => "save-index.json",
+            Place::Set(_) | Place::Sigil(_) => "standalone-index.json",
         }
     }
 
     /// Every file on this device this save is held in — what a sync that writes it changes, for
     /// [`Report::written`].
-    fn paths(&self) -> Vec<PathBuf> {
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
         match &self.place {
             Place::File(path) => vec![path.clone()],
             Place::Set(bundle) => bundle.files.iter().map(|(_, path)| path.clone()).collect(),
+            Place::Sigil(unit) => unit.paths(),
         }
     }
 
@@ -152,6 +173,11 @@ impl Thread {
             Place::Set(bundle) if !bundle.folder => {
                 Some(written.map_or_else(|| bundle.files.iter().map(|(_, path)| name(path)).collect(), |paths| paths.iter().map(name).collect()))
             }
+            // A unit with no file of its own: what says it is still here is its files being there.
+            Place::Sigil(unit) if unit.file().is_none() => Some(match written {
+                Some(paths) => paths.iter().filter(|p| p.is_file()).map(name).collect(),
+                None => unit.paths().iter().map(name).collect(),
+            }),
             _ => None,
         }
     }
@@ -160,7 +186,7 @@ impl Thread {
     fn held(&self) -> Result<Option<Held>, String> {
         match &self.place {
             Place::File(path) => match fs::read(path) {
-                Ok(bytes) => Ok(Some(Held { hash: hash::file(&bytes), legacy: None, bytes: bytes.len() as u64, modified: modified(path) })),
+                Ok(bytes) => Ok(Some(Held { hash: hash::file(&bytes), legacy: None, raw: None, bytes: bytes.len() as u64, modified: modified(path) })),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e.to_string()),
             },
@@ -172,10 +198,12 @@ impl Thread {
                 Ok(Some(Held {
                     hash: hash::set(&set),
                     legacy: Some(standalone::set_hash(&set)),
+                    raw: None,
                     bytes: set.iter().map(|(_, b)| b.len() as u64).sum(),
                     modified: bundle.files.iter().filter_map(|(_, p)| modified(p)).max(),
                 }))
             }
+            Place::Sigil(unit) => Ok(unit.held()?.map(|(hash, bytes, modified)| Held { hash, legacy: None, raw: unit.raw(), bytes, modified })),
         }
     }
 
@@ -193,12 +221,14 @@ impl Thread {
                 let zipped = standalone::pack(&set).map_err(|e| format!("could not zip it ({e})"))?;
                 Ok((zipped, hash::set(&set)))
             }
+            Place::Sigil(unit) => unit.body(),
         }
     }
 
-    /// Put `bytes` from RomM in place, made at `made` by RomM's clock, answering the hash of what is
-    /// here now — what this device's next sync will read — and the files it was written to.
-    fn put(&self, bytes: &[u8], made: Option<SystemTime>) -> Result<(String, Vec<PathBuf>), String> {
+    /// Put `bytes` from RomM — its file `server_name` — in place, made at `made` by RomM's clock,
+    /// answering the hash of what is here now — what this device's next sync will read — and the
+    /// files it was written to.
+    fn put(&self, bytes: &[u8], made: Option<SystemTime>, server_name: &str) -> Result<(String, Vec<PathBuf>), String> {
         match &self.place {
             Place::File(path) => {
                 super::write_atomic(path, bytes).map_err(|e| e.to_string())?;
@@ -216,6 +246,7 @@ impl Thread {
                 let written = set.iter().map(|(relative, _)| bundle.target.join(relative)).collect();
                 Ok((hash::set(&set), written))
             }
+            Place::Sigil(unit) => unit.put(bytes, made, server_name),
         }
     }
 
@@ -227,6 +258,7 @@ impl Thread {
                 let set = standalone::read_set(&bundle.files).map_err(|e| e.to_string())?;
                 standalone::pack(&set).map_err(|e| format!("could not zip a copy ({e})"))
             }
+            Place::Sigil(unit) => unit.snapshot(),
         }
     }
 
@@ -237,6 +269,7 @@ impl Thread {
             Place::Set(bundle) if bundle.folder => fs::remove_dir_all(&bundle.target).map_err(|e| e.to_string()),
             // A flat set shares its card with every other game's saves: only its own files go.
             Place::Set(bundle) => bundle.files.iter().try_for_each(|(_, p)| fs::remove_file(p)).map_err(|e| e.to_string()),
+            Place::Sigil(unit) => unit.clear(),
         }
     }
 }
@@ -276,6 +309,9 @@ pub async fn sync(
         return Ok(Outcome::Unsupported("this install is not registered with RomM as a device".into()));
     };
     let mut run = Run::new(client, conn, store, device);
+    // Games whose saves go through sigil for the first time: RomM's copies in the shape before are
+    // settled first — see [`Run::migrate`].
+    let threads = run.migrate(threads).await;
 
     // What is here, read once: the negotiation states it, and the decisions weigh it.
     let mut local: Vec<(Thread, Option<Held>)> = Vec::with_capacity(threads.len());
@@ -435,9 +471,10 @@ pub async fn sync(
 /// named it after a different build of the same game); a set is the set of its name.
 fn same_save(thread: &Thread, server_name: &str) -> bool {
     let name = names::canonical(server_name);
-    match thread.place {
+    match &thread.place {
         Place::File(_) => same_kind(thread, &name),
         Place::Set(_) => name.eq_ignore_ascii_case(&thread.name),
+        Place::Sigil(unit) => unit.holds(&name),
     }
 }
 
@@ -462,7 +499,7 @@ pub async fn restore(client: &RommClient, conn: &Connection, store: &Path, threa
         return Err("what came down is not the version RomM described, so nothing was changed".into());
     }
     // Made now, not when RomM first had it: it is this device's newest from here on.
-    thread.put(&bytes, None)?;
+    thread.put(&bytes, None, &version.file_name)?;
     run.report.written.extend(thread.paths());
     let held = thread.held()?;
     let op = SyncOperation {
@@ -492,6 +529,9 @@ pub fn holds(thread: &Thread, version: &SaveAsset) -> bool {
 
 /// Whether `server_name` is a file of `thread`'s type.
 fn same_kind(thread: &Thread, server_name: &str) -> bool {
+    if let Place::Sigil(unit) = &thread.place {
+        return unit.holds(server_name);
+    }
     let ext = |n: &str| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     ext(&names::canonical(server_name)) == ext(&thread.name)
 }
@@ -552,7 +592,7 @@ enum Step {
 fn decide(op: &SyncOperation, slot: &str, held: Option<&Held>, baseline: Option<&Entry>) -> Step {
     let server_hash = op.server_content_hash.as_deref();
     if let (Some(held), Some(server_hash)) = (held, server_hash)
-        && held.hash == server_hash
+        && held.is(server_hash)
     {
         // An agreement from before sync sessions was never acknowledged as this device: once, now.
         let confirm =
@@ -630,7 +670,7 @@ fn decide(op: &SyncOperation, slot: &str, held: Option<&Held>, baseline: Option<
 
 /// Whether what is here is what `baseline` recorded.
 fn same_content(held: &Held, baseline: &Entry) -> bool {
-    held.hash == baseline.hash || (!baseline.romm_hash && held.legacy.as_deref() == Some(baseline.hash.as_str()))
+    held.is(&baseline.hash) || (!baseline.romm_hash && held.legacy.as_deref() == Some(baseline.hash.as_str()))
 }
 
 /// RomM's hash of the version `baseline` agreed on, when it is known.
@@ -728,7 +768,127 @@ impl<'a> Run<'a> {
     }
 
     fn baseline(&mut self, thread: &Thread) -> Option<Entry> {
-        self.index(thread).agreed(thread.key(), thread.rom_id, thread.stamp.as_ref()).cloned()
+        let key = thread.key();
+        self.index(thread).agreed(&key, thread.rom_id, thread.stamp.as_ref()).cloned()
+    }
+
+    /// The first sync of games whose saves sigil now keeps ([`Place::Sigil`]) while RomM may still
+    /// hold them in the shape before it: a PS2 game's save folders zipped one by one, a PSP game's, a
+    /// core's `.srm` that sigil keeps as a zip of save types. For each such game with no agreement of
+    /// its own yet:
+    ///
+    /// - RomM already holds the unit, under the name this app gives it: another device moved the
+    ///   game over. When what is here is what this device last agreed with RomM on in the old shape,
+    ///   it is only behind, and its unit is recorded as agreeing with no version RomM holds — so the
+    ///   sync takes RomM's. Anything else here may be progress RomM lacks, and is weighed against
+    ///   the unit as any save is.
+    /// - Otherwise the old shape is settled first, by the engine that wrote it — what a device on it
+    ///   pushed comes down, what is here and newer goes up, a conflict is decided as one — and the
+    ///   unit goes up after, in this sync. Where the old shape's own zip had the unit's name, the
+    ///   agreement just reached is recorded as the unit's, so the unit only goes up once it changes.
+    ///
+    /// A game RomM's copies could not be read for, or whose old shape did not settle, is left out of
+    /// this sync, rather than weighed against a copy in another shape.
+    async fn migrate(&mut self, threads: Vec<Thread>) -> Vec<Thread> {
+        let firsts: Vec<usize> = (0..threads.len())
+            .filter(|&i| matches!(&threads[i].place, Place::Sigil(u) if !u.legacy.is_empty() || u.legacy_source.is_some()))
+            .filter(|&i| self.baseline(&threads[i]).is_none())
+            .collect();
+        if firsts.is_empty() {
+            return threads;
+        }
+        let mut roms: Vec<i64> = firsts.iter().map(|&i| threads[i].rom_id).collect();
+        roms.sort_unstable();
+        roms.dedup();
+        let mut versions: Vec<SaveAsset> = Vec::new();
+        for batch in roms.chunks(100) {
+            match self.client.fetch_saves_of(self.conn, batch).await {
+                Ok(found) => versions.extend(found),
+                Err(e) => {
+                    self.report.notes.push(format!(
+                        "{} games were left for the next sync: RomM's copies of their saves could not be read ({})",
+                        roms.len(),
+                        super::describe(&e)
+                    ));
+                    return without(threads, &firsts);
+                }
+            }
+        }
+
+        let mut old: Vec<Thread> = Vec::new();
+        let mut settling: Vec<(usize, Vec<Thread>)> = Vec::new();
+        for &i in &firsts {
+            let thread = &threads[i];
+            let Place::Sigil(unit) = &thread.place else { continue };
+            let theirs: Vec<&SaveAsset> = versions
+                .iter()
+                .filter(|v| v.rom_id == Some(thread.rom_id) && v.slot.as_deref().unwrap_or(AUTOSAVE) == thread.slot)
+                .collect();
+            let moved = theirs.iter().any(|v| names::canonical(&v.file_name).eq_ignore_ascii_case(&thread.name));
+            if moved {
+                if let Ok(Some(held)) = thread.held()
+                    && self.unchanged(&unit.legacy)
+                {
+                    self.remember(thread, held.hash, Version { save_id: 0, synced_at: None, server_hash: None }, true, None);
+                }
+                continue;
+            }
+            let names: Vec<String> = theirs.iter().map(|v| names::canonical(&v.file_name)).collect();
+            let legacy = match &unit.legacy_source {
+                Some((emulator, rom, title)) => standalone::legacy_threads(*emulator, rom, title, thread.rom_id, thread.stamp.as_ref(), &names),
+                None => unit.legacy.clone(),
+            };
+            if legacy.is_empty() {
+                continue;
+            }
+            old.extend(legacy.iter().cloned());
+            settling.push((i, legacy));
+        }
+        if old.is_empty() {
+            return threads;
+        }
+
+        let outcome = Box::pin(sync(self.client, self.conn, &self.store.clone(), old, &[], Vec::new(), &|_| None)).await;
+        // That sync wrote the indexes on disk; what this one read of them before is stale now.
+        self.indexes.clear();
+        let report = match outcome {
+            Ok(Outcome::Done(report)) => *report,
+            Ok(Outcome::Unsupported(why)) | Err(why) => {
+                self.report.notes.push(format!("{} games were left for the next sync: their saves from before could not be settled ({why})", settling.len()));
+                return without(threads, &settling.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+            }
+        };
+        let failed: Vec<usize> = settling
+            .iter()
+            .filter(|(_, legacy)| report.failed.iter().any(|f| legacy.iter().any(|t| f.starts_with(&format!("{}:", t.name)))))
+            .map(|(i, _)| *i)
+            .collect();
+        self.report.absorb(report);
+
+        // The old shape's zip under the unit's own name: its agreement is the unit's.
+        for (i, legacy) in &settling {
+            let thread = &threads[*i];
+            let Place::Sigil(unit) = &thread.place else { continue };
+            let same = legacy.iter().find(|t| t.name.eq_ignore_ascii_case(&unit.artifact));
+            let Some(same) = same.filter(|_| !failed.contains(i) && unit.name != unit.artifact) else { continue };
+            let (Some(agreed), Ok(Some(held))) = (self.baseline(same), thread.held()) else { continue };
+            let version = Version { save_id: agreed.save_id, synced_at: agreed.synced_at.clone(), server_hash: theirs(&agreed).map(str::to_string) };
+            self.remember(thread, held.hash, version, !agreed.unconfirmed, None);
+        }
+        if !failed.is_empty() {
+            self.report.notes.push(format!("{} games were left for the next sync: their saves from before did not all settle", failed.len()));
+        }
+        without(threads, &failed)
+    }
+
+    /// Whether every one of `legacy` is, here, what this device last agreed with RomM on — or not
+    /// here at all.
+    fn unchanged(&mut self, legacy: &[Thread]) -> bool {
+        legacy.iter().all(|thread| match thread.held() {
+            Ok(None) => true,
+            Ok(Some(held)) => self.baseline(thread).is_some_and(|b| same_content(&held, &b)),
+            Err(_) => false,
+        })
     }
 
     /// Act on RomM's answer `op` about `thread` — `by_name` when it is this device's own, against the
@@ -760,7 +920,7 @@ impl<'a> Run<'a> {
     async fn agree(&mut self, op: &SyncOperation, thread: &Thread, held: Option<&Held>, baseline: Option<&Entry>, confirm: bool) {
         let Some(held) = held else { return };
         self.report.in_sync += 1;
-        let identical = op.server_content_hash.as_deref() == Some(held.hash.as_str());
+        let identical = op.server_content_hash.as_deref().is_some_and(|h| held.is(h));
         let version = match (identical, op.save_id, baseline) {
             (true, Some(save_id), _) => {
                 Version { save_id, synced_at: op.server_updated_at.clone(), server_hash: op.server_content_hash.clone() }
@@ -858,9 +1018,12 @@ impl<'a> Run<'a> {
     /// this save's kind can be another save of a slot several share — each disc of a set keeps its own
     /// `.srm` — and a flat set's pull takes away the set's files RomM's copy of it does not name.
     async fn pull(&mut self, op: &SyncOperation, thread: &Thread, keep: Option<&Held>) -> bool {
-        let replaced = keep.is_some_and(|held| op.server_content_hash.as_deref() != Some(held.hash.as_str()));
+        let replaced = keep.is_some_and(|held| op.server_content_hash.as_deref().is_none_or(|h| !held.is(h)));
+        // A unit that is more than one file of its own can take files away, or sit on a card every
+        // game shares: what it replaces is set aside first, whatever it is called.
         let unaccounted = !names::canonical(&op.file_name).eq_ignore_ascii_case(&thread.name)
-            || matches!(&thread.place, Place::Set(bundle) if !bundle.folder);
+            || matches!(&thread.place, Place::Set(bundle) if !bundle.folder)
+            || matches!(&thread.place, Place::Sigil(unit) if unit.file().is_none());
         if replaced && unaccounted && self.set_aside(thread).is_none() {
             return false;
         }
@@ -875,7 +1038,7 @@ impl<'a> Run<'a> {
             return self.failed(thread, "what came down is not the save RomM described, so it was left as it was".into());
         }
         let made = op.server_updated_at.as_deref().and_then(names::parse_timestamp);
-        let (hash, written) = match thread.put(&bytes, made) {
+        let (hash, written) = match thread.put(&bytes, made, &op.file_name) {
             Ok(put) => put,
             Err(e) => return self.failed(thread, e),
         };
@@ -936,7 +1099,7 @@ impl<'a> Run<'a> {
         versions.iter().any(|v| {
             v.id != current
                 && same_save(thread, &v.file_name)
-                && v.content_hash.as_deref() == Some(held.hash.as_str())
+                && v.content_hash.as_deref().is_some_and(|h| held.is(h))
                 && matches!((made(v), newest), (Some(then), Some(now)) if then < now)
         })
     }
@@ -949,7 +1112,7 @@ impl<'a> Run<'a> {
             return;
         }
         self.report.written.extend(thread.paths());
-        let key = thread.key().to_path_buf();
+        let key = thread.key();
         if let Err(e) = self.index(thread).remove(&key) {
             self.report.failed.push(format!("{}: removed, but could not record it ({e})", thread.name));
         }
@@ -982,7 +1145,7 @@ impl<'a> Run<'a> {
             files: thread.set_files(written),
             stamp: thread.stamp.clone(),
         };
-        let key = thread.key().to_path_buf();
+        let key = thread.key();
         if let Err(e) = self.index(thread).set(&key, entry) {
             self.report.failed.push(format!("{}: synced, but could not record it ({e})", thread.name));
         }
@@ -998,6 +1161,11 @@ impl<'a> Run<'a> {
         self.fail(thread, why);
         false
     }
+}
+
+/// `threads` but those at `left`.
+fn without(threads: Vec<Thread>, left: &[usize]) -> Vec<Thread> {
+    threads.into_iter().enumerate().filter(|(i, _)| !left.contains(i)).map(|(_, t)| t).collect()
 }
 
 /// How a push went.
@@ -1138,7 +1306,24 @@ mod tests {
     }
 
     fn held(hash: &str) -> Held {
-        Held { hash: hash.into(), legacy: None, bytes: 8, modified: None }
+        Held { hash: hash.into(), legacy: None, raw: None, bytes: 8, modified: None }
+    }
+
+    #[test]
+    fn a_unit_sigil_sends_in_a_form_of_its_own_is_still_the_file_an_agreement_recorded() {
+        // A PS1 card: the file on disk hashes "raw", the unit sigil makes of it "canonical".
+        let card = Held { raw: Some("raw".into()), ..held("canonical") };
+        let last = agreed("raw", 10);
+        assert_eq!(decided(&op("no_op", Some(10), Some("raw")), Some(&card), Some(&last)), Step::Agree { confirm: false });
+        assert_eq!(decided(&op("upload", Some(10), Some("raw")), Some(&card), Some(&last)), Step::Agree { confirm: false });
+        // Another device moved on: unchanged here, so it is only a download — never a conflict.
+        assert_eq!(decided(&op("download", Some(11), Some("newer")), Some(&card), Some(&last)), Step::Download);
+        assert_eq!(decided(&op("no_op", Some(11), Some("newer")), Some(&card), Some(&last)), Step::Download);
+        // No agreement at all, and RomM holds this very file: the same.
+        assert_eq!(decided(&op("no_op", Some(10), Some("raw")), Some(&card), None), Step::Agree { confirm: true });
+        // Changed here since: still sent.
+        let played = Held { raw: Some("raw2".into()), ..held("canonical2") };
+        assert_eq!(decided(&op("no_op", Some(10), Some("raw")), Some(&played), Some(&last)), Step::Upload);
     }
 
     fn agreed(hash: &str, save_id: i64) -> Entry {

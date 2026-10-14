@@ -1,6 +1,6 @@
 [package]
 name = "deckhand"
-version = "0.8.10"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.93"  # edition 2024; sevenz-rust2 0.23 requires 1.93
 description = "A gamepad-first desktop companion for the RomM ROM manager — Rust/iced port"
@@ -61,6 +61,11 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+# argosy-sigil, the C library save sync goes through — see build.rs and `sigil`.
+[build-dependencies]
+cmake = "0.1"
+cc = "1"
 
 [dev-dependencies]
 # Writes the .7z archives the unpacking tests read.

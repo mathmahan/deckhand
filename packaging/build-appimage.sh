@@ -11,7 +11,9 @@
 # and run extracted, so FUSE 2 is not needed on the build machine either.
 #
 # `--here` builds with the cargo already on the PATH instead of starting a container, for a caller
-# that is a bookworm machine with libudev-dev and pkg-config installed — the release workflow's job.
+# that is a bookworm machine with libudev-dev, pkg-config and cmake installed — the release workflow's
+# job. Either way the argosy-sigil submodule has to be checked out (`git submodule update --init
+# --recursive`): build.rs compiles it.
 # It builds into CARGO_TARGET_DIR when that is set, so a target/ kept between builds is used.
 set -eu
 
@@ -34,7 +36,7 @@ else
         -v "$ROOT:/src:ro" -v "$BUILD:/build" \
         -v "${CARGO_HOME:-$HOME/.cargo}/registry:/tmp/cargo/registry" \
         -w /src rust:1-bookworm \
-        sh -c "apt-get update -qq && apt-get install -y -qq libudev-dev pkg-config >/dev/null \
+        sh -c "apt-get update -qq && apt-get install -y -qq libudev-dev pkg-config cmake >/dev/null \
             && cargo build --release --locked; status=\$?; \
             chown -R $(id -u):$(id -g) /build /tmp/cargo/registry; exit \$status"
 fi
