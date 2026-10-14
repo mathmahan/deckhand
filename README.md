@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> **This entire project was vibe-coded with AI assistance.** The code was built iteratively through prompting, testing, debugging and refinement rather than through a traditional from-scratch coding workflow.
+> **This entire project was vibe-coded with AI assistance.** The code was built iteratively through prompting, testing, debugging and refinement rather than through a traditional from-scratch coding workflow. Please backup your saves before using this app.
 
 
 <p align="center"><img src="packaging/deckhand.png" width="128" alt="Deckhand logo"></p>
