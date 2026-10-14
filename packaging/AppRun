@@ -1,0 +1,5 @@
+#!/bin/sh
+# AppImage entry point. Every argument goes to the binary, so the one AppImage is both the window
+# (no arguments) and the save-sync wrapper a launcher calls (`pre`, `post`, `sync`).
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/deckhand" "$@"

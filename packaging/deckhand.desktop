@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Deckhand
+Comment=Browse, download, play and save-sync a RomM library
+Exec=deckhand
+Icon=deckhand
+StartupWMClass=deckhand
+Categories=Game;Utility;
+Terminal=false

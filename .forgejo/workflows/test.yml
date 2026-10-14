@@ -1,0 +1,47 @@
+# Every push to a branch, and every pull request: the tests, then clippy.
+#
+# The job runs in Debian bookworm, as the release builds do. Its image is a Node one because
+# actions/checkout is a Node program run inside the job's container; Rust is installed on top.
+#
+# The toolchain, the crates cargo downloads and target/ live on the `deckhand-build` volume, which
+# outlives the job, so a push compiles what it changed rather than every dependency again. The
+# runner has to allow it (`container.valid_volumes`); without that the job still runs, from
+# scratch. `docker volume rm deckhand-build` starts it over.
+name: test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+      volumes:
+        - deckhand-build:/build
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_HOME: /build/rustup
+      CARGO_HOME: /build/cargo
+      CARGO_TARGET_DIR: /build/target
+      # Nothing here is stepped through, so debug info is not worth writing.
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust and the libraries it links
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libudev-dev pkg-config >/dev/null
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+          fi
+          "$CARGO_HOME/bin/rustup" update stable --no-self-update
+          "$CARGO_HOME/bin/rustup" component add clippy
+          echo "$CARGO_HOME/bin" >> "$FORGEJO_PATH"
+
+      - run: cargo test --locked
+
+      - run: cargo clippy --locked --all-targets -- -D warnings

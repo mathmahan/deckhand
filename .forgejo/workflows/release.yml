@@ -1,0 +1,54 @@
+# A pushed version tag (v0.9.0): the AppImage, attached to a draft release for the tag with its
+# checksum in the notes. Publishing it is left to a person, who writes the notes' first line — the
+# headline the app shows when it offers the update. The Windows .exe is not built here, for now.
+#
+# It is built in Debian bookworm, so it links glibc 2.36 and starts on SteamOS and most
+# distributions; see packaging/build-appimage.sh. The toolchain, the crates and target/ are kept on
+# the `deckhand-build` volume, as the test workflow's are.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: docker
+    container:
+      image: node:24-bookworm
+      volumes:
+        - deckhand-build:/build
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_HOME: /build/rustup
+      CARGO_HOME: /build/cargo
+      CARGO_TARGET_DIR: /build/target
+    steps:
+      - uses: actions/checkout@v6
+
+      # The updater compares the tag with the version the binary was built as. A tag ahead of
+      # Cargo.toml would be offered again and again, as each install of it is still the old version.
+      - name: Check the tag names Cargo.toml's version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "v$version" != "$FORGEJO_REF_NAME" ]; then
+            echo "The tag is $FORGEJO_REF_NAME but Cargo.toml says $version" >&2
+            exit 1
+          fi
+
+      - name: Install Rust and the libraries it links
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libudev-dev pkg-config file jq >/dev/null
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+          fi
+          "$CARGO_HOME/bin/rustup" update stable --no-self-update
+          echo "$CARGO_HOME/bin" >> "$FORGEJO_PATH"
+
+      - run: packaging/build-appimage.sh --here
+
+      - name: Draft the release
+        env:
+          FORGEJO_TOKEN: ${{ forgejo.token }}
+        run: packaging/draft-release.sh "$FORGEJO_REF_NAME" target/appimage/Deckhand-*.AppImage

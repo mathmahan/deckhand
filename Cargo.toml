@@ -1,0 +1,85 @@
+[package]
+name = "deckhand"
+version = "0.8.10"
+edition = "2024"
+rust-version = "1.93"  # edition 2024; sevenz-rust2 0.23 requires 1.93
+description = "A gamepad-first desktop companion for the RomM ROM manager — Rust/iced port"
+license = "GPL-3.0"
+# Where new versions are published — see `release`.
+repository = "https://github.com/mathmahan/deckhand"
+
+[dependencies]
+# GUI. `image` brings the image widget (covers, hero art); `tokio` makes iced drive the same
+# runtime reqwest needs, so a Task can await an HTTP call directly.
+iced = { version = "0.14", features = ["image", "tokio", "advanced"] }
+
+# RomM client. `gzip` because RomM compresses its JSON — a library page comes down at an eighth of
+# its size — while roms, saves and art are sent as they are.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "multipart", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+futures = "0.3"
+
+# Cover pipeline: decode + downscale to display size, and the hero backdrop's blur. `ico` for the
+# platform icons RomM serves, which are what its own interface shows beside a platform's name.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "ico"] }
+
+# Lucide, for the tab bar icons. `iced_aw` is the wrong crate for this — it is a widget library,
+# and its icons were split out into this one, which it depends on itself.
+iced_fonts = { version = "0.3", features = ["lucide"] }
+
+# Gamepad input. SDL's controller mappings are what make every pad — a Deck's built-in controls
+# through Steam Input, an Xbox or a DualSense — read as one layout. Links libudev on Linux, which
+# every systemd distribution and SteamOS has.
+gilrs = "0.11"
+
+# Standalone emulators' saves travel to RomM as one zip per game's save set, the format the
+# Kotlin app uses — and a downloaded rom in a zip is unpacked. Pure Rust throughout: deflate,
+# deflate64 (what Windows' own zipper uses past 2 GB), bzip2 and LZMA.
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma"] }
+# A downloaded rom in a .7z is unpacked too. Pure Rust; reading only.
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["bzip2", "ppmd"] }
+
+dirs = "6"
+
+# The QR code a phone scans to approve this device in RomM — drawn as an image here, so only the
+# encoder.
+qrcode = { version = "0.14", default-features = false }
+
+# Save sync: a save's identity is its content. MD5 rather than anything stronger because it is
+# what RomM's own sync protocol carries as `content_hash`, so the index stays comparable with it.
+md-5 = "0.10"
+# A new AppImage is checked against the SHA-256 its release notes give before it replaces this one.
+sha2 = "0.10"
+# A Steam shortcut's app id is a CRC-32 of its program and name — see `steam`.
+crc32fast = "1"
+
+# Free space on a drive, before a download or an unpack is started on it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+# Writes the .7z archives the unpacking tests read.
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress", "util"] }
+# Renders a page headlessly to a PNG, for looking at one without a window — see the ignored
+# `render_*` tests in `app`.
+iced_test = "0.14"
+# The stub RomM server the pairing and library round-trip tests talk to.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Dependencies are optimised even in a debug build; only Deckhand's own code stays unoptimised, so
+# a backtrace still names real lines. This is here because of one dependency in particular: `image`
+# decodes and resizes ~28x slower unoptimised, which is the difference between opening a system
+# costing 18 CPU-seconds and costing 400. Under `cargo run` that was a multi-second freeze at every
+# core pegged, and it read as an app bug rather than a build-profile one.
+[profile.dev.package."*"]
+opt-level = 3

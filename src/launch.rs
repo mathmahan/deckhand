@@ -1,0 +1,1355 @@
+//! Starting a downloaded game, and what has to happen around it.
+//!
+//! A port of the Kotlin app's `GameLauncher`, kept to its launch order:
+//!
+//! 1. **BIOS**, so a system that will not boot without one has it — see [`crate::bios`].
+//! 2. **The save comes down**, so progress made on another device is what the game opens.
+//! 3. **The game runs**, tracked rather than detached: waiting on it is what tells the app when to
+//!    come back, and when the save it wrote is ready to go up.
+//! 4. **The save goes up**, so the next device starts from here.
+//!
+//! What runs it is RetroDECK, handed the file and the system: `flatpak run net.retrodeck.retrodeck
+//! -s <system> <rom>`. One command for every system, because RetroDECK's own launcher then picks
+//! the emulator from ES-DE's configuration — the user's per-system and per-game choices made in
+//! ES-DE apply here unchanged. The `-s` is what lets a game live outside RetroDECK's `roms/` tree:
+//! without it RetroDECK reads the system out of a `roms/<system>/` segment in the path, which a game
+//! under `~/Games/Deckhand` does not have. A command of the player's own, set in Settings ▸ Playing,
+//! replaces all of it.
+//!
+//! The command names only RetroDECK, so which emulator — and which core — will actually run is read
+//! back out of ES-DE's own files the same way RetroDECK reads them ([`RetroDeck::emulator`]). Save
+//! sync needs that answer: RetroArch may file saves by core, and a standalone emulator keeps saves
+//! this build does not sync at all.
+//!
+//! Steps 1, 2 and 4 are best-effort. None of them is worth not playing over, so each one that fails
+//! becomes a line in the banner afterwards and the launch goes on.
+//!
+//! Step 2 alone is also what a download ends with ([`ready`]): a game's existing progress is laid out
+//! before its first launch, which is what makes "download it here, carry on from where I was" work
+//! without a launch in between.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
+
+use crate::config::{Connection, Settings};
+use crate::downloads::Installed;
+use crate::downloads::layout::{PLAYABLE, extension};
+use crate::library::Stamp;
+use crate::romm::{RommClient, HEARTBEAT_LASTS};
+use crate::romm::models::PlaySession;
+use crate::sync::{self, Report};
+
+/// RetroDECK's Flatpak id.
+pub const RETRODECK: &str = "net.retrodeck.retrodeck";
+
+/// The ES-DE system a RomM platform slug is, which is the name RetroDECK knows it by.
+///
+/// The two mostly agree; these are the ones that do not, from the Kotlin app's `romFolderFor`. It
+/// matters for more than a folder name here — `-s ngc` is a system RetroDECK has no emulator for.
+/// An unknown slug passes through unchanged, so a platform added to RomM still launches if ES-DE
+/// happens to call it the same thing.
+pub fn es_system(slug: &str) -> String {
+    let slug = slug.trim().to_lowercase();
+    match slug.as_str() {
+        "famicom" | "fc" | "family-computer" => "nes",
+        "sfc" | "super-famicom" | "superfamicom" | "super-nintendo-entertainment-system" | "super_nintendo" => "snes",
+        "game-boy" | "gameboy" => "gb",
+        "game-boy-color" | "gameboycolor" => "gbc",
+        "game-boy-advance" | "gameboyadvance" => "gba",
+        "nintendo-64" | "nintendo64" => "n64",
+        "ngc" | "gamecube" | "nintendo-gamecube" => "gc",
+        "wii-u" | "nintendo-wii-u" => "wiiu",
+        "3ds" | "nintendo-3ds" | "new-nintendo-3ds" => "n3ds",
+        "megadrive" | "md" | "sega-genesis" | "sega-mega-drive" | "genesis-slash-megadrive"
+        | "sega-mega-drive-genesis" | "mega-drive" => "genesis",
+        "sms" | "master-system" | "sega-master-system" => "mastersystem",
+        "game-gear" | "sega-game-gear" => "gamegear",
+        "dc" | "sega-dreamcast" => "dreamcast",
+        "ps" | "ps1" | "playstation" => "psx",
+        "playstation-2" | "playstation2" | "sony-playstation-2" => "ps2",
+        "vita" | "playstation-vita" | "ps-vita" => "psvita",
+        "jaguar" | "atari-jaguar" => "atarijaguar",
+        _ => return slug,
+    }
+    .to_string()
+}
+
+/// The file an emulator should be handed for a downloaded game.
+///
+/// The `.m3u` when the download wrote one — a multi-disc set is played through its playlist, which
+/// is what lets the emulator swap discs, and RetroArch names the save after it. Otherwise the one
+/// file, or the one entry point (`.cue`, `.chd`…) among several — never a `.bin` track — or the one
+/// file among notes, pictures and patches that can be the game (a cartridge rom). A folder of
+/// files with no entry point (a PS3 game's tree) is the folder, which is how RetroDECK takes a
+/// "directory as a file" game.
+pub fn target(installed: &Installed) -> PathBuf {
+    let files = &installed.files;
+    let pick = files
+        .iter()
+        .find(|f| extension(f) == "m3u")
+        .or_else(|| (files.len() == 1).then(|| &files[0]))
+        .or_else(|| files.iter().find(|f| PLAYABLE.contains(&extension(f).as_str())))
+        .or_else(|| {
+            // A cartridge rom among notes, pictures or a patch: the one file that can be the game, at
+            // the top or in the rom's own folder. Never that folder — RetroDECK would look in it for
+            // a file named like the folder, and find none.
+            let mut games = files.iter().filter(|f| f.matches('/').count() <= 1 && !crate::downloads::detect::not_a_game(f));
+            games.next().filter(|_| games.next().is_none())
+        });
+    if let Some(file) = pick {
+        return installed.dir.join(file);
+    }
+    // Every file under one folder of the rom's own: that folder is the game.
+    let first = files.first().and_then(|f| f.split_once('/')).map(|(dir, _)| dir);
+    match first {
+        Some(dir) if files.iter().all(|f| f.starts_with(&format!("{dir}/"))) => installed.dir.join(dir),
+        _ => installed.dir.join(files.first().map(String::as_str).unwrap_or_default()),
+    }
+}
+
+/// A command line as the words a program is started with — split at spaces, except inside quotes,
+/// and with a backslash taking the next character as it is: what the Settings field holds, written
+/// the way a shell would take it.
+pub fn split_command(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"') | None, '\\') => {
+                let next = chars.next().ok_or("the command ends with a lone backslash")?;
+                word.get_or_insert_default().push(next);
+            }
+            (Some(_), c) => word.get_or_insert_default().push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            (None, c) if c.is_whitespace() => words.extend(word.take()),
+            (None, c) => word.get_or_insert_default().push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err("a quote in the command is never closed".into());
+    }
+    words.extend(word);
+    Ok(words)
+}
+
+/// Words back into a line [`split_command`] reads the same: quoted where they have to be.
+pub fn join_command(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| {
+            if !w.is_empty() && !w.chars().any(|c| c.is_whitespace() || "\"'\\".contains(c)) {
+                w.clone()
+            } else {
+                format!("'{}'", w.replace('\'', "'\"'\"'"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What will run a game, as far as its saves are concerned.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Emulator {
+    /// RetroArch, running this libretro core (`snes9x`, `swanstation`).
+    Core(String),
+    /// RetroArch, with no way to tell which core. Fine for a RetroArch that does not file saves by
+    /// core; one that does gets its existing saves synced and no new one pulled.
+    RetroArch,
+    /// Something else, by the name ES-DE gives it. Its saves are not RetroArch's, so not synced.
+    Other(String),
+}
+
+impl Emulator {
+    /// Whether this build's save sync covers it, and with which core.
+    pub fn syncs(&self) -> Option<Option<&str>> {
+        match self {
+            Emulator::Core(core) => Some(Some(core)),
+            Emulator::RetroArch => Some(None),
+            Emulator::Other(_) => None,
+        }
+    }
+}
+
+/// What starts games.
+#[derive(Debug, Clone)]
+pub enum Launcher {
+    RetroDeck(RetroDeck),
+    /// The player's own command (`launch_command`): argv words, with `{rom}` and `{system}` filled in.
+    Custom(Vec<String>),
+}
+
+impl Launcher {
+    /// What starts a game of ES-DE `system`: the player's command for that system, else their command
+    /// for every game, else RetroDECK if it is installed.
+    pub fn find(settings: &Settings, system: &str) -> Result<Self, String> {
+        let own = settings.system_commands.get(system).into_iter().chain(&settings.launch_command);
+        if let Some(command) = own.into_iter().find(|c| !c.is_empty()) {
+            return Ok(Launcher::Custom(command.clone()));
+        }
+        RetroDeck::detect().map(Launcher::RetroDeck).ok_or_else(|| {
+            "no emulator is set up for it — install RetroDECK, or choose an emulator in Settings ▸ Playing"
+                .to_string()
+        })
+    }
+
+    /// The argv that plays `rom` as `system`.
+    pub fn command(&self, system: &str, rom: &Path) -> Vec<String> {
+        let rom = rom.to_string_lossy();
+        match self {
+            Launcher::RetroDeck(_) => {
+                ["flatpak", "run", RETRODECK, "-s", system, &rom].map(String::from).to_vec()
+            }
+            Launcher::Custom(words) => {
+                let mut command: Vec<String> =
+                    words.iter().map(|w| w.replace("{rom}", &rom).replace("{system}", system)).collect();
+                // A command that never says where the game goes gets it last, which is where every
+                // emulator's command line takes it.
+                if !words.iter().any(|w| w.contains("{rom}")) {
+                    command.push(rom.into_owned());
+                }
+                command
+            }
+        }
+    }
+
+    /// The argv that plays `rom` as `system` booting straight into RetroArch's state slot 0 — the
+    /// newest state, as save sync lays them out. None when what runs it is not RetroArch, which has
+    /// no such switch.
+    ///
+    /// RetroDECK passes nothing on to the emulator, but takes the command itself with `-e`, filling
+    /// in its placeholders as it does for its own choice: so the command it would choose, read from
+    /// the same tables, goes with `--entryslot 0` on the end.
+    pub fn resume_command(&self, system: &str, rom: &Path) -> Option<Vec<String>> {
+        match self {
+            Launcher::RetroDeck(rd) => {
+                let text = rd.command_text(system, rom).filter(|t| t.contains("%EMULATOR_RETROARCH%"))?;
+                let rom = rom.to_string_lossy().into_owned();
+                Some(["flatpak", "run", RETRODECK, "-e", &format!("{text} --entryslot 0"), "-s", system, &rom].map(String::from).to_vec())
+            }
+            Launcher::Custom(_) => {
+                // RetroArch, by a core or not — nothing else boots into a slot.
+                self.emulator(system, rom).syncs()?;
+                let mut command = self.command(system, rom);
+                command.extend(["--entryslot".to_string(), "0".to_string()]);
+                Some(command)
+            }
+        }
+    }
+
+    /// Which emulator `command` will run `rom` with.
+    pub fn emulator(&self, system: &str, rom: &Path) -> Emulator {
+        match self {
+            Launcher::RetroDeck(rd) => rd.emulator(system, rom),
+            Launcher::Custom(_) => {
+                // Read filled in, so a core named by `{system}` is the system's own.
+                let words = self.command(system, rom);
+                if let Some(core) = crate::cli::core_path(&words).as_deref().and_then(crate::cli::core_id) {
+                    return Emulator::Core(core);
+                }
+                let program = program_name(&words);
+                if program.to_lowercase().contains("retroarch") {
+                    Emulator::RetroArch
+                } else {
+                    Emulator::Other(program)
+                }
+            }
+        }
+    }
+}
+
+/// What a command runs, by name: its program's file name — or, for `flatpak run`, the app it runs
+/// (`net.pcsx2.PCSX2`), since `flatpak` says nothing about which emulator it is.
+fn program_name(words: &[String]) -> String {
+    let file_name = |word: &str| Path::new(word).file_name().map_or_else(|| word.to_string(), |n| n.to_string_lossy().into_owned());
+    let program = words.first().map(String::as_str).unwrap_or_default();
+    if file_name(program) == "flatpak"
+        && let Some(run) = words.iter().position(|w| w == "run")
+        && let Some(app) = words[run + 1..].iter().find(|w| !w.starts_with('-'))
+    {
+        return app.clone();
+    }
+    file_name(program)
+}
+
+/// A command for an emulator picked by its file — a program, an AppImage, or a Flatpak's launcher
+/// in `exports/bin`: the options ES-DE starts it with, for those Deckhand knows, and `{rom}` last.
+/// RetroArch's needs a core as well, which is the player's to add.
+pub fn preset(program: &Path) -> Vec<String> {
+    let name = program.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    // ES-DE's own options for each, from its `es_systems.xml`.
+    const OPTIONS: &[(&str, &[&str])] = &[
+        ("pcsx2", &["-batch"]),
+        ("duckstation", &["-batch"]),
+        ("primehack", &["-b", "-e"]),
+        ("dolphin", &["-b", "-e"]),
+        ("rpcs3", &["--no-gui"]),
+        ("cemu", &["-g"]),
+        ("melonds", &["-f"]),
+        ("gopher64", &["-f"]),
+        ("rosalie", &["--nogui", "-q"]),
+        ("mupen64plus", &["--nogui"]),
+        ("simple64", &["--nogui"]),
+        ("bsnes", &["--fullscreen"]),
+        ("xemu", &["-dvd_path"]),
+    ];
+    let options = OPTIONS.iter().find(|(key, _)| name.contains(key)).map_or(&[][..], |(_, options)| *options);
+    std::iter::once(program.to_string_lossy().into_owned())
+        .chain(options.iter().map(|o| o.to_string()))
+        .chain(["{rom}".to_string()])
+        .collect()
+}
+
+/// A folder RetroDECK's own config, `retrodeck.json`, names under `paths` — where its storage is.
+fn retrodeck_path(key: &str) -> Option<PathBuf> {
+    let config = dirs::home_dir()?.join(".var/app").join(RETRODECK).join("config/retrodeck/retrodeck.json");
+    let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(config).ok()?).ok()?;
+    json.pointer(&format!("/paths/{key}")).and_then(|v| v.as_str()).filter(|p| !p.is_empty()).map(PathBuf::from)
+}
+
+/// RetroDECK's roms folder, the one ES-DE scans: where downloads go by default when RetroDECK is here.
+pub fn retrodeck_roms() -> Option<PathBuf> {
+    retrodeck_path("roms_path").or_else(|| retrodeck_path("rd_home_path").map(|home| home.join("roms")))
+}
+
+/// A RetroDECK install, as far as choosing an emulator goes: ES-DE's data folder, holding the
+/// gamelists that carry per-game and per-system choices, and the `es_systems.xml` tables that turn a
+/// choice into a command, most specific first.
+#[derive(Debug, Clone)]
+pub struct RetroDeck {
+    es_de: PathBuf,
+    systems: Vec<PathBuf>,
+}
+
+impl RetroDeck {
+    /// ES-DE's data folder: gamelists, custom systems, scripts.
+    pub fn es_de(&self) -> &Path {
+        &self.es_de
+    }
+
+    /// RetroDECK on this machine, found by the config it writes — `retrodeck.json`, which also says
+    /// where its storage is.
+    pub fn detect() -> Option<Self> {
+        let home = dirs::home_dir()?;
+        let rd_home = retrodeck_path("rd_home_path")?;
+        let es_de = rd_home.join("ES-DE");
+        // The user's own table, then the one RetroDECK ships, which is readable from outside the
+        // Flatpak. System-wide first, since that is how a Deck has it; a per-user install is legal.
+        let bundled = ["/var/lib/flatpak/app".into(), home.join(".local/share/flatpak/app")]
+            .into_iter()
+            .map(|root: PathBuf| {
+                root.join(RETRODECK)
+                    .join("current/active/files/retrodeck/components/es-de/share/es-de/resources/systems/linux/es_systems.xml")
+            });
+        let systems = std::iter::once(es_de.join("custom_systems/es_systems.xml")).chain(bundled).collect();
+        Some(Self { es_de, systems })
+    }
+
+    /// The emulator RetroDECK will pick for `rom` as `system`, decided the way its `run_game.sh`
+    /// decides it: the game's own `<altemulator>` in ES-DE's gamelist, else the system's
+    /// `<alternativeEmulator>`, else the system's first command. The label picks a `<command>` out of
+    /// the first table that defines the system at all — tables are searched per system rather than
+    /// first-file-wins, because RetroDECK ships a custom table that is all comments.
+    pub fn emulator(&self, system: &str, rom: &Path) -> Emulator {
+        let (command, label) = self.chosen(system, rom);
+        match (command, label) {
+            (Some((label, text)), _) => from_command(&label, &text),
+            // No table could be read. ES-DE calls every standalone command "<Name> (Standalone)" and
+            // none of its RetroArch ones that, so the label alone is a fair answer; no label at all
+            // is the system's default, which is a core for most systems.
+            (None, Some(label)) if label.to_lowercase().contains("(standalone)") => Emulator::Other(label),
+            (None, _) => Emulator::RetroArch,
+        }
+    }
+
+    /// The ES-DE command RetroDECK will run `rom` with, as written in its table —
+    /// `%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/snes9x_libretro.so %ROM%` — chosen as [`Self::emulator`]
+    /// chooses it. What RetroDECK's `-e` takes, filled in by RetroDECK itself.
+    pub fn command_text(&self, system: &str, rom: &Path) -> Option<String> {
+        self.chosen(system, rom).0.map(|(_, text)| text)
+    }
+
+    /// The command chosen for `rom`, by its label, and the label asked for.
+    fn chosen(&self, system: &str, rom: &Path) -> (Option<(String, String)>, Option<String>) {
+        let gamelist = fs::read_to_string(self.es_de.join("gamelists").join(system).join("gamelist.xml")).unwrap_or_default();
+        let gamelist = strip_comments(&gamelist);
+        let name = rom.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let label = game_label(&gamelist, &name).or_else(|| system_label(&gamelist));
+
+        let commands = self
+            .systems
+            .iter()
+            .filter_map(|file| fs::read_to_string(file).ok())
+            .map(|xml| commands_for(&xml, system))
+            .find(|commands| !commands.is_empty())
+            .unwrap_or_default();
+        let command = match &label {
+            Some(label) => commands.iter().find(|(l, _)| l == label),
+            None => commands.first(),
+        };
+        (command.cloned(), label)
+    }
+}
+
+/// An ES-DE command read for what it runs: `%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/snes9x_libretro.so
+/// %ROM%` is RetroArch with `snes9x`.
+fn from_command(label: &str, text: &str) -> Emulator {
+    if !text.contains("%EMULATOR_RETROARCH%") {
+        return Emulator::Other(label.to_string());
+    }
+    let core = text.split_once("%CORE_RETROARCH%/").and_then(|(_, rest)| rest.split_once("_libretro")).map(|(core, _)| core);
+    match core {
+        Some(core) if !core.is_empty() => Emulator::Core(core.to_lowercase()),
+        _ => Emulator::RetroArch,
+    }
+}
+
+/// Every `<command label="…">` of `system` in one `es_systems.xml`, in ES-DE's order.
+fn commands_for(xml: &str, system: &str) -> Vec<(String, String)> {
+    let xml = strip_comments(xml);
+    blocks(&xml, "system")
+        .find(|block| element(block, "name").as_deref() == Some(system))
+        .map(|block| {
+            let mut out = Vec::new();
+            let mut rest = block;
+            while let Some(start) = rest.find("<command") {
+                rest = &rest[start..];
+                let Some(open_end) = rest.find('>') else { break };
+                let open = &rest[..open_end];
+                let Some(close) = rest.find("</command>") else { break };
+                let label = attribute(open, "label").unwrap_or_default();
+                out.push((label, unescape(rest[open_end + 1..close].trim())));
+                rest = &rest[close..];
+            }
+            out
+        })
+        .unwrap_or_default()
+}
+
+/// The `<altemulator>` of the gamelist entry whose path is `./<name>`.
+fn game_label(gamelist: &str, name: &str) -> Option<String> {
+    blocks(gamelist, "game")
+        .find(|game| element(game, "path").is_some_and(|p| p.rsplit('/').next() == Some(name)))
+        .and_then(|game| element(game, "altemulator"))
+        .filter(|l| !l.is_empty())
+}
+
+/// The `<label>` inside a gamelist's `<alternativeEmulator>` header.
+fn system_label(gamelist: &str) -> Option<String> {
+    blocks(gamelist, "alternativeEmulator").next().and_then(|header| element(header, "label")).filter(|l| !l.is_empty())
+}
+
+// ES-DE's files are read with a few string scans rather than an XML parser. They are small and
+// regular, and a gamelist with an emulator override is not well-formed XML anyway — it has two
+// top-level elements, which a strict parser rejects outright.
+
+/// The insides of every `<tag>…</tag>`, in order.
+fn blocks<'a>(xml: &'a str, tag: &str) -> impl Iterator<Item = &'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut rest = xml;
+    std::iter::from_fn(move || {
+        let start = rest.find(&open)? + open.len();
+        let end = rest[start..].find(&close)? + start;
+        let block = &rest[start..end];
+        rest = &rest[end + close.len()..];
+        Some(block)
+    })
+}
+
+/// The text of the first `<tag>…</tag>` in `xml`, trimmed and unescaped.
+fn element(xml: &str, tag: &str) -> Option<String> {
+    blocks(xml, tag).next().map(|t| unescape(t.trim()))
+}
+
+/// `name="value"` from an opening tag.
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let start = tag.find(&format!("{name}=\""))? + name.len() + 2;
+    let end = tag[start..].find('"')? + start;
+    Some(unescape(&tag[start..end]))
+}
+
+fn unescape(s: &str) -> String {
+    s.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+fn strip_comments(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One downloaded game, worked out for playing: the file, the system, what runs it.
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub rom_id: i64,
+    pub title: String,
+    pub rom: PathBuf,
+    pub system: String,
+    pub platform_id: Option<i64>,
+    /// Why there is no launcher, when there is none. A download's save pull goes ahead without
+    /// one, assuming RetroArch, since that is all this build can sync anyway.
+    pub launcher: Result<Launcher, String>,
+    pub emulator: Emulator,
+    /// Which rom the record was downloaded from, and what its files are called — what a sync holds
+    /// the id to before it moves the game's saves under it. See [`Installed::is`].
+    pub stamp: Option<Stamp>,
+    pub names: Vec<String>,
+}
+
+impl Plan {
+    /// Reads ES-DE's tables, so off the UI thread.
+    pub fn new(settings: &Settings, installed: &Installed) -> Self {
+        let rom = target(installed);
+        let system = es_system(&installed.system_id);
+        let launcher = Launcher::find(settings, &system);
+        let emulator = match &launcher {
+            Ok(launcher) => launcher.emulator(&system, &rom),
+            Err(_) => Emulator::RetroArch,
+        };
+        Plan {
+            rom_id: installed.rom_id,
+            title: installed.title.clone(),
+            rom,
+            system,
+            platform_id: installed.platform_id,
+            launcher,
+            emulator,
+            stamp: installed.stamp.clone(),
+            names: installed.names(),
+        }
+    }
+
+    /// Whether `now` — what RomM holds under the game's id — is the rom it was downloaded from.
+    pub fn is(&self, now: &Stamp) -> bool {
+        crate::downloads::holds(self.stamp.as_ref(), &self.names, now)
+    }
+}
+
+/// What the BIOS and save steps need from the app: the pairing, and where its own records live.
+#[derive(Clone)]
+pub struct Context {
+    pub client: RommClient,
+    pub connection: Option<Connection>,
+    pub retroarch_config: Option<PathBuf>,
+    pub store: PathBuf,
+}
+
+/// Steps 1 and 2: the platform's BIOS, then the game's save down from RomM. What a launch does first
+/// and what a finished download does. Answers what is worth telling the user — usually nothing.
+pub async fn ready(ctx: &Context, plan: &Plan) -> Vec<String> {
+    let Some(conn) = &ctx.connection else { return Vec::new() };
+    let mut notes = Vec::new();
+
+    // Only the platform's id finds its firmware, and a record written before it was kept has none,
+    // so that costs one request for the rom's own.
+    let platform_id = match plan.platform_id {
+        Some(id) => Some(id),
+        None => ctx.client.fetch_rom_detail(conn, plan.rom_id).await.ok().and_then(|d| d.platform_id),
+    };
+    // A RetroArch without a BIOS folder, or a RomM with no firmware, is the common case and not news.
+    if let (Some(platform_id), Ok(dir)) = (platform_id, sync::retroarch::bios_dir(ctx.retroarch_config.as_deref()))
+        && let Ok(fetched) = crate::bios::sync(&ctx.client, conn, platform_id, &dir).await
+        && !fetched.is_empty()
+    {
+        notes.push(BIOS_SYNCED.into());
+    }
+
+    notes.extend(sync_any(ctx, conn, plan, true, Vec::new()).await.0);
+    said(notes)
+}
+
+/// Step 4: the save the session wrote, up to RomM, with the play session it ends. Answers what is
+/// worth saying, and whether RomM took the play session with the sync.
+pub async fn settle(ctx: &Context, plan: &Plan, play: Option<PlaySession>) -> (Vec<String>, bool) {
+    match &ctx.connection {
+        Some(conn) => {
+            let (notes, recorded) = sync_any(ctx, conn, plan, false, play.into_iter().collect()).await;
+            (notes, recorded > 0)
+        }
+        None => (Vec::new(), false),
+    }
+}
+
+/// The game's saves, whichever emulator keeps them: RetroArch's battery saves and states, or a
+/// standalone emulator's own. `before` says so once, before play, for one this build cannot sync.
+/// Answers the notes, and how many of `plays` RomM took with the sync.
+async fn sync_any(ctx: &Context, conn: &Connection, plan: &Plan, before: bool, plays: Vec<PlaySession>) -> (Vec<String>, usize) {
+    if let Some(core) = plan.emulator.syncs() {
+        return sync_save(ctx, conn, plan, core, plays).await;
+    }
+    let Emulator::Other(name) = &plan.emulator else { return (Vec::new(), 0) };
+    let Some(emulator) = sync::standalone::Emulator::for_launch(&plan.system, name) else {
+        let notes = if before { vec![format!("it runs on {name}, whose saves this build doesn't sync")] } else { Vec::new() };
+        return (notes, 0);
+    };
+    match sync::standalone::sync(&ctx.client, conn, &ctx.store, emulator, &plan.rom, &plan.title, plan.rom_id, plan.stamp.as_ref(), plays).await {
+        Ok(report) => (save_notes(&report), report.plays_recorded),
+        Err(why) => (vec![format!("{name} saves not synced: {why}")], 0),
+    }
+}
+
+async fn sync_save(ctx: &Context, conn: &Connection, plan: &Plan, core: Option<&str>, plays: Vec<PlaySession>) -> (Vec<String>, usize) {
+    let install = match sync::retroarch::locate(ctx.retroarch_config.as_deref()) {
+        Ok(install) => install,
+        Err(why) => return (vec![format!("saves not synced: {why}")], 0),
+    };
+    match sync::sync_rom(&ctx.client, conn, &install, &ctx.store, &plan.rom, core, plan.rom_id, plan.stamp.as_ref(), plays).await {
+        Ok(report) => (save_notes(&report), report.plays_recorded),
+        Err(why) => (vec![format!("saves not synced: {why}")], 0),
+    }
+}
+
+/// What a note says of a BIOS fetched, whichever files it was.
+const BIOS_SYNCED: &str = "BIOS synced";
+/// What a note says of saves or states moved, either way, however many and whichever they were.
+const SAVES_SYNCED: &str = "saves synced";
+
+/// A sync's report, cut to what a banner should say: that saves moved, and what went wrong — never
+/// "in sync", and never which saves: the game they are is the banner's own subject.
+fn save_notes(report: &Report) -> Vec<String> {
+    let mut notes = Vec::new();
+    // A save changed on both sides is one that moved too: one side of it is now on the other. The
+    // player chose which, or it was the newer.
+    if !(report.pulled.is_empty() && report.pushed.is_empty() && report.conflicts.is_empty()) {
+        notes.push(SAVES_SYNCED.into());
+    }
+    notes.extend(report.other_cores.iter().cloned());
+    notes.extend(report.removed.iter().cloned());
+    notes.extend(report.failed.iter().map(|f| format!("save sync failed: {f}")));
+    notes
+}
+
+/// `notes` with the BIOS and the saves said once, in one line where the first of them was: "BIOS
+/// and saves synced" for a launch that fetched a BIOS, pulled a save before play and pushed one
+/// after.
+fn said(notes: Vec<String>) -> Vec<String> {
+    let bios = notes.iter().any(|n| n == BIOS_SYNCED);
+    let saves = notes.iter().any(|n| n == SAVES_SYNCED);
+    let line = match (bios, saves) {
+        (true, true) => "BIOS and saves synced",
+        (true, false) => BIOS_SYNCED,
+        (false, true) => SAVES_SYNCED,
+        (false, false) => return notes,
+    };
+    let mut out = Vec::with_capacity(notes.len());
+    for note in notes {
+        if note != BIOS_SYNCED && note != SAVES_SYNCED {
+            out.push(note);
+        } else if !out.iter().any(|n| n == line) {
+            out.push(line.into());
+        }
+    }
+    out
+}
+
+/// What a launch sends back.
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// The BIOS and the save are in place and the game is starting.
+    Running(i64),
+    /// The game has closed, and its save is on its way up to RomM.
+    Saving(i64),
+    /// It is over — the game closed and its save went up, or it never started, and why.
+    Ended(i64, Result<Session, String>),
+    /// A save changed both here and on RomM: which to keep. The sync waits on the answer.
+    Conflict(i64, sync::Conflict, Reply),
+}
+
+/// Where a [`Event::Conflict`]'s answer goes — sent once; an event is cloned, an answer is not.
+#[derive(Clone)]
+pub struct Reply(std::sync::Arc<std::sync::Mutex<Option<futures::channel::oneshot::Sender<sync::Choice>>>>);
+
+impl Reply {
+    pub fn new(sender: futures::channel::oneshot::Sender<sync::Choice>) -> Self {
+        Reply(std::sync::Arc::new(std::sync::Mutex::new(Some(sender))))
+    }
+
+    /// Answer. A second answer, or one nobody waits for any more, goes nowhere.
+    pub fn send(&self, choice: sync::Choice) {
+        if let Some(sender) = self.0.lock().ok().and_then(|mut s| s.take()) {
+            let _ = sender.send(choice);
+        }
+    }
+}
+
+impl std::fmt::Debug for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reply")
+    }
+}
+
+/// A finished play session.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub exit: Exit,
+    /// When the game closed, if it ran long enough to count as play — see [`MIN_SESSION`].
+    pub played_at: Option<String>,
+    /// What the steps around it did that is worth saying — a BIOS fetched, a save moved.
+    pub notes: Vec<String>,
+}
+
+/// Where a launch has got to, for whoever started it to show — see [`play`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Step 3: the game is starting.
+    Running,
+    /// Step 4: the game has closed, and its save is going up to RomM.
+    Saving,
+}
+
+/// The whole of a launch, steps 1 to 4. `tell` hears [`Stage::Running`] once, just before the game
+/// starts, and [`Stage::Saving`] once after it closes — only when its save goes anywhere.
+///
+/// An error is a game that never started: no launcher, files gone, a command that would not run.
+/// Anything that goes wrong around a game that did start is a note instead.
+pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut tell: impl FnMut(Stage)) -> Result<Session, String> {
+    let resume = settings.resume_state;
+    let plan = tokio::task::spawn_blocking(move || Plan::new(&settings, &installed))
+        .await
+        .map_err(|e| e.to_string())?;
+    let launcher = plan.launcher.clone()?;
+    if !plan.rom.exists() {
+        return Err(format!("{} is gone — remove the game and download it again", plan.rom.display()));
+    }
+    // The game's id held to RomM before anything goes there under it — a Steam shortcut can start
+    // a game long after the library was last read, and a RomM rebuilt since keeps another game
+    // there. Then the game plays and RomM hears nothing of it: not its save, not that it is being
+    // played, not for how long, all of which would land on that other game.
+    let mut notes = Vec::new();
+    let ctx = match &ctx.connection {
+        Some(conn) => match sync::still_holds(&ctx.client, conn, plan.rom_id, &|now| plan.is(now)).await {
+            Ok(()) => ctx,
+            Err(why) => {
+                notes.push(why);
+                Context { connection: None, ..ctx }
+            }
+        },
+        None => ctx,
+    };
+    notes.extend(ready(&ctx, &plan).await);
+    // Into the newest state, when asked to and there is one here — the save sync just laid it into
+    // slot 0. Only when the file is there: RetroArch refuses to start at all over a missing one.
+    let resumed = resume.then(|| newest_state(&ctx, &plan)).flatten().and_then(|_| launcher.resume_command(&plan.system, &plan.rom));
+    if resumed.is_some() {
+        notes.push("resumed from the newest save state".into());
+    }
+    let command = resumed.unwrap_or_else(|| launcher.command(&plan.system, &plan.rom));
+    tell(Stage::Running);
+    let start = SystemTime::now();
+    let game = tokio::task::spawn_blocking(move || run(&command));
+    let exit = while_playing(&ctx, plan.rom_id, game).await.map_err(|e| e.to_string())??;
+    let play = play_session(plan.rom_id, start, SystemTime::now());
+    if ctx.connection.is_some() {
+        tell(Stage::Saving);
+    }
+    let (more, recorded) = settle(&ctx, &plan, play.clone()).await;
+    notes.extend(more);
+    let played_at = record_session(&ctx, play, recorded, &mut notes).await;
+    Ok(Session { exit, played_at, notes: said(notes) })
+}
+
+/// How often RomM hears that a game is still running: a third of [`HEARTBEAT_LASTS`], so one lost on
+/// the way does not show the game as stopped.
+const HEARTBEAT: Duration = Duration::from_secs(HEARTBEAT_LASTS.as_secs() / 3);
+
+/// Await `game` while telling RomM, every [`HEARTBEAT`], that this device is playing `rom_id`, so its
+/// web app shows the game as being played here — and, once it ends, that it has stopped.
+///
+/// Best effort, like every step around a game. A RomM that has no such thing (before 5.4), does not
+/// know this device or does not let it say so is not asked again this session; any other failure is
+/// one heartbeat missed, and the next goes as usual.
+async fn while_playing<T>(ctx: &Context, rom_id: i64, game: impl Future<Output = T>) -> T {
+    let Some((conn, device)) = ctx.connection.as_ref().and_then(|c| Some((c, c.device_id.as_deref()?))) else {
+        return game.await;
+    };
+    let beats = async {
+        loop {
+            if let Err(e) = ctx.client.heartbeat(conn, device, rom_id).await
+                && matches!(e.status, 401 | 403 | 404 | 405 | 422)
+            {
+                return std::future::pending::<std::convert::Infallible>().await;
+            }
+            tokio::time::sleep(HEARTBEAT).await;
+        }
+    };
+    let out = tokio::select! {
+        out = game => out,
+        never = beats => match never {},
+    };
+    let _ = ctx.client.clear_heartbeat(conn, device).await;
+    out
+}
+
+/// The game's newest save state on this device — slot 0, where save sync lays the newest — if
+/// RetroArch runs it and the file is there.
+fn newest_state(ctx: &Context, plan: &Plan) -> Option<PathBuf> {
+    let core = plan.emulator.syncs()?;
+    let install = sync::retroarch::locate(ctx.retroarch_config.as_deref()).ok()?;
+    let dir = install.for_game(&plan.rom, core).game_states_dir(&plan.rom, core).ok()?;
+    let stem = plan.rom.file_stem()?.to_string_lossy().into_owned();
+    Some(dir.join(format!("{stem}.state"))).filter(|p| p.is_file())
+}
+
+/// A session shorter than this is a game that crashed on boot or was closed from its menu, not play.
+pub const MIN_SESSION: Duration = Duration::from_secs(20);
+
+/// The time between `start` and `end` as a play session of `rom_id`, if it was long enough to be one.
+pub fn play_session(rom_id: i64, start: SystemTime, end: SystemTime) -> Option<PlaySession> {
+    let duration = end.duration_since(start).unwrap_or_default();
+    (duration >= MIN_SESSION).then(|| PlaySession {
+        rom_id: Some(rom_id),
+        save_slot: Some(sync::session::AUTOSAVE.into()),
+        start_time: sync::format_timestamp(start),
+        end_time: sync::format_timestamp(end),
+        duration_ms: duration.as_millis() as u64,
+    })
+}
+
+/// Make sure RomM has the session, answering when it ended if it counted as play.
+///
+/// It goes with the sync session that follows the game where RomM holds those (`recorded`), on its
+/// own otherwise. RomM is what keeps `last_played`, which orders *Continue playing* on every device,
+/// and the playtime. Whether or not RomM took it, the answer is still the end time: the game was
+/// played here, and Home should say so now rather than after the next library sync.
+async fn record_session(ctx: &Context, play: Option<PlaySession>, recorded: bool, notes: &mut Vec<String>) -> Option<String> {
+    let play = play?;
+    if !recorded
+        && let Some(conn) = &ctx.connection
+        && let Err(e) = ctx.client.post_play_session(conn, &play).await
+    {
+        notes.push(format!("playtime not recorded on RomM: {e}"));
+    }
+    Some(play.end_time)
+}
+
+/// Steps 1 and 2 for a game that has just finished downloading, so its first launch — here or from
+/// anywhere else that opens these files — starts from the progress RomM already holds.
+pub async fn after_download(ctx: Context, settings: Settings, installed: Installed) -> Vec<String> {
+    match tokio::task::spawn_blocking(move || Plan::new(&settings, &installed)).await {
+        Ok(plan) => ready(&ctx, &plan).await,
+        Err(_) => Vec::new(),
+    }
+}
+
+/// How a game's process ended.
+#[derive(Debug, Clone)]
+pub struct Exit {
+    pub success: bool,
+    pub code: Option<i32>,
+    /// The last thing it printed, for a launch that failed — usually the reason.
+    pub last_line: Option<String>,
+}
+
+/// Step 3: run `command` and wait for it. Blocking — the caller puts it on a thread of its own.
+///
+/// Both outputs are drained as they come, because a child whose pipe fills stops, and only the last
+/// line of each is kept: an emulator can print every frame for hours. Stderr's wins, since that is
+/// where a launcher says why it gave up.
+pub fn run(command: &[String]) -> Result<Exit, String> {
+    let (program, args) = command.split_first().ok_or("the launch command is empty")?;
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start {program}: {e}"))?;
+    let stdout = child.stdout.take().map(last_line);
+    let stderr = child.stderr.take().map(last_line);
+    let status = child.wait().map_err(|e| format!("lost track of {program}: {e}"))?;
+    let joined = |reader: Option<std::thread::JoinHandle<Option<String>>>| reader.and_then(|r| r.join().ok().flatten());
+    let (stderr, stdout) = (joined(stderr), joined(stdout));
+    Ok(Exit { success: status.success(), code: status.code(), last_line: stderr.or(stdout) })
+}
+
+/// Read `pipe` to the end on a thread of its own, keeping its last non-blank line.
+fn last_line(pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Option<String>> {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut last = None;
+        for line in std::io::BufReader::new(pipe).split(b'\n').map_while(Result::ok) {
+            let line = String::from_utf8_lossy(&line).trim().to_string();
+            if !line.is_empty() {
+                last = Some(line);
+            }
+        }
+        last
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_command_line_splits_as_a_shell_would_and_joins_back_the_same() {
+        let words = split_command(r#"retroarch -L "/my cores/{system}.so" --config='a b.cfg' it\'s {rom}"#).unwrap();
+        assert_eq!(words, ["retroarch", "-L", "/my cores/{system}.so", "--config=a b.cfg", "it's", "{rom}"]);
+        assert_eq!(split_command(&join_command(&words)).unwrap(), words);
+        assert_eq!(split_command("  ").unwrap(), Vec::<String>::new());
+        assert_eq!(split_command("a '' b").unwrap(), ["a", "", "b"], "an empty word is still a word");
+        assert!(split_command("retroarch 'open").is_err());
+        assert!(split_command("retroarch \\").is_err());
+        assert_eq!(join_command(&["flatpak".into(), "run".into(), "x".into()]), "flatpak run x", "nothing quoted that need not be");
+    }
+
+    fn installed(files: &[&str]) -> Installed {
+        Installed {
+            host: String::new(),
+            rom_id: 1,
+            title: "Game".into(),
+            system_id: "psx".into(),
+            platform_id: None,
+            dir: PathBuf::from("/g/psx"),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            bytes: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn romm_slugs_become_the_systems_es_de_knows() {
+        assert_eq!(es_system("ngc"), "gc");
+        assert_eq!(es_system("PS"), "psx");
+        assert_eq!(es_system("snes"), "snes");
+        assert_eq!(es_system("some-new-thing"), "some-new-thing");
+    }
+
+    #[test]
+    fn the_target_is_the_playlist_the_file_or_the_entry_point() {
+        assert_eq!(target(&installed(&["a.cue", "a.bin", "b.cue", "b.bin", "Game.m3u"])), PathBuf::from("/g/psx/Game.m3u"));
+        assert_eq!(target(&installed(&["Tetris.gb"])), PathBuf::from("/g/psx/Tetris.gb"));
+        assert_eq!(target(&installed(&["G/track01.bin", "G/G.cue"])), PathBuf::from("/g/psx/G/G.cue"));
+        assert_eq!(
+            target(&installed(&["G/PS3_GAME/USRDIR/EBOOT.BIN", "G/PS3_GAME/PARAM.SFO"])),
+            PathBuf::from("/g/psx/G"),
+            "a tree with no entry point is its folder"
+        );
+        assert_eq!(
+            target(&installed(&["Mana/Mana.sfc", "Mana/readme.txt", "Mana/Mana.ips"])),
+            PathBuf::from("/g/psx/Mana/Mana.sfc"),
+            "a cartridge rom among notes is the rom, not its folder"
+        );
+        assert_eq!(target(&installed(&["Mana.sfc", "cover.png"])), PathBuf::from("/g/psx/Mana.sfc"));
+    }
+
+    #[test]
+    fn a_system_s_own_command_comes_first_and_a_flatpak_is_known_by_its_app() {
+        use crate::sync::standalone::Emulator as Standalone;
+        let mut settings =
+            Settings { launch_command: Some(split_command("retroarch -L /c/snes9x_libretro.so").unwrap()), ..Settings::default() };
+        settings.system_commands.insert("ps2".into(), split_command("flatpak run net.pcsx2.PCSX2 -batch {rom}").unwrap());
+        let rom = Path::new("/g/ps2/Game.chd");
+        let ps2 = Launcher::find(&settings, "ps2").unwrap();
+        assert_eq!(ps2.command("ps2", rom), ["flatpak", "run", "net.pcsx2.PCSX2", "-batch", "/g/ps2/Game.chd"]);
+        assert_eq!(ps2.emulator("ps2", rom), Emulator::Other("net.pcsx2.PCSX2".into()));
+        assert_eq!(Standalone::for_launch("ps2", "net.pcsx2.PCSX2"), Some(Standalone::Pcsx2), "so its saves sync");
+        let snes = Launcher::find(&settings, "snes").unwrap();
+        assert_eq!(snes.emulator("snes", rom), Emulator::Core("snes9x".into()), "the rest start the shared way");
+
+        // Picked from Flatpak's exports, the launcher's name is the app's.
+        let exported = Launcher::Custom(preset(Path::new("/var/lib/flatpak/exports/bin/net.pcsx2.PCSX2")));
+        assert_eq!(exported.emulator("ps2", rom), Emulator::Other("net.pcsx2.PCSX2".into()));
+        // A core named by `{system}` is read filled in.
+        let by_system = Launcher::Custom(split_command("retroarch -L /cores/{system}_libretro.so {rom}").unwrap());
+        assert_eq!(by_system.emulator("mgba", rom), Emulator::Core("mgba".into()));
+    }
+
+    #[test]
+    fn a_picked_emulator_gets_the_options_es_de_starts_it_with() {
+        let appimage = "/home/deck/Applications/pcsx2-v2.2.0-linux-appimage-x64-Qt.AppImage";
+        assert_eq!(preset(Path::new(appimage)), [appimage, "-batch", "{rom}"]);
+        let dolphin = "/var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu";
+        assert_eq!(preset(Path::new(dolphin)), [dolphin, "-b", "-e", "{rom}"]);
+        assert_eq!(preset(Path::new("/usr/bin/rpcs3")), ["/usr/bin/rpcs3", "--no-gui", "{rom}"]);
+        assert_eq!(preset(Path::new("/usr/bin/PPSSPPSDL")), ["/usr/bin/PPSSPPSDL", "{rom}"], "nothing to add");
+    }
+
+    #[test]
+    fn the_readme_s_example_commands_read_as_it_says() {
+        let launcher = |line: &str| Launcher::Custom(split_command(line).unwrap());
+        let rom = Path::new("/g/snes/Game.sfc");
+        let native = launcher("retroarch -L /usr/lib/libretro/snes9x_libretro.so {rom}");
+        assert_eq!(native.emulator("snes", rom), Emulator::Core("snes9x".into()));
+        let flatpak = launcher(
+            "flatpak run org.libretro.RetroArch -L /home/deck/.var/app/org.libretro.RetroArch/config/retroarch/cores/mgba_libretro.so {rom}",
+        );
+        assert_eq!(flatpak.emulator("gba", rom), Emulator::Core("mgba".into()));
+        let windows = split_command(r"'C:\RetroArch-Win64\retroarch.exe' -L 'C:\RetroArch-Win64\cores\snes9x_libretro.dll' {rom}").unwrap();
+        assert_eq!(windows, [r"C:\RetroArch-Win64\retroarch.exe", "-L", r"C:\RetroArch-Win64\cores\snes9x_libretro.dll", "{rom}"]);
+
+        // An emulator per system, as picking its file fills it in — and whose saves sync.
+        use crate::sync::standalone::Emulator as Standalone;
+        for (system, file, line, standalone) in [
+            (
+                "ps2",
+                "/home/deck/Applications/pcsx2-v2.2.0-linux-appimage-x64-Qt.AppImage",
+                "/home/deck/Applications/pcsx2-v2.2.0-linux-appimage-x64-Qt.AppImage -batch {rom}",
+                Standalone::Pcsx2,
+            ),
+            (
+                "gc",
+                "/var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu",
+                "/var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu -b -e {rom}",
+                Standalone::Dolphin,
+            ),
+        ] {
+            assert_eq!(join_command(&preset(Path::new(file))), line);
+            let Emulator::Other(name) = launcher(line).emulator(system, rom) else { panic!("{line}") };
+            assert_eq!(Standalone::for_launch(system, &name), Some(standalone), "{line}");
+        }
+    }
+
+    #[test]
+    fn retrodeck_is_told_the_system_and_a_custom_command_is_filled_in() {
+        let rom = Path::new("/g/gc/Game.rvz");
+        let rd = Launcher::RetroDeck(RetroDeck { es_de: PathBuf::new(), systems: Vec::new() });
+        assert_eq!(rd.command("gc", rom), ["flatpak", "run", RETRODECK, "-s", "gc", "/g/gc/Game.rvz"]);
+
+        let custom = Launcher::Custom(vec!["retroarch".into(), "-L".into(), "/c/{system}_libretro.so".into(), "{rom}".into()]);
+        assert_eq!(custom.command("gc", rom), ["retroarch", "-L", "/c/gc_libretro.so", "/g/gc/Game.rvz"]);
+        let bare = Launcher::Custom(vec!["dolphin-emu".into(), "-b".into()]);
+        assert_eq!(bare.command("gc", rom), ["dolphin-emu", "-b", "/g/gc/Game.rvz"], "the game goes last");
+        assert_eq!(bare.emulator("gc", rom), Emulator::Other("dolphin-emu".into()));
+        let ra = Launcher::Custom(vec!["retroarch".into(), "-L".into(), "/c/mgba_libretro.so".into()]);
+        assert_eq!(ra.emulator("gba", rom), Emulator::Core("mgba".into()));
+    }
+
+    const SYSTEMS: &str = r#"<?xml version="1.0"?>
+<systemList>
+  <system>
+    <name>snes</name>
+    <command label="Snes9x - Current">%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/snes9x_libretro.so %ROM%</command>
+    <command label="bsnes">%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/bsnes_libretro.so %ROM%</command>
+  </system>
+  <system>
+    <name>gc</name>
+    <command label="Dolphin (Standalone)">%EMULATOR_DOLPHIN% -b -e %ROM%</command>
+  </system>
+</systemList>"#;
+
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(name: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("deckhand-launch-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("ES-DE/custom_systems")).unwrap();
+            fs::write(root.join("bundled.xml"), SYSTEMS).unwrap();
+            // RetroDECK's shipped custom table: every entry commented out.
+            fs::write(
+                root.join("ES-DE/custom_systems/es_systems.xml"),
+                "<systemList><!-- <system><name>snes</name><command label=\"x\">nope</command></system> --></systemList>",
+            )
+            .unwrap();
+            Self(root)
+        }
+
+        fn retrodeck(&self) -> RetroDeck {
+            RetroDeck {
+                es_de: self.0.join("ES-DE"),
+                systems: vec![self.0.join("ES-DE/custom_systems/es_systems.xml"), self.0.join("bundled.xml")],
+            }
+        }
+
+        fn gamelist(&self, system: &str, xml: &str) {
+            let dir = self.0.join("ES-DE/gamelists").join(system);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("gamelist.xml"), xml).unwrap();
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn resuming_hands_retroarch_the_newest_slot_through_retrodeck_or_a_command_of_one_s_own() {
+        let tree = Tree::new("resume");
+        let rd = Launcher::RetroDeck(tree.retrodeck());
+        let rom = Path::new("/g/snes/Chrono.sfc");
+        assert_eq!(
+            rd.resume_command("snes", rom).unwrap(),
+            [
+                "flatpak",
+                "run",
+                RETRODECK,
+                "-e",
+                "%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/snes9x_libretro.so %ROM% --entryslot 0",
+                "-s",
+                "snes",
+                "/g/snes/Chrono.sfc"
+            ],
+            "the command RetroDECK would choose, as RetroDECK's -e takes one"
+        );
+        assert_eq!(rd.resume_command("gc", Path::new("/g/gc/Game.rvz")), None, "Dolphin has no state slots to boot into");
+
+        let ra = Launcher::Custom(vec!["retroarch".into(), "-L".into(), "/c/snes9x_libretro.so".into()]);
+        assert_eq!(ra.resume_command("snes", rom).unwrap(), ["retroarch", "-L", "/c/snes9x_libretro.so", "/g/snes/Chrono.sfc", "--entryslot", "0"]);
+        let other = Launcher::Custom(vec!["dolphin-emu".into(), "-b".into()]);
+        assert_eq!(other.resume_command("gc", rom), None);
+    }
+
+    #[test]
+    fn the_emulator_is_es_des_choice_game_then_system_then_default() {
+        let tree = Tree::new("choice");
+        let rd = tree.retrodeck();
+        let rom = Path::new("/g/snes/Chrono Trigger (USA).sfc");
+        assert_eq!(rd.emulator("snes", rom), Emulator::Core("snes9x".into()), "the first command is the default");
+        assert_eq!(rd.emulator("gc", Path::new("/g/gc/x.rvz")), Emulator::Other("Dolphin (Standalone)".into()));
+
+        // A system-wide choice, in the two-root shape ES-DE writes.
+        tree.gamelist("snes", "<alternativeEmulator><label>bsnes</label></alternativeEmulator>\n<gameList></gameList>");
+        assert_eq!(rd.emulator("snes", rom), Emulator::Core("bsnes".into()));
+
+        // A per-game one wins over it, matched by file name wherever the game lives.
+        tree.gamelist(
+            "snes",
+            "<alternativeEmulator><label>bsnes</label></alternativeEmulator>\n<gameList><game><path>./Chrono Trigger (USA).sfc</path>\
+             <altemulator>Snes9x - Current</altemulator></game></gameList>",
+        );
+        assert_eq!(rd.emulator("snes", rom), Emulator::Core("snes9x".into()));
+        assert_eq!(rd.emulator("snes", Path::new("/g/snes/Other.sfc")), Emulator::Core("bsnes".into()));
+    }
+
+    #[test]
+    fn with_no_table_to_read_the_label_decides() {
+        let tree = Tree::new("label");
+        let rd = RetroDeck { es_de: tree.0.join("ES-DE"), systems: Vec::new() };
+        let rom = Path::new("/g/gc/x.rvz");
+        assert_eq!(rd.emulator("gc", rom), Emulator::RetroArch);
+        tree.gamelist("gc", "<alternativeEmulator><label>Dolphin (Standalone)</label></alternativeEmulator>");
+        assert_eq!(rd.emulator("gc", rom), Emulator::Other("Dolphin (Standalone)".into()));
+    }
+
+    /// A downloaded game, a RetroArch to play it with, and a RomM holding its BIOS and a save from
+    /// another device — then a launch that writes new progress.
+    #[tokio::test]
+    async fn a_download_gets_its_bios_and_save_and_a_launch_sends_the_new_save_back() {
+        const CHRONO: &str = "Chrono Trigger (USA)";
+        let root = std::env::temp_dir().join(format!("deckhand-launch-play-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ra")).unwrap();
+        fs::create_dir_all(root.join("games/snes")).unwrap();
+        fs::write(root.join(format!("games/snes/{CHRONO}.sfc")), "rom").unwrap();
+        fs::write(
+            root.join("ra/retroarch.cfg"),
+            format!(
+                "savefile_directory = \"{0}/saves\"\nsystem_directory = \"{0}/bios\"\n\
+                 sort_savefiles_by_content_enable = \"true\"\nsort_savefiles_enable = \"false\"\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        let save = root.join(format!("saves/snes/{CHRONO}.srm"));
+        let other_device = serde_json::json!({
+            "id": 11, "rom_id": 1, "file_name": format!("{CHRONO} [2026-07-01_10-00-00].srm"),
+            "emulator": "snes9x", "updated_at": "2026-07-01T10:00:00Z",
+            "download_path": "/api/raw/assets/saves/11.srm",
+        });
+        let pushed = serde_json::json!({
+            "id": 12, "rom_id": 1, "file_name": format!("{CHRONO} [2026-07-02_10-00-00].srm"),
+            "emulator": "snes9x", "updated_at": "2026-07-02T10:00:00Z",
+        });
+        let (host, requests) = crate::stub_server::start_recording(vec![
+            ("GET /api/raw/assets/saves/11.srm", 200, "from the other device".into()),
+            ("GET /api/saves", 200, format!("[{other_device}]")),
+            ("POST /api/saves", 201, pushed.to_string()),
+            ("GET /api/states", 200, "[]".into()),
+            ("GET /api/firmware?platform_id=7", 200, r#"[{"id":3,"file_name":"bios.bin","file_size_bytes":4}]"#.into()),
+            ("GET /api/firmware/3/content/bios.bin", 200, "BIOS".into()),
+        ])
+        .await;
+
+        let settings = Settings {
+            retroarch_config: Some(root.join("ra/retroarch.cfg")),
+            // A RetroArch command line in shape — `-L` names the core — that "plays" by writing a save.
+            launch_command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("printf 'played here' > '{}'", save.display()),
+                "-L".into(),
+                "/cores/snes9x_libretro.so".into(),
+            ]),
+            ..Settings::default()
+        };
+        let ctx = Context {
+            client: RommClient::new().unwrap(),
+            connection: Some(Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None }),
+            retroarch_config: settings.retroarch_config.clone(),
+            store: root.join("store"),
+        };
+        let mut game = installed(&[&format!("{CHRONO}.sfc")]);
+        game.system_id = "snes".into();
+        game.platform_id = Some(7);
+        game.dir = root.join("games/snes");
+
+        let notes = after_download(ctx.clone(), settings.clone(), game.clone()).await;
+        assert_eq!(notes, ["BIOS and saves synced"], "said, not named");
+        assert_eq!(fs::read_to_string(root.join("bios/bios.bin")).unwrap(), "BIOS");
+        assert_eq!(fs::read_to_string(&save).unwrap(), "from the other device");
+
+        let mut stages = Vec::new();
+        let session = play(ctx.clone(), settings.clone(), game.clone(), |stage| stages.push(stage)).await.unwrap();
+        assert!(session.exit.success, "{session:?}");
+        assert_eq!(stages, [Stage::Running, Stage::Saving]);
+        assert_eq!(session.notes, ["saves synced"], "nothing new to pull before, the new save after");
+
+        // Asked to resume, it does only once there is a state in slot 0 to boot into: RetroArch will
+        // not start at all over a missing one.
+        let resuming = Settings { resume_state: true, ..settings.clone() };
+        let session = play(ctx.clone(), resuming.clone(), game.clone(), |_| {}).await.unwrap();
+        assert!(!session.notes.iter().any(|n| n.contains("resumed")), "{:?}", session.notes);
+        let plan = Plan::new(&resuming, &game);
+        let states = sync::retroarch::locate(resuming.retroarch_config.as_deref()).unwrap().game_states_dir(&plan.rom, Some("snes9x")).unwrap();
+        fs::create_dir_all(&states).unwrap();
+        fs::write(states.join(format!("{CHRONO}.state")), "state").unwrap();
+        let session = play(ctx, resuming, game, |_| {}).await.unwrap();
+        assert!(session.notes.iter().any(|n| n.contains("resumed from the newest save state")), "{:?}", session.notes);
+        assert!(requests.lock().unwrap().iter().any(|r| r.starts_with("POST /api/saves?rom_id=1")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_session_long_enough_to_be_play_is_posted_and_a_short_one_is_not() {
+        let (host, requests) = crate::stub_server::start_recording(vec![("POST /api/play-sessions", 200, "{}".into())]).await;
+        let ctx = Context {
+            client: RommClient::new().unwrap(),
+            connection: Some(Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None }),
+            retroarch_config: None,
+            store: PathBuf::new(),
+        };
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_900_000);
+        let mut notes = Vec::new();
+        let short = play_session(1, start, start + Duration::from_secs(5));
+        assert_eq!(short, None, "a crash on boot is not play");
+        assert_eq!(record_session(&ctx, short, false, &mut notes).await, None);
+        assert!(requests.lock().unwrap().is_empty());
+
+        let long = play_session(1, start, start + Duration::from_secs(600));
+        assert_eq!(long.as_ref().map(|p| (p.duration_ms, p.save_slot.as_deref())), Some((600_000, Some("autosave"))));
+        // Taken with the sync session already: not posted again.
+        assert_eq!(record_session(&ctx, long.clone(), true, &mut notes).await.as_deref(), Some("2026-07-01T10:10:00Z"));
+        assert!(requests.lock().unwrap().is_empty());
+
+        let ended = record_session(&ctx, long, false, &mut notes).await;
+        assert_eq!(ended.as_deref(), Some("2026-07-01T10:10:00Z"));
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn romm_hears_a_game_is_being_played_until_it_ends() {
+        let (host, requests) = crate::stub_server::start_recording(vec![
+            ("POST /api/activity/heartbeat", 200, "{}".into()),
+            ("DELETE /api/activity/heartbeat", 204, String::new()),
+        ])
+        .await;
+        let device = |id: Option<&str>| Context {
+            client: RommClient::new().unwrap(),
+            connection: Some(Connection { host: host.clone(), token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: id.map(str::to_string) }),
+            retroarch_config: None,
+            store: PathBuf::new(),
+        };
+        let game = tokio::time::sleep(Duration::from_millis(300));
+        while_playing(&device(Some("deck-1")), 42, game).await;
+        let lines = requests.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("POST /api/activity/heartbeat"));
+        assert!(lines[1].starts_with("DELETE /api/activity/heartbeat?device_id=deck-1"));
+
+        // Not yet a device RomM knows: nobody to say it of.
+        requests.lock().unwrap().clear();
+        assert_eq!(while_playing(&device(None), 42, async { 7 }).await, 7);
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_romm_without_activity_is_not_asked_again_while_the_game_runs() {
+        let (host, requests) = crate::stub_server::start_recording(vec![]).await;
+        let ctx = Context {
+            client: RommClient::new().unwrap(),
+            connection: Some(Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: Some("d".into()) }),
+            retroarch_config: None,
+            store: PathBuf::new(),
+        };
+        let finished = while_playing(&ctx, 42, async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            "exit"
+        });
+        assert_eq!(finished.await, "exit", "the game's own answer, whatever RomM said");
+        let beats = requests.lock().unwrap().iter().filter(|l| l.starts_with("POST")).count();
+        assert_eq!(beats, 1);
+    }
+
+    #[test]
+    fn a_process_is_waited_on_and_its_last_word_kept() {
+        let ok = run(&["sh".into(), "-c".into(), "echo starting; echo done".into()]).unwrap();
+        assert!(ok.success);
+        let failed = run(&["sh".into(), "-c".into(), "echo out; echo 'no such game' >&2; exit 3".into()]).unwrap();
+        assert_eq!((failed.success, failed.code, failed.last_line.as_deref()), (false, Some(3), Some("no such game")));
+        assert!(run(&["/nonexistent/launcher".into()]).unwrap_err().contains("could not start"));
+    }
+
+    /// RomM rebuilt under the device, and Steam starts a game by the id it had: the game plays, and
+    /// nothing of it — its save, that it is being played — goes to the game RomM keeps there now.
+    #[tokio::test]
+    async fn a_game_whose_id_a_rebuilt_romm_gave_to_another_plays_without_its_saves_moving() {
+        const MANA: &str = "Secret of Mana (USA)";
+        let root = std::env::temp_dir().join(format!("deckhand-launch-rebuilt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ra")).unwrap();
+        fs::create_dir_all(root.join("games/snes")).unwrap();
+        fs::write(root.join(format!("games/snes/{MANA}.sfc")), "rom").unwrap();
+        fs::write(root.join("ra/retroarch.cfg"), format!("savefile_directory = \"{}/saves\"\n", root.display())).unwrap();
+        let save = root.join(format!("saves/{MANA}.srm"));
+        let zipang = serde_json::json!({ "id": 1, "fs_name_no_ext": "Zipang (Japan)", "created_at": "2026-10-12T19:00:00+00:00" });
+        let (host, requests) = crate::stub_server::start_recording(vec![("GET /api/roms/1/simple", 200, zipang.to_string())]).await;
+
+        let settings = Settings {
+            retroarch_config: Some(root.join("ra/retroarch.cfg")),
+            launch_command: Some(vec!["sh".into(), "-c".into(), format!("mkdir -p '{0}' && printf 'played' > '{1}'", root.join("saves").display(), save.display()), "-L".into(), "/cores/snes9x_libretro.so".into()]),
+            ..Settings::default()
+        };
+        let ctx = Context {
+            client: RommClient::new().unwrap(),
+            connection: Some(Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: Some("deck".into()) }),
+            retroarch_config: settings.retroarch_config.clone(),
+            store: root.join("store"),
+        };
+        let mut game = installed(&[&format!("{MANA}.sfc")]);
+        game.system_id = "snes".into();
+        game.platform_id = Some(7);
+        game.dir = root.join("games/snes");
+        game.stamp = Some(Stamp { stem: MANA.into(), born: Some("2026-08-01T22:26:48+00:00".into()) });
+
+        let mut stages = Vec::new();
+        let session = play(ctx, settings, game, |stage| stages.push(stage)).await.unwrap();
+
+        assert!(session.exit.success && fs::read_to_string(&save).unwrap() == "played", "the game ran");
+        assert_eq!(stages, [Stage::Running], "with no save going up, nothing waits on one after");
+        assert_eq!(session.notes.len(), 1, "{:?}", session.notes);
+        assert!(session.notes[0].contains("\"Zipang (Japan)\""), "and says why its save stayed: {:?}", session.notes);
+        let asked = requests.lock().unwrap().clone();
+        assert!(asked.iter().all(|r| r.starts_with("GET /api/roms/1/simple")), "RomM was asked, and told nothing: {asked:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+}
