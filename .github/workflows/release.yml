@@ -1,0 +1,83 @@
+# A pushed version tag (0.9.2): the AppImage, attached to a draft release for the tag with its
+# checksum in the notes. Publishing it is left to a person, who writes the notes' first line — the
+# headline the app shows when it offers the update. The Windows .exe is not built here.
+#
+# The app's updater (src/release.rs) installs an AppImage only when the notes give its SHA-256 on a
+# line naming it, and a draft is never offered. Run again for the same tag, the file and its
+# checksum line are replaced and the rest of the notes is kept.
+#
+# It is built in Debian bookworm, so it links glibc 2.36 and starts on SteamOS and most
+# distributions; see packaging/build-appimage.sh. The release is drafted from a second job on the
+# runner itself, which has gh.
+name: release
+
+on:
+  push:
+    tags: ['[0-9]*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: node:24-bookworm
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # argosy-sigil, the save library build.rs compiles, and the libraries it vendors.
+          submodules: recursive
+
+      # The updater compares the tag with the version the binary was built as. A tag ahead of
+      # Cargo.toml would be offered again and again, as each install of it is still the old version.
+      - name: Check the tag names Cargo.toml's version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "The tag is $GITHUB_REF_NAME but Cargo.toml says $version" >&2
+            exit 1
+          fi
+
+      - name: Install Rust and the libraries it links
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libudev-dev pkg-config cmake file >/dev/null
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - run: packaging/build-appimage.sh --here
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: target/appimage/Deckhand-*.AppImage
+          if-no-files-found: error
+
+  draft:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: appimage
+
+      - name: Draft the release
+        run: |
+          file="$(ls Deckhand-*.AppImage)"
+          line="sha256 \`$(sha256sum "$file" | cut -d' ' -f1)\` $file"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release view "$TAG" --json body --jq .body | grep -vF "$file" > notes.md || true
+            printf '%s\n' "$line" >> notes.md
+            gh release edit "$TAG" --notes-file notes.md
+            gh release upload "$TAG" "$file" --clobber
+          else
+            printf '**New in %s: …**\n\n%s\n' "$TAG" "$line" > notes.md
+            gh release create "$TAG" "$file" --draft --verify-tag --title "Deckhand $TAG" --notes-file notes.md
+          fi
+          echo "Draft $TAG: write its first line and publish it at $(gh release view "$TAG" --json url --jq .url)"
