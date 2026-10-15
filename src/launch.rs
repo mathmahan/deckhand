@@ -299,6 +299,7 @@ pub fn preset(program: &Path) -> Vec<String> {
         ("simple64", &["--nogui"]),
         ("bsnes", &["--fullscreen"]),
         ("xemu", &["-dvd_path"]),
+        ("eden", &["-f", "-g"]),
     ];
     let options = OPTIONS.iter().find(|(key, _)| name.contains(key)).map_or(&[][..], |(_, options)| *options);
     std::iter::once(program.to_string_lossy().into_owned())
@@ -979,6 +980,10 @@ mod tests {
         assert_eq!(preset(Path::new(dolphin)), [dolphin, "-b", "-e", "{rom}"]);
         assert_eq!(preset(Path::new("/usr/bin/rpcs3")), ["/usr/bin/rpcs3", "--no-gui", "{rom}"]);
         assert_eq!(preset(Path::new("/usr/bin/PPSSPPSDL")), ["/usr/bin/PPSSPPSDL", "{rom}"], "nothing to add");
+        let eden = "/home/deck/Applications/Eden-Linux-v0.2.0-amd64.AppImage";
+        assert_eq!(preset(Path::new(eden)), [eden, "-f", "-g", "{rom}"]);
+        let ryubing = "/var/lib/flatpak/exports/bin/io.github.ryubing.Ryujinx";
+        assert_eq!(preset(Path::new(ryubing)), [ryubing, "{rom}"]);
     }
 
     #[test]
@@ -1008,6 +1013,18 @@ mod tests {
                 "/var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu",
                 "/var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu -b -e {rom}",
                 Standalone::Dolphin,
+            ),
+            (
+                "switch",
+                "/home/deck/Applications/Eden-Linux-v0.2.0-amd64.AppImage",
+                "/home/deck/Applications/Eden-Linux-v0.2.0-amd64.AppImage -f -g {rom}",
+                Standalone::Eden,
+            ),
+            (
+                "switch",
+                "/var/lib/flatpak/exports/bin/io.github.ryubing.Ryujinx",
+                "/var/lib/flatpak/exports/bin/io.github.ryubing.Ryujinx {rom}",
+                Standalone::Ryujinx,
             ),
         ] {
             assert_eq!(join_command(&preset(Path::new(file))), line);

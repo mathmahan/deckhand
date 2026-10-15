@@ -8,6 +8,8 @@
 use std::os::raw::{c_char, c_int, c_void};
 
 pub const SIGIL_RESULT_V4: u32 = 4;
+pub const SIGIL_SUPPORT_V1: u32 = 1;
+pub const SIGIL_OPTIONS_V1: u32 = 1;
 pub const SIGIL_SAVE_REQUEST_V1: u32 = 1;
 pub const SIGIL_SYNC_REQUEST_V1: u32 = 1;
 
@@ -24,6 +26,9 @@ pub const SIGIL_SAVE_SHAPE_FOLDER: c_int = 3;
 pub const SIGIL_SYNC_UNMANAGED: c_int = 1;
 
 pub const SIGIL_SOURCE_BINARY: c_int = 0;
+
+/// When the file can't be read, take the id from its name: what sigil does with no options at all.
+pub const SIGIL_FLAG_FILENAME_FALLBACK: u32 = 1 << 0;
 
 pub const SIGIL_SAVE_PATH_MAX: usize = 512;
 pub const SIGIL_SAVE_ENTRY_MAX: usize = 256;
@@ -54,6 +59,23 @@ pub struct sigil_result {
     pub n64_header: [c_char; 24],
     pub n64_md5: [c_char; 33],
     pub n64_md5_n64: [c_char; 33],
+}
+
+/// What reading some games takes besides the file: the Switch's keys, here as a `prod.keys` path.
+#[repr(C)]
+pub struct sigil_support {
+    pub struct_version: u32,
+    pub switch_header_key: *const u8,
+    pub switch_prod_keys_path: *const c_char,
+    pub switch_prod_keys_text: *const c_char,
+    pub switch_prod_keys_text_len: usize,
+}
+
+#[repr(C)]
+pub struct sigil_options {
+    pub struct_version: u32,
+    pub support: *const sigil_support,
+    pub flags: u32,
 }
 
 /// A stream sigil reads through. Only ever made by sigil (`sigil_io_open_file`) and handed back to
@@ -223,7 +245,7 @@ pub struct sigil_sync_result {
 }
 
 unsafe extern "C" {
-    pub fn sigil_extract_from_path(path: *const c_char, hint: sigil_platform, opts: *const c_void, out: *mut sigil_result) -> c_int;
+    pub fn sigil_extract_from_path(path: *const c_char, hint: sigil_platform, opts: *const sigil_options, out: *mut sigil_result) -> c_int;
     pub fn sigil_platform_from_slug(slug: *const c_char) -> sigil_platform;
     pub fn sigil_platform_to_slug(platform: sigil_platform) -> *const c_char;
     pub fn sigil_io_open_file(path: *const c_char) -> *mut sigil_io;
@@ -245,6 +267,8 @@ unsafe extern "C" {
 #[cfg(test)]
 unsafe extern "C" {
     pub fn deckhand_sigil_sizeof_result() -> usize;
+    pub fn deckhand_sigil_sizeof_support() -> usize;
+    pub fn deckhand_sigil_sizeof_options() -> usize;
     pub fn deckhand_sigil_sizeof_save_member() -> usize;
     pub fn deckhand_sigil_sizeof_save_request() -> usize;
     pub fn deckhand_sigil_sizeof_save_unit() -> usize;

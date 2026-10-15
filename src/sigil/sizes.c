@@ -4,6 +4,8 @@
 #include <sigil.h>
 
 size_t deckhand_sigil_sizeof_result(void) { return sizeof(sigil_result); }
+size_t deckhand_sigil_sizeof_support(void) { return sizeof(sigil_support); }
+size_t deckhand_sigil_sizeof_options(void) { return sizeof(sigil_options); }
 size_t deckhand_sigil_sizeof_save_member(void) { return sizeof(sigil_save_member); }
 size_t deckhand_sigil_sizeof_save_request(void) { return sizeof(sigil_save_request); }
 size_t deckhand_sigil_sizeof_save_unit(void) { return sizeof(sigil_save_unit); }

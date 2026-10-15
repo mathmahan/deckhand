@@ -61,7 +61,13 @@ over on each game's first sync.
 | Wii | Dolphin | ✅ Saves, save states |
 | Wii U | Cemu | ✅ Saves |
 | 3DS | Azahar | ✅ Saves and extra data |
-| Switch, Xbox, Xbox 360 | — | ❌ Not synced yet |
+| Switch | Ryubing, Eden | ✅ Saves, each user's and the ones the console shares, which move between the two |
+| Xbox, Xbox 360 | — | ❌ Not synced yet |
+
+A Switch game is known by the id inside its NSP or XCI, which reading takes the `prod.keys` you gave
+Ryubing (`system/`) or Eden (`keys/`); without them, by an id in its file name, such as
+`Game [0100ABCD12345000].nsp`. Neither ships with RetroDECK, so set the one you installed under
+*Emulator for each system*.
 
 ![Browse](screenshots/browse.jpg)
 
@@ -98,10 +104,13 @@ Deckhand fills in the usual options for it, for you to check:
 
 # GameCube, with the Dolphin Flatpak
 /var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu -b -e {rom}
+
+# Switch, with the Eden AppImage
+/home/deck/Applications/Eden-Linux-v0.2.0-amd64.AppImage -f -g {rom}
 ```
 
-Saves sync for RetroArch, and on Linux for PCSX2, DuckStation, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar
-and Cemu — see [Save sync](#save-sync).
+Saves sync for RetroArch, and on Linux for PCSX2, DuckStation, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar,
+Cemu, Ryubing and Eden — see [Save sync](#save-sync).
 
 ## Building
 

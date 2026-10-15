@@ -72,6 +72,10 @@ pub enum Emulator {
     /// PS1 memory cards, synced through sigil only: the engine before it never kept them. Its save
     /// states as well.
     DuckStation,
+    /// Switch saves under Ryubing, Ryujinx's fork, or Ryujinx itself. Synced through sigil only.
+    Ryujinx,
+    /// Switch saves under Eden, a yuzu fork. Synced through sigil only.
+    Eden,
 }
 
 impl Emulator {
@@ -89,6 +93,8 @@ impl Emulator {
             "n3ds" if label.contains("azahar") || label.contains("citra") => Some(Emulator::Azahar),
             "wiiu" if label.contains("cemu") => Some(Emulator::Cemu),
             "psx" if label.contains("duckstation") => Some(Emulator::DuckStation),
+            "switch" if label.contains("ryujinx") || label.contains("ryubing") => Some(Emulator::Ryujinx),
+            "switch" if label.contains("eden") => Some(Emulator::Eden),
             _ => None,
         }
     }
@@ -104,6 +110,8 @@ impl Emulator {
             Emulator::Azahar => "azahar",
             Emulator::Cemu => "cemu",
             Emulator::DuckStation => "duckstation",
+            Emulator::Ryujinx => "ryujinx",
+            Emulator::Eden => "eden",
         }
     }
 }
@@ -249,7 +257,7 @@ fn discover(emulator: Emulator, rom: &Path, title: &str, keys: &[String], server
         Emulator::Vita3k => vita3k(rom, title, server),
         Emulator::Azahar => azahar(rom),
         Emulator::Cemu => cemu(rom),
-        Emulator::DuckStation => Ok(Vec::new()),
+        Emulator::DuckStation | Emulator::Ryujinx | Emulator::Eden => Ok(Vec::new()),
     }
 }
 
@@ -1276,8 +1284,9 @@ pub(super) fn folder_bundle(parent: &Path, folder: &str) -> Bundle {
 // ---- What sigil is asked -------------------------------------------------------------------------
 
 /// What sigil is asked about the game `rom` runs as on `emulator`: the emulator's layout, the folder
-/// its paths are under — the one holding its `memcards/`, `PSP/`, `dev_hdd0/`, `ux0/`, `sdmc/` or
-/// `mlc01/`, as sigil names them — the settings that move a save, and the game's ids off its discs.
+/// its paths are under — the one holding its `memcards/`, `PSP/`, `dev_hdd0/`, `ux0/`, `sdmc/`,
+/// `mlc01/`, `bis/` or `nand/`, as sigil names them — the settings that move a save, and the game's
+/// ids off its discs, a Switch game's read with the user's keys.
 ///
 /// Every emulator is found where [`installs`] looks, RetroDECK's first. A folder the emulator was
 /// told to keep somewhere sigil cannot name — memory cards in a folder not called `memcards` — is
@@ -1289,7 +1298,7 @@ pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sig
             _ => Err(format!("{what} is in {}, a folder not named {name}, which sigil can't take", dir.display())),
         }
     };
-    let (layout, platform, root, settings, profile): (&str, &str, PathBuf, Vec<PathBuf>, Option<&str>) = match emulator {
+    let (layout, platform, root, settings, profile): (&str, &str, PathBuf, Vec<PathBuf>, Option<String>) = match emulator {
         Emulator::Dolphin | Emulator::DolphinWii => {
             let user = first_dir(installs("data/dolphin-emu", ("org.DolphinEmu.dolphin-emu", "data/dolphin-emu"), ".local/share/dolphin-emu"))
                 .ok_or("no Dolphin folder found")?;
@@ -1321,12 +1330,12 @@ pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sig
             let savedata = rpcs3_savedata()?;
             // `dev_hdd0/home/<profile>/savedata`
             let hdd0 = savedata.ancestors().nth(3).ok_or("RPCS3's dev_hdd0 has no folder above it")?.to_path_buf();
-            ("rpcs3", "ps3", named(&hdd0, "dev_hdd0", "RPCS3's dev_hdd0")?, Vec::new(), Some("00000001"))
+            ("rpcs3", "ps3", named(&hdd0, "dev_hdd0", "RPCS3's dev_hdd0")?, Vec::new(), Some("00000001".into()))
         }
         Emulator::Vita3k => {
             // `ux0/user/<profile>/savedata`
             let ux0 = vita3k_savedata().ancestors().nth(3).ok_or("Vita3K's ux0 has no folder above it")?.to_path_buf();
-            ("vita3k", "psvita", named(&ux0, "ux0", "Vita3K's ux0")?, Vec::new(), Some("00"))
+            ("vita3k", "psvita", named(&ux0, "ux0", "Vita3K's ux0")?, Vec::new(), Some("00".into()))
         }
         Emulator::Azahar => ("azahar", "3ds", named(&azahar_sdmc(), "sdmc", "Azahar's SD card")?, Vec::new(), None),
         Emulator::Cemu => ("cemu", "wiiu", named(&cemu_mlc(), "mlc01", "Cemu's mlc01")?, Vec::new(), None),
@@ -1336,6 +1345,15 @@ pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sig
                 .map(PathBuf::from)
                 .unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join("memcards"));
             ("duckstation", "psx", named(&cards, "memcards", "DuckStation's memory cards folder")?, vec![file], None)
+        }
+        Emulator::Ryujinx => {
+            let base = ryujinx_base().ok_or("no Ryujinx folder found")?;
+            let profile = ryujinx_profile(&base);
+            ("ryujinx", "switch", base, Vec::new(), profile)
+        }
+        Emulator::Eden => {
+            let data = eden_data().ok_or("no Eden folder found")?;
+            ("eden", "switch", eden_root(&data, Some(&eden_config(&data)))?, Vec::new(), None)
         }
     };
     // The settings sigil says this layout's files turn on, from the emulator's own config.
@@ -1347,10 +1365,15 @@ pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sig
         .filter_map(|option| Some((option.key.clone(), ini_value(file?, &option.key)?)))
         .collect();
     let disc = entry_point(rom);
-    let identity = crate::sigil::identify(&disc, Some(platform)).map_err(|e| format!("its game id could not be read: {e}"))?;
+    let keys = switch_keys(emulator);
+    let identify = |d: &Path| crate::sigil::identify_with(d, Some(platform), keys.as_deref());
+    let identity = identify(&disc).map_err(|e| match &keys {
+        None if platform == "switch" => format!("its game id could not be read without the Switch's prod.keys: {e}"),
+        _ => format!("its game id could not be read: {e}"),
+    })?;
     let game_ids = discs(rom)
         .iter()
-        .filter_map(|d| crate::sigil::identify(d, Some(platform)).ok())
+        .filter_map(|d| identify(d).ok())
         .map(|i| i.title_id())
         .filter(|id| !id.is_empty())
         .collect();
@@ -1361,9 +1384,79 @@ pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sig
         identity: Some(identity),
         options,
         root,
-        profile: profile.map(str::to_string),
+        profile,
         game_ids,
     })
+}
+
+// ---- Switch -------------------------------------------------------------------------------------
+
+/// Of an emulator's installs that are here, the one that ran last, by when it last wrote `log` — a
+/// log folder it writes on every start. A Flatpak, an AppImage's native folder and RetroDECK's,
+/// which once shipped Ryujinx, can all be here at once; the earlier of two that never logged wins.
+fn last_used(candidates: Vec<PathBuf>, log: &str) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .rev()
+        .filter(|p| p.is_dir())
+        .max_by_key(|p| fs::metadata(p.join(log)).and_then(|m| m.modified()).ok())
+}
+
+/// Ryujinx's folder, the one holding its `bis/` and `system/`: Ryubing's Flatpak's, else the
+/// native one an AppImage uses, else RetroDECK's or the old Ryujinx Flatpak's.
+fn ryujinx_base() -> Option<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_default();
+    last_used(
+        vec![
+            home.join(".var/app/io.github.ryubing.Ryujinx/config/Ryujinx"),
+            home.join(".config/Ryujinx"),
+            home.join(".var/app").join(crate::launch::RETRODECK).join("config/Ryujinx"),
+            home.join(".var/app/org.ryujinx.Ryujinx/config/Ryujinx"),
+        ],
+        "Logs",
+    )
+}
+
+/// The user Ryujinx last opened, from its `system/Profiles.json` — whose saves a game's are where
+/// there are several users. None with one user, whom sigil takes without being told.
+fn ryujinx_profile(base: &Path) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(base.join("system/Profiles.json")).ok()?).ok()?;
+    let users: Vec<&str> = json.get("profiles")?.as_array()?.iter().filter_map(|p| p.get("user_id")?.as_str()).collect();
+    let last = json.get("last_opened")?.as_str()?;
+    (users.len() > 1 && users.contains(&last)).then(|| last.to_string())
+}
+
+/// Eden's data folder, the one holding its `keys/` and, unless it was told otherwise, its `nand/`.
+fn eden_data() -> Option<PathBuf> {
+    let home = dirs::home_dir().unwrap_or_default();
+    last_used(vec![home.join(".var/app/dev.eden_emu.eden/data/eden"), home.join(".local/share/eden")], "log")
+}
+
+/// Eden's `qt-config.ini` for its data folder `data`: the Flatpak's own, else the native one.
+fn eden_config(data: &Path) -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_default();
+    let flatpak = home.join(".var/app/dev.eden_emu.eden");
+    if data.starts_with(&flatpak) { flatpak.join("config/eden/qt-config.ini") } else { home.join(".config/eden/qt-config.ini") }
+}
+
+/// The folder holding Eden's `nand/`: the one its settings name, else its data folder's. A settings
+/// file that isn't there names none.
+fn eden_root(data: &Path, config: Option<&Path>) -> Result<PathBuf, String> {
+    let nand = config.and_then(|c| ini_value(c, "nand_directory")).map_or_else(|| data.join("nand"), PathBuf::from);
+    match (nand.file_name().and_then(|n| n.to_str()), nand.parent()) {
+        (Some("nand"), Some(parent)) => Ok(parent.to_path_buf()),
+        _ => Err(format!("Eden's NAND is in {}, a folder not named nand, which sigil can't take", nand.display())),
+    }
+}
+
+/// The user's `prod.keys` where the Switch emulator keeps them, which reading an NSP or XCI takes.
+fn switch_keys(emulator: Emulator) -> Option<PathBuf> {
+    match emulator {
+        Emulator::Ryujinx => ryujinx_base().map(|base| base.join("system/prod.keys")),
+        Emulator::Eden => eden_data().map(|data| data.join("keys/prod.keys")),
+        _ => None,
+    }
+    .filter(|keys| keys.is_file())
 }
 
 // ---- Matching a PS3 save's title to the game ----------------------------------------------------
@@ -1791,6 +1884,64 @@ mod tests {
         assert_eq!(Emulator::for_launch("psp", "PPSSPP (Standalone)"), Some(Emulator::Ppsspp));
         assert_eq!(Emulator::for_launch("ps3", "RPCS3 Shortcut (Standalone)"), Some(Emulator::Rpcs3));
         assert_eq!(Emulator::for_launch("psvita", "Vita3K (Standalone)"), Some(Emulator::Vita3k));
-        assert_eq!(Emulator::for_launch("switch", "Ryubing (Standalone)"), None);
+        assert_eq!(Emulator::for_launch("switch", "Ryujinx (Standalone)"), Some(Emulator::Ryujinx));
+        assert_eq!(Emulator::for_launch("switch", "Ryubing (Standalone)"), Some(Emulator::Ryujinx));
+        assert_eq!(Emulator::for_launch("switch", "io.github.ryubing.Ryujinx"), Some(Emulator::Ryujinx));
+        assert_eq!(Emulator::for_launch("switch", "Eden (Standalone)"), Some(Emulator::Eden));
+        assert_eq!(Emulator::for_launch("switch", "dev.eden_emu.eden"), Some(Emulator::Eden));
+        assert_eq!(Emulator::for_launch("switch", "Citron (Standalone)"), None);
+        assert_eq!(Emulator::for_launch("psx", "Eden (Standalone)"), None);
+    }
+
+    #[test]
+    fn the_install_that_ran_last_is_the_one_whose_saves_sync() {
+        let dir = temp("last-used");
+        let (flatpak, native, gone) = (dir.join("flatpak"), dir.join("native"), dir.join("gone"));
+        fs::create_dir_all(flatpak.join("Logs")).unwrap();
+        fs::create_dir_all(native.join("Logs")).unwrap();
+        let candidates = || vec![flatpak.clone(), native.clone(), gone.clone()];
+        let at = |p: &Path, secs: u64| {
+            fs::File::open(p).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+        };
+        at(&flatpak.join("Logs"), 2_000_000_000);
+        at(&native.join("Logs"), 1_000_000_000);
+        assert_eq!(last_used(candidates(), "Logs"), Some(flatpak.clone()));
+        at(&native.join("Logs"), 2_100_000_000);
+        assert_eq!(last_used(candidates(), "Logs"), Some(native.clone()), "the AppImage ran since");
+        assert_eq!(last_used(candidates(), "log"), Some(flatpak.clone()), "neither logged: the first that is here");
+        assert_eq!(last_used(vec![gone.clone()], "Logs"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edens_nand_is_where_its_settings_put_it() {
+        let dir = temp("eden");
+        let data = dir.join("eden");
+        assert_eq!(eden_root(&data, None), Ok(data.clone()), "beside its keys, by default");
+        assert_eq!(eden_root(&data, Some(&dir.join("qt-config.ini"))), Ok(data.clone()), "nor set up yet");
+        let ini = dir.join("qt-config.ini");
+        fs::write(&ini, "[Data%20Storage]\nnand_directory\\default=false\nnand_directory=/run/media/sd/switch/nand/\n").unwrap();
+        assert_eq!(eden_root(&data, Some(&ini)), Ok(PathBuf::from("/run/media/sd/switch")));
+        fs::write(&ini, "[Data%20Storage]\nnand_directory=/run/media/sd/switch-nand\n").unwrap();
+        assert!(eden_root(&data, Some(&ini)).is_err(), "sigil finds the NAND by its name");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ryujinx_names_its_last_user_only_where_there_are_several() {
+        let base = temp("ryujinx");
+        fs::create_dir_all(base.join("system")).unwrap();
+        let profiles = |users: &[&str], last: &str| {
+            let profiles: Vec<serde_json::Value> = users.iter().map(|u| serde_json::json!({ "user_id": u, "name": "Player" })).collect();
+            fs::write(base.join("system/Profiles.json"), serde_json::json!({ "profiles": profiles, "last_opened": last }).to_string()).unwrap();
+        };
+        let (ryu, guest) = ("00000000000000010000000000000000", "7A4C6C1D2E3F40518293A4B5C6D7E8F9");
+        profiles(&[ryu], ryu);
+        assert_eq!(ryujinx_profile(&base), None, "one user, whom sigil takes by itself");
+        profiles(&[ryu, guest], guest);
+        assert_eq!(ryujinx_profile(&base).as_deref(), Some(guest));
+        profiles(&[ryu, guest], "00000000000000000000000000000099");
+        assert_eq!(ryujinx_profile(&base), None, "a user since removed is no one's");
+        let _ = fs::remove_dir_all(&base);
     }
 }

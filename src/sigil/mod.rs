@@ -121,20 +121,26 @@ impl std::fmt::Debug for Identity {
 /// Remembered for as long as the file is unchanged, so a sync over every game on the device reads
 /// each disc once a session, not once a sync.
 pub fn identify(path: &Path, platform: Option<&str>) -> Result<Identity, Error> {
-    type Key = (PathBuf, Option<String>, u64, Option<SystemTime>);
+    identify_with(path, platform, None)
+}
+
+/// [`identify`], with the user's Switch keys at `keys`: an NSP or XCI is encrypted, and without its
+/// `prod.keys` only an id in the file's name says which game it is.
+pub fn identify_with(path: &Path, platform: Option<&str>, keys: Option<&Path>) -> Result<Identity, Error> {
+    type Key = (PathBuf, Option<String>, u64, Option<SystemTime>, Option<PathBuf>);
     static SEEN: OnceLock<Mutex<HashMap<Key, Result<Identity, Error>>>> = OnceLock::new();
     let meta = fs::metadata(path).map_err(|e| Error { code: -2, message: e.to_string(), problem: Some(path.display().to_string()) })?;
-    let key: Key = (path.to_path_buf(), platform.map(str::to_string), meta.len(), meta.modified().ok());
+    let key: Key = (path.to_path_buf(), platform.map(str::to_string), meta.len(), meta.modified().ok(), keys.map(Path::to_path_buf));
     let seen = SEEN.get_or_init(Default::default);
     if let Some(known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return known.clone();
     }
-    let found = extract(path, platform);
+    let found = extract(path, platform, keys);
     seen.lock().unwrap_or_else(|e| e.into_inner()).insert(key, found.clone());
     found
 }
 
-fn extract(path: &Path, platform: Option<&str>) -> Result<Identity, Error> {
+fn extract(path: &Path, platform: Option<&str>, keys: Option<&Path>) -> Result<Identity, Error> {
     let file = c_path(path)?;
     let hint = match platform {
         Some(slug) => {
@@ -144,11 +150,27 @@ fn extract(path: &Path, platform: Option<&str>) -> Result<Identity, Error> {
         }
         None => ffi::SIGIL_PLATFORM_AUTO,
     };
+    let keys = keys.map(c_path).transpose()?;
+    let support = keys.as_ref().map(|keys| ffi::sigil_support {
+        struct_version: ffi::SIGIL_SUPPORT_V1,
+        switch_header_key: std::ptr::null(),
+        switch_prod_keys_path: keys.as_ptr(),
+        switch_prod_keys_text: std::ptr::null(),
+        switch_prod_keys_text_len: 0,
+    });
+    // Without keys, no options: sigil's defaults, which take an id from the file's name as well.
+    let options = support.as_ref().map(|support| ffi::sigil_options {
+        struct_version: ffi::SIGIL_OPTIONS_V1,
+        support,
+        flags: ffi::SIGIL_FLAG_FILENAME_FALLBACK,
+    });
     // SAFETY: zeroed is a valid empty result, which sigil fills in.
     let mut out: ffi::sigil_result = unsafe { std::mem::zeroed() };
     out.struct_version = ffi::SIGIL_RESULT_V4;
-    // SAFETY: valid path, no options, and a result to write into.
-    let rc = unsafe { ffi::sigil_extract_from_path(file.as_ptr(), hint, std::ptr::null(), &mut out) };
+    let opts = options.as_ref().map_or(std::ptr::null(), |o| o as *const ffi::sigil_options);
+    // SAFETY: a valid path, options that point into `keys` and `support` (alive past the call) or
+    // none, and a result to write into.
+    let rc = unsafe { ffi::sigil_extract_from_path(file.as_ptr(), hint, opts, &mut out) };
     if rc != ffi::SIGIL_OK {
         return Err(Error::new(rc, Some(path.display().to_string())));
     }
@@ -788,6 +810,8 @@ mod tests {
         // SAFETY: plain functions returning sizes.
         unsafe {
             assert_eq!(size_of::<ffi::sigil_result>(), ffi::deckhand_sigil_sizeof_result());
+            assert_eq!(size_of::<ffi::sigil_support>(), ffi::deckhand_sigil_sizeof_support());
+            assert_eq!(size_of::<ffi::sigil_options>(), ffi::deckhand_sigil_sizeof_options());
             assert_eq!(size_of::<ffi::sigil_save_member>(), ffi::deckhand_sigil_sizeof_save_member());
             assert_eq!(size_of::<ffi::sigil_save_request>(), ffi::deckhand_sigil_sizeof_save_request());
             assert_eq!(size_of::<ffi::sigil_save_unit>(), ffi::deckhand_sigil_sizeof_save_unit());
@@ -896,6 +920,153 @@ mod tests {
     }
 
     #[test]
+    fn a_switch_dump_its_keys_cannot_open_is_known_by_the_id_in_its_name() {
+        let dir = temp("switch-id");
+        let dump = dir.join("Game [0100ABCD12345000][v0].nsp");
+        fs::write(&dump, b"no PFS0 in here").unwrap();
+        assert_eq!(identify(&dump, Some("switch")).unwrap().title_id(), "0100ABCD12345000", "no keys");
+        let keys = dir.join("prod.keys");
+        fs::write(&keys, "header_key = 00\n").unwrap();
+        assert_eq!(identify_with(&dump, Some("switch"), Some(&keys)).unwrap().title_id(), "0100ABCD12345000", "keys that don't fit");
+        let nameless = dir.join("Game.nsp");
+        fs::write(&nameless, b"no PFS0 in here").unwrap();
+        assert!(identify_with(&nameless, Some("switch"), Some(&keys)).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An Eden NAND under `root` with one user: `profiles.dat` holds the UUID, and the user's save
+    /// folder is named by it with its bytes reversed.
+    fn eden_nand(root: &Path, uuid: [u8; 16]) -> String {
+        let mut dat = vec![0u8; 0x10 + 8 * 0xC8];
+        dat[0x10..0x20].copy_from_slice(&uuid);
+        dat[0x10 + 0x28..0x10 + 0x2C].copy_from_slice(b"Mats");
+        let avators = root.join("nand/system/save/8000000000000010/su/avators");
+        fs::create_dir_all(&avators).unwrap();
+        fs::write(avators.join("profiles.dat"), dat).unwrap();
+        uuid.iter().rev().map(|b| format!("{b:02X}")).collect()
+    }
+
+    #[test]
+    fn a_switch_games_saves_go_up_without_the_user_and_come_down_under_another() {
+        let root = temp("eden");
+        let user = eden_nand(&root, [0x01, 0xF4, 0xBC, 0xE1, 0x1E, 0x6E, 0x29, 0x00, 0x10, 0xB1, 0xDE, 0xEB, 0xBA, 0x2D, 0x5D, 0x12]);
+        let saves = root.join("nand/user/save/0000000000000000");
+        let device = "00000000000000000000000000000000";
+        for (folder, file, bytes) in [
+            (format!("{user}/0100ABCD12345000"), "progress.bin", &b"world 4"[..]),
+            (format!("{device}/0100ABCD12345000"), "island.bin", b"the whole island"),
+            (format!("{user}/0100FFFF00000000"), "progress.bin", b"another game"),
+        ] {
+            fs::create_dir_all(saves.join(&folder)).unwrap();
+            fs::write(saves.join(&folder).join(file), bytes).unwrap();
+        }
+        fs::write(saves.join(&user).join("0100ABCD12345000/.yuzu_save_size"), b"size").unwrap();
+        let request = Request {
+            layout: "eden".into(),
+            platform: Some("switch".into()),
+            content: PathBuf::from("/roms/switch/Game.nsp"),
+            identity: Some(Identity::made_up("switch", "0100ABCD12345000", "0100ABCD12345000", 0)),
+            options: Vec::new(),
+            root: root.clone(),
+            profile: None,
+            game_ids: vec!["0100ABCD12345000".into()],
+        };
+        let unit = request.collect(None).unwrap();
+        assert_eq!(unit.artifact, "0100ABCD12345000.zip");
+        let data = unit.data.unwrap();
+        let mut names: Vec<String> = crate::sync::hash::zip_entries(&data).unwrap().into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        assert_eq!(names, ["0100ABCD12345000/progress.bin", "device/0100ABCD12345000/island.bin"], "its saves, no user's id, nor the size file");
+
+        // Another device, whose one user is someone else: the saves are theirs there.
+        let other = temp("eden-other");
+        let them = eden_nand(&other, [0xAA; 16]);
+        Request { root: other.clone(), ..request }.restore(&data, None).unwrap();
+        let theirs = other.join("nand/user/save/0000000000000000");
+        assert_eq!(fs::read(theirs.join(&them).join("0100ABCD12345000/progress.bin")).unwrap(), b"world 4");
+        assert_eq!(fs::read(theirs.join(device).join("0100ABCD12345000/island.bin")).unwrap(), b"the whole island");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&other);
+    }
+
+    /// A Ryujinx folder under `root` with one user, whose save index puts the account save of
+    /// `title` in folder `account` and its device save in folder `device`.
+    fn ryujinx_bis(root: &Path, title: u64, account: u64, device: u64) {
+        let user = "00000000000000010000000000000000";
+        fs::create_dir_all(root.join("system")).unwrap();
+        let profiles = serde_json::json!({ "profiles": [{ "user_id": user, "name": "Ryu" }], "last_opened": user });
+        fs::write(root.join("system/Profiles.json"), profiles.to_string()).unwrap();
+        // LibHac's KeyValueArchive: "IMKV", the entry count, then each "IMEN" with its key and value.
+        let mut arc: Vec<u8> = [0x564B_4D49u32, 0, 2].iter().flat_map(|n| n.to_le_bytes()).collect();
+        for (folder, kind, user_high) in [(account, 1u8, 1u64), (device, 3, 0)] {
+            arc.extend([0x4E45_4D49u32, 0x40, 0x40].iter().flat_map(|n| n.to_le_bytes()));
+            let mut key = [0u8; 0x40];
+            key[..8].copy_from_slice(&title.to_le_bytes());
+            key[8..16].copy_from_slice(&user_high.to_le_bytes());
+            key[0x20] = kind;
+            let mut value = [0u8; 0x40];
+            value[..8].copy_from_slice(&folder.to_le_bytes());
+            value[0x18] = 1;
+            arc.extend(key);
+            arc.extend(value);
+        }
+        let index = root.join("bis/system/save/8000000000000000/0");
+        fs::create_dir_all(&index).unwrap();
+        fs::write(index.join("imkvdb.arc"), arc).unwrap();
+    }
+
+    #[test]
+    fn a_switch_save_moves_between_ryujinx_and_eden_unchanged() {
+        let game = |layout: &str, root: &Path| Request {
+            layout: layout.into(),
+            platform: Some("switch".into()),
+            content: PathBuf::from("/roms/switch/Game.nsp"),
+            identity: Some(Identity::made_up("switch", "0100ABCD12345000", "0100ABCD12345000", 0)),
+            options: Vec::new(),
+            root: root.to_path_buf(),
+            profile: None,
+            game_ids: vec!["0100ABCD12345000".into()],
+        };
+        let entries = |unit: &[u8]| {
+            let mut names: Vec<String> = crate::sync::hash::zip_entries(unit).unwrap().into_iter().map(|(n, _)| n).collect();
+            names.sort();
+            names
+        };
+        let ryujinx = temp("ryujinx");
+        ryujinx_bis(&ryujinx, 0x0100_ABCD_1234_5000, 1, 2);
+        let saves = ryujinx.join("bis/user/save");
+        for (file, bytes) in [
+            ("0000000000000001/0/progress.bin", &b"world 4"[..]),
+            ("0000000000000001/1/progress.bin", b"the working copy"),
+            ("0000000000000002/0/island.bin", b"the whole island"),
+        ] {
+            fs::create_dir_all(saves.join(file).parent().unwrap()).unwrap();
+            fs::write(saves.join(file), bytes).unwrap();
+        }
+        let unit = game("ryujinx", &ryujinx).collect(None).unwrap().data.unwrap();
+        assert_eq!(entries(&unit), ["0100ABCD12345000/progress.bin", "device/0100ABCD12345000/island.bin"], "the committed copy only");
+
+        // Eden on another device takes it as its own…
+        let eden = temp("ryujinx-eden");
+        let user = eden_nand(&eden, [0x33; 16]);
+        game("eden", &eden).restore(&unit, None).unwrap();
+        let eden_saves = eden.join("nand/user/save/0000000000000000");
+        assert_eq!(fs::read(eden_saves.join(&user).join("0100ABCD12345000/progress.bin")).unwrap(), b"world 4");
+        let from_eden = game("eden", &eden).collect(None).unwrap().data.unwrap();
+        assert_eq!(entries(&from_eden), entries(&unit));
+
+        // …and a Ryujinx whose index gave the game other folders takes Eden's.
+        let back = temp("eden-ryujinx");
+        ryujinx_bis(&back, 0x0100_ABCD_1234_5000, 9, 10);
+        game("ryujinx", &back).restore(&from_eden, None).unwrap();
+        assert_eq!(fs::read(back.join("bis/user/save/0000000000000009/0/progress.bin")).unwrap(), b"world 4");
+        assert_eq!(fs::read(back.join("bis/user/save/000000000000000a/0/island.bin")).unwrap(), b"the whole island");
+        for dir in [ryujinx, eden, back] {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn a_restore_never_writes_outside_its_root() {
         assert_eq!(inside(Path::new("/r"), "a/b.srm"), Some(PathBuf::from("/r/a/b.srm")));
         assert_eq!(inside(Path::new("/r"), "PSP/SAVEDATA/X/"), Some(PathBuf::from("/r/PSP/SAVEDATA/X")));
@@ -910,6 +1081,8 @@ mod tests {
         assert!(duckstation.options.iter().any(|o| o.key == "Card1Type" && o.default == "PerGameTitle"));
         assert_eq!(layout("snes9x").unwrap().id, "libretro", "a core with no row of its own gets the default");
         assert_eq!(subdirs("ppsspp_standalone"), ["PSP/SAVEDATA"]);
+        assert_eq!(subdirs("ryujinx"), ["bis/user/save", "bis/system/save/8000000000000000", "system"]);
+        assert_eq!(subdirs("eden"), ["nand/user/save/0000000000000000", "nand/system/save/8000000000000010/su/avators"]);
         assert_eq!(platform_of("gc"), Some("gamecube"));
         assert_eq!(platform_of("genesis"), None);
     }
