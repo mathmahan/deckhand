@@ -113,12 +113,11 @@ pub enum Row {
     LibraryCache,
     Version,
     Updates,
-    ReleaseToken,
     ConfigFile,
 }
 
 impl Row {
-    pub const ALL: [Row; 25] = [
+    pub const ALL: [Row; 24] = [
         Row::ServerAddress,
         Row::Connection,
         Row::Certificate,
@@ -142,7 +141,6 @@ impl Row {
         Row::LibraryCache,
         Row::Version,
         Row::Updates,
-        Row::ReleaseToken,
         Row::ConfigFile,
     ];
 
@@ -171,7 +169,6 @@ impl Row {
             Row::LibraryCache => "Library cache",
             Row::Version => "Version",
             Row::Updates => "Updates",
-            Row::ReleaseToken => "Update token",
             Row::ConfigFile => "Config file",
         }
     }
@@ -185,7 +182,7 @@ impl Row {
             Row::RomsFolder | Row::Budget | Row::Downloaded | Row::ImageCache | Row::LibraryCache => {
                 Section::Storage
             }
-            Row::Version | Row::Updates | Row::ReleaseToken | Row::ConfigFile => Section::About,
+            Row::Version | Row::Updates | Row::ConfigFile => Section::About,
         }
     }
 
@@ -339,8 +336,6 @@ pub struct SettingsContext<'a> {
     pub save_sync: &'a SaveSync,
     /// Where Deckhand's own update stands — see [`crate::release`].
     pub release: &'a crate::release::Status,
-    /// Whether looking for updates needs the update token — see [`crate::release::needs_token`].
-    pub token_needed: bool,
     /// Whether this runs as an AppImage, the one build that installs an update itself.
     pub appimage: bool,
     /// Whether RetroDECK is installed.
@@ -682,7 +677,7 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
         Row::Updates => {
             use crate::release::Status;
             match ctx.release {
-                Status::Off => vec![value_text("off · needs an update token".to_string(), Tone::Plain), action_chip("Set token", lit, false)],
+                Status::Unasked => vec![value_text("not asked yet".to_string(), Tone::Plain), action_chip("Check", lit, false)],
                 Status::Checking => vec![value_text("asking…".to_string(), Tone::Plain)],
                 Status::Current => vec![
                     status_dot(Some(true)),
@@ -714,15 +709,6 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
                 ],
             }
         }
-        // Never shown whole: the row is on screen for anyone looking over a shoulder.
-        Row::ReleaseToken => match ctx.settings.release_token.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            Some(token) => {
-                let tail: String = token.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
-                vec![value_text(format!("set · ends in {tail}"), Tone::Plain), action_chip("Change", lit, false)]
-            }
-            None if !ctx.token_needed => vec![value_text("not needed".to_string(), Tone::Plain), action_chip("Set", lit, false)],
-            None => vec![value_text("not set".to_string(), Tone::Plain), action_chip("Set", lit, false)],
-        },
         Row::ConfigFile => vec![value_text(Settings::file().display().to_string(), Tone::Plain)],
     }
 }

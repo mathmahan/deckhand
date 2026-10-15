@@ -1,12 +1,8 @@
 //! Deckhand's own new versions: whether the repository has published one newer than this build,
 //! and — run as an AppImage — fetching it and putting it in place of the file that is running.
 //!
-//! - **Asked where it is published.** `repository` in `Cargo.toml` says where. On GitHub the
-//!   repository is public, and its releases are read through GitHub's API with no token. Anywhere
-//!   else it is a private Forgejo one, whose releases read only with a token that can see it, typed
-//!   or pasted in Settings ▸ About ▸ *Update token*, and best made able to read this one repository
-//!   and nothing else. Without one nothing is asked there, and Settings says so. A token is only
-//!   ever sent to the API's own host.
+//! - **Asked where it is published.** `repository` in `Cargo.toml` names the GitHub repository,
+//!   which is public: its releases are read through GitHub's API, with no token.
 //! - **When**: at launch, every six hours while the window stays open, and from the Settings row.
 //! - **Replaced in place.** The new AppImage takes the running one's path and name, so whatever
 //!   starts Deckhand — a Steam shortcut, a desktop entry — starts the new one. It is checked before
@@ -31,35 +27,19 @@ pub const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 /// The repository this build's releases are published in: `repository` in `Cargo.toml`.
 pub const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 
-/// `repository`'s scheme, host and `owner/name`.
-fn parts(repository: &str) -> (&str, &str, &str) {
+/// `repository`'s `owner/name`.
+fn owner_and_name(repository: &str) -> &str {
     let repository = repository.trim_end_matches('/').trim_end_matches(".git");
-    let (scheme, rest) = repository.split_once("://").unwrap_or(("https", repository));
-    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-    (scheme, host, path)
+    let rest = repository.split_once("://").map_or(repository, |(_, rest)| rest);
+    rest.split_once('/').map_or("", |(_, path)| path)
 }
 
-fn on_github(repository: &str) -> bool {
-    let (_, host, _) = parts(repository);
-    host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com")
-}
-
-/// Whether `repository`'s releases read only with a token: a Forgejo one's, which is private, do;
-/// GitHub's, which is public, do not.
-pub fn needs_token(repository: &str) -> bool {
-    !on_github(repository)
-}
-
-/// Where `repository`'s newest release is read. `https://host/owner/name` is Forgejo's
-/// `https://host/api/v1/repos/owner/name/releases/latest`; on GitHub, which keeps its API on a host
-/// of its own, `https://api.github.com/repos/owner/name/releases/latest`.
+/// Where `repository`'s newest release is read: `https://github.com/owner/name` is
+/// `https://api.github.com/repos/owner/name/releases/latest`, GitHub keeping its API on a host of
+/// its own.
 pub fn latest_url(repository: &str) -> String {
-    let (scheme, host, path) = parts(repository);
-    if on_github(repository) {
-        format!("https://api.github.com/repos/{path}/releases/latest")
-    } else {
-        format!("{scheme}://{host}/api/v1/repos/{path}/releases/latest")
-    }
+    let path = owner_and_name(repository);
+    format!("https://api.github.com/repos/{path}/releases/latest")
 }
 
 /// `repository`'s releases page, for a copy that cannot install a release itself.
@@ -99,9 +79,9 @@ impl Release {
 /// Where the app's own update stands — what Settings shows, and what pressing its row does.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum Status {
-    /// No `release_token`, where the repository needs one, so nothing is asked.
+    /// Not asked yet.
     #[default]
-    Off,
+    Unasked,
     Checking,
     /// This build is the newest.
     Current,
@@ -141,7 +121,7 @@ struct WireAsset {
     name: String,
     size: u64,
     browser_download_url: String,
-    /// `sha256:<hex>`, which GitHub gives for every asset it holds. Forgejo gives none.
+    /// `sha256:<hex>`, which GitHub gives for every asset it holds.
     #[serde(default)]
     digest: Option<String>,
 }
@@ -222,35 +202,21 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-/// `request` with the token on it — when there is one and `url` is on the API's own host, and only
-/// then.
-fn authorised(request: reqwest::RequestBuilder, api: &str, url: &str, token: &str) -> reqwest::RequestBuilder {
-    let origin = |u: &str| reqwest::Url::parse(u).ok().map(|u| u.origin());
-    match (origin(api), origin(url)) {
-        (Some(a), Some(b)) if a == b && !token.is_empty() => {
-            request.header(reqwest::header::AUTHORIZATION, format!("token {token}"))
-        }
-        _ => request,
-    }
-}
-
 fn unreachable(url: &str) -> String {
     let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string));
     format!("could not reach {}", host.as_deref().unwrap_or(url))
 }
 
-/// Read the newest release. `api` is [`latest_url`], or a test server's; `token` may be empty.
-pub async fn check(api: &str, token: &str) -> Result<Release, String> {
-    let response = authorised(client()?.get(api), api, api, token).send().await.map_err(|_| unreachable(api))?;
+/// Read the newest release. `api` is [`latest_url`], or a test server's.
+pub async fn check(api: &str) -> Result<Release, String> {
+    let response = client()?.get(api).send().await.map_err(|_| unreachable(api))?;
     // GitHub turns away whoever has asked too often this hour, and says so in this header.
     let spent = response.headers().get("x-ratelimit-remaining").is_some_and(|left| left == "0");
     match response.status().as_u16() {
         200 => parse(&response.text().await.map_err(|_| "the release stopped arriving part way".to_string())?),
         403 | 429 if spent => Err("asked too often for now — it asks again later".into()),
-        401 | 403 if !token.is_empty() => Err("the release token was turned down".into()),
         401 | 403 => Err("the repository turned the question down".into()),
-        // Forgejo answers for a private repository it will not show with a 404, not a 403.
-        404 => Err("no release there, or the token cannot see the repository".into()),
+        404 => Err("no release there".into()),
         code => Err(format!("the repository answered {code}")),
     }
 }
@@ -268,8 +234,6 @@ pub fn running_appimage() -> Option<PathBuf> {
 /// Fetch `release`'s AppImage and put it where `target` — the AppImage running — is. `progress`
 /// hears 0.0–1.0 of the download.
 pub async fn install(
-    api: &str,
-    token: &str,
     release: &Release,
     target: &Path,
     mut progress: impl FnMut(f32),
@@ -280,8 +244,7 @@ pub async fn install(
     // Beside it, so the swap is a rename on the one drive; hidden, so a half-fetched file is never
     // taken for one to run.
     let part = dir.join(format!(".{name}.download"));
-    let response =
-        authorised(client()?.get(&asset.url), api, &asset.url, token).send().await.map_err(|_| unreachable(&asset.url))?;
+    let response = client()?.get(&asset.url).send().await.map_err(|_| unreachable(&asset.url))?;
     if !response.status().is_success() {
         return Err(format!("the download answered {}", response.status().as_u16()));
     }
@@ -393,23 +356,11 @@ mod tests {
 
     #[test]
     fn the_api_is_found_from_the_repository() {
-        assert_eq!(
-            latest_url("https://repo.example/mattias/Deckhand"),
-            "https://repo.example/api/v1/repos/mattias/Deckhand/releases/latest"
-        );
-        assert_eq!(latest_url("https://repo.example/a/b.git/"), "https://repo.example/api/v1/repos/a/b/releases/latest");
+        assert_eq!(latest_url("https://github.com/a/b.git/"), "https://api.github.com/repos/a/b/releases/latest");
         assert_eq!(latest_url("https://github.com/mathmahan/deckhand"), "https://api.github.com/repos/mathmahan/deckhand/releases/latest");
         assert_eq!(latest_url("https://GitHub.com/a/b.git"), "https://api.github.com/repos/a/b/releases/latest");
         assert!(latest_url(REPOSITORY).ends_with("/releases/latest"));
         assert_eq!(releases_page("https://github.com/a/b.git"), "https://github.com/a/b/releases");
-    }
-
-    #[test]
-    fn only_a_forgejo_repository_needs_a_token() {
-        assert!(needs_token("https://repo.example/a/b"));
-        assert!(!needs_token("https://github.com/a/b"));
-        assert!(!needs_token("https://www.github.com/a/b"));
-        assert!(needs_token("https://github.com.example/a/b"), "a host that only starts like GitHub's");
     }
 
     #[test]
@@ -465,21 +416,6 @@ mod tests {
         assert!(!release.is_newer());
     }
 
-    #[test]
-    fn the_token_goes_to_the_repository_host_only() {
-        let http = client().unwrap();
-        let api = "https://repo.example/api/v1/repos/a/b/releases/latest";
-        let token = |url: &str| {
-            let request = authorised(http.get(url), api, url, "secret").build().unwrap();
-            request.headers().get("authorization").map(|v| v.to_str().unwrap().to_string())
-        };
-        assert_eq!(token("https://repo.example/a/b/releases/download/v1/x.AppImage").as_deref(), Some("token secret"));
-        assert_eq!(token("https://cdn.example/x.AppImage"), None, "another host");
-        assert_eq!(token("http://repo.example/x.AppImage"), None, "the same host in the clear");
-        let request = authorised(http.get(api), api, api, "").build().unwrap();
-        assert!(request.headers().get("authorization").is_none(), "no token, no header");
-    }
-
     /// A temp folder of its own, gone when the test ends.
     struct Dir(PathBuf);
 
@@ -510,12 +446,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_newest_release_is_asked_for_and_a_refusal_is_named() {
-        let host = stub_server::start(vec![("GET /api/v1/repos/a/b/releases/latest", 200, json("v9.0.0", NOTES, &[]))]).await;
-        let found = check(&format!("{host}/api/v1/repos/a/b/releases/latest"), "t").await.unwrap();
+        let host = stub_server::start(vec![("GET /repos/a/b/releases/latest", 200, json("9.0.0", NOTES, &[]))]).await;
+        let found = check(&format!("{host}/repos/a/b/releases/latest")).await.unwrap();
         assert_eq!(found.version, "9.0.0");
-        let missing = check(&format!("{host}/api/v1/repos/a/private/releases/latest"), "t").await.unwrap_err();
-        assert!(missing.contains("token cannot see"), "{missing}");
-        let down = check("http://127.0.0.1:9/api/v1/repos/a/b/releases/latest", "t").await.unwrap_err();
+        let missing = check(&format!("{host}/repos/a/gone/releases/latest")).await.unwrap_err();
+        assert_eq!(missing, "no release there");
+        let down = check("http://127.0.0.1:9/repos/a/b/releases/latest").await.unwrap_err();
         assert_eq!(down, "could not reach 127.0.0.1");
     }
 
@@ -543,7 +479,7 @@ mod tests {
             preview: false,
         };
         let mut seen = Vec::new();
-        install(&format!("{host}/api/v1/repos/a/b/releases/latest"), "t", &release, &target, |p| seen.push(p)).await.unwrap();
+        install(&release, &target, |p| seen.push(p)).await.unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), new);
         assert_eq!(seen.last(), Some(&1.0));
         #[cfg(unix)]
@@ -566,7 +502,6 @@ mod tests {
         let target = dir.0.join("Deckhand.AppImage");
         let old = appimage_bytes(1);
         std::fs::write(&target, &old).unwrap();
-        let api = format!("{host}/api/v1/repos/a/b/releases/latest");
         let release = |path: &str, size: usize, sha256: Option<String>| Release {
             version: "9.0.0".into(),
             headline: None,
@@ -574,13 +509,13 @@ mod tests {
             preview: false,
         };
 
-        let tampered = install(&api, "t", &release("/dl/good", good.len(), Some("0".repeat(64))), &target, |_| {}).await;
+        let tampered = install(&release("/dl/good", good.len(), Some("0".repeat(64))), &target, |_| {}).await;
         assert!(tampered.unwrap_err().contains("SHA-256"));
-        let short = install(&api, "t", &release("/dl/good", good.len() + 1, None), &target, |_| {}).await;
+        let short = install(&release("/dl/good", good.len() + 1, None), &target, |_| {}).await;
         assert!(short.unwrap_err().contains("bytes"));
-        let page = install(&api, "t", &release("/dl/page", 20, None), &target, |_| {}).await;
+        let page = install(&release("/dl/page", 20, None), &target, |_| {}).await;
         assert_eq!(page.unwrap_err(), "what downloaded is not an AppImage");
-        let gone = install(&api, "t", &release("/dl/missing", 1, None), &target, |_| {}).await;
+        let gone = install(&release("/dl/missing", 1, None), &target, |_| {}).await;
         assert_eq!(gone.unwrap_err(), "the download answered 404");
 
         assert_eq!(std::fs::read(&target).unwrap(), old, "the installed version is untouched");

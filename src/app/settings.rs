@@ -45,7 +45,6 @@ impl App {
             SettingRow::RomsFolder => self.pick_location(),
             // Ask, install or restart, whichever is next.
             SettingRow::Updates => self.press_updates(),
-            SettingRow::ReleaseToken => self.type_release_token(),
             SettingRow::SignOut => self.update(Message::SignOut),
             SettingRow::Launcher => self.pick_launcher(),
             SettingRow::SystemEmulators => self.pick_system_emulators(),

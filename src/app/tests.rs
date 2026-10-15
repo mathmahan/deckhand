@@ -955,7 +955,6 @@ mod render {
     fn render_settings_editing() {
         let mut app = paired_fixtures(30);
         app.settings.launch_command = Some(["retroarch", "-L", "/usr/lib/libretro/snes9x_libretro.so", "{rom}"].map(String::from).to_vec());
-        app.settings.release_token = Some("0123456789abcdef0123456789abcdef9f3a".into());
         let _ = app.update(Message::TabSelected(Tab::Settings));
         snapshot_sized(&app, "settings-all", (1280.0, 2400.0));
         let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::Launcher)));
@@ -2057,35 +2056,33 @@ fn release(version: &str) -> crate::release::Release {
 }
 
 #[test]
-fn on_github_new_versions_are_looked_for_without_a_token() {
+fn new_versions_are_looked_for_with_no_token_and_the_updates_row_asks_again() {
     use crate::release::Status;
     let (mut app, _) = App::new(Some(0));
-    app.release_repository = "https://github.com/a/b";
-    assert_eq!(app.settings.release_token, None);
-    assert_eq!(app.update(Message::CheckRelease).units(), 1, "asked, with no token");
+    assert_eq!(app.release, Status::Unasked);
+    let _ = app.update(Message::TabSelected(Tab::Settings));
+    let _ = app.view();
+    assert_eq!(app.update(Message::CheckRelease).units(), 1, "asked");
     assert_eq!(app.release, Status::Checking);
 
-    // The Updates row asks again rather than wanting a token first.
+    // The Updates row asks again after a failed ask, and before any.
     let _ = app.update(Message::ReleaseChecked(Err("could not reach api.github.com".into())));
-    let _ = app.update(Message::TabSelected(Tab::Settings));
     let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::Updates)));
     assert!(app.entry.is_none());
+    assert_eq!(app.release, Status::Checking);
+    app.release = Status::Unasked;
+    let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::Updates)));
     assert_eq!(app.release, Status::Checking);
     let _ = app.view();
 }
 
 #[test]
-fn without_a_token_nothing_is_asked_and_the_updates_row_takes_one_typed_in() {
+fn a_field_takes_keys_the_pad_and_a_paste_and_is_cancelled_or_saved() {
     use crate::gamepad::Pad;
-    use crate::release::Status;
     let (mut app, _) = App::new(Some(0));
-    // A private Forgejo repository, whatever this build was made from.
-    app.release_repository = "https://repo.example/a/b";
-    assert_eq!(app.release, Status::Off);
-    assert_eq!(app.update(Message::CheckRelease).units(), 0, "no request");
     let _ = app.update(Message::TabSelected(Tab::Settings));
-    let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::Updates)));
-    assert!(app.entry.is_some(), "pressing it asks for the token");
+    let _ = app.type_launch_command();
+    assert_eq!(app.entry.as_ref().unwrap().entry.text, "", "RetroDECK, so empty");
 
     // A keyboard types, the pad presses keys, and neither reaches the page underneath.
     let _ = app.update(Message::KeyChar("ab[".into(), false));
@@ -2100,22 +2097,20 @@ fn without_a_token_nothing_is_asked_and_the_updates_row_takes_one_typed_in() {
     let _ = app.view();
     let _ = app.update(Message::Activate);
     assert!(app.entry.is_none());
-    assert_eq!(app.settings.release_token.as_deref(), Some("abcd"));
-    assert_eq!(app.release, Status::Checking, "and asked with it straight away");
+    assert_eq!(app.settings.launch_command, Some(vec!["abcd".to_string()]));
 
-    // Cancelled, nothing changes; saved empty, the token goes and so does the asking.
-    let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::ReleaseToken)));
+    // Cancelled, nothing changes; saved empty, the setting goes.
+    let _ = app.type_launch_command();
     assert_eq!(app.entry.as_ref().unwrap().entry.text, "abcd", "opens on what is set");
     let _ = app.update(Message::KeyChar("zz".into(), false));
     let _ = app.update(Message::Pad(Pad::Back));
-    assert_eq!(app.settings.release_token.as_deref(), Some("abcd"));
-    let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::ReleaseToken)));
+    assert_eq!(app.settings.launch_command, Some(vec!["abcd".to_string()]));
+    let _ = app.type_launch_command();
     for _ in 0..4 {
         let _ = app.update(Message::Pad(Pad::Erase));
     }
     let _ = app.update(Message::Pad(Pad::Start));
-    assert_eq!(app.settings.release_token, None);
-    assert_eq!(app.release, Status::Off);
+    assert_eq!(app.settings.launch_command, None);
 }
 
 #[test]
@@ -2261,7 +2256,6 @@ fn a_new_version_is_announced_once_and_stays_offered_through_a_failed_ask() {
     use crate::release::Status;
     let (mut app, _) = App::new(Some(0));
     app.banner = None;
-    app.settings.release_token = Some("t".into());
 
     let _ = app.update(Message::ReleaseChecked(Ok(release("99.0.0"))));
     assert!(matches!(&app.release, Status::Out(r) if r.version == "99.0.0"));
@@ -2293,7 +2287,6 @@ fn an_install_reports_its_progress_and_a_restart_waits_for_the_game_being_played
     use crate::release::{Event, Status};
     let (mut app, _) = App::new(Some(60));
     app.banner = None;
-    app.settings.release_token = Some("t".into());
     app.appimage = Some("/nowhere/Deckhand.AppImage".into());
     let _ = app.update(Message::ReleaseChecked(Ok(release("99.0.0"))));
     assert!(app.banner.as_deref().unwrap().contains("Settings ▸ About ▸ Updates installs it"), "{:?}", app.banner);

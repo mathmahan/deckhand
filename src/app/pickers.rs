@@ -452,23 +452,6 @@ impl App {
         Task::none()
     }
 
-    pub(super) fn type_release_token(&mut self) -> Task<Message> {
-        let note = if crate::release::needs_token(self.release_repository) {
-            "A Forgejo access token that can read Deckhand's repository, which is private. Make one on the \
-             Forgejo site under Settings ▸ Applications, with read access to repositories and limited to \
-             Deckhand, then paste or type it here. Empty turns looking for new versions off."
-        } else {
-            "Not needed: Deckhand's releases are public on GitHub, and new versions are looked for without \
-             one. A GitHub token here goes with each question, which only lifts GitHub's limit on how often \
-             it can be asked. Empty asks without one."
-        };
-        self.entry = Some(PendingEntry {
-            entry: crate::ui::entry::Entry::new("Update token", note, self.settings.release_token.clone().unwrap_or_default()),
-            purpose: Typing::ReleaseToken,
-        });
-        Task::none()
-    }
-
     pub(super) fn type_launch_command(&mut self) -> Task<Message> {
         self.entry = Some(PendingEntry {
             entry: crate::ui::entry::Entry::new(
@@ -543,23 +526,9 @@ impl App {
 
     /// Save what the field holds, or say under it why it cannot be.
     pub(super) fn finish_entry(&mut self) -> Task<Message> {
-        use crate::release::Status;
         let Some(mut pending) = self.entry.take() else { return Task::none() };
         let text = pending.entry.text.trim().to_string();
         match pending.purpose.clone() {
-            Typing::ReleaseToken => {
-                self.settings.release_token = (!text.is_empty()).then(|| text.clone());
-                self.write_settings();
-                // An install under way, or done, carries on with the token it started with.
-                if matches!(self.release, Status::Installing(..) | Status::Installed(_)) {
-                    return Task::none();
-                }
-                self.release = Status::Off;
-                if text.is_empty() {
-                    self.say("The update token is gone, so new versions are no longer looked for.".into());
-                }
-                self.check_release()
-            }
             Typing::LoginUrl => {
                 if let Screen::Login(state) = &mut self.screen {
                     state.url = text;

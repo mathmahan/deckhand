@@ -34,7 +34,7 @@ pub struct Connection {
     pub device_id: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub connection: Option<Connection>,
@@ -76,11 +76,6 @@ pub struct Settings {
     /// RetroArch's `--entryslot 0`; see [`crate::launch`]. Off until chosen.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resume_state: bool,
-    /// A token that can read Deckhand's own repository, so new versions of the app are found — see
-    /// [`crate::release`]. Typed or pasted in Settings ▸ About. On Forgejo, where the repository is
-    /// private, nothing is asked without one; on GitHub it is not needed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub release_token: Option<String>,
 }
 
 /// Written by hand so the token never reaches a log line or a panic message through `{:?}` — a
@@ -94,25 +89,6 @@ impl std::fmt::Debug for Connection {
             .field("token_id", &self.token_id)
             .field("token_name", &self.token_name)
             .field("device_id", &self.device_id)
-            .finish()
-    }
-}
-
-/// By hand for the same reason as [`Connection`]'s: the update token stays out of it.
-impl std::fmt::Debug for Settings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Settings")
-            .field("connection", &self.connection)
-            .field("ui_scale", &self.ui_scale)
-            .field("grid_density", &self.grid_density)
-            .field("retroarch_config", &self.retroarch_config)
-            .field("roms_dir", &self.roms_dir)
-            .field("launch_command", &self.launch_command)
-            .field("system_commands", &self.system_commands)
-            .field("storage_budget_gb", &self.storage_budget_gb)
-            .field("watch_saves", &self.watch_saves)
-            .field("resume_state", &self.resume_state)
-            .field("release_token", &self.release_token.as_ref().map(|_| "<hidden>"))
             .finish()
     }
 }
@@ -142,7 +118,6 @@ impl Default for Settings {
             storage_budget_gb: None,
             resume_state: false,
             watch_saves: true,
-            release_token: None,
         }
     }
 }
@@ -232,7 +207,7 @@ impl Settings {
         let dir = Self::config_dir();
         fs::create_dir_all(&dir)?;
         let tmp = dir.join("settings.json.tmp");
-        // Readable by this user alone: it holds the RomM token and the update token.
+        // Readable by this user alone: it holds the RomM token.
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -263,10 +238,16 @@ mod tests {
                 token_name: None,
                 device_id: None,
             }),
-            release_token: Some("forgejo_secret".into()),
             ..Settings::default()
         };
         let shown = format!("{settings:?}");
         assert!(!shown.contains("secret") && shown.contains("romm.local"), "{shown}");
+    }
+
+    #[test]
+    fn a_settings_file_with_the_old_update_token_still_reads() {
+        let settings: Settings = serde_json::from_str(r#"{"release_token": "old", "resume_state": true}"#).unwrap();
+        assert!(settings.resume_state);
+        assert!(!serde_json::to_string(&settings).unwrap().contains("old"), "and is dropped when written");
     }
 }

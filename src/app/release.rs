@@ -3,14 +3,9 @@
 use super::*;
 
 impl App {
-    /// Ask the repository for its newest release — on Forgejo, when there is a token to ask with.
+    /// Ask the repository for its newest release.
     pub(super) fn check_release(&mut self) -> Task<Message> {
         use crate::release::Status;
-        let token = self.settings.release_token.as_deref().map(str::trim).unwrap_or_default().to_string();
-        if token.is_empty() && crate::release::needs_token(self.release_repository) {
-            self.release = Status::Off;
-            return Task::none();
-        }
         match self.release {
             Status::Checking | Status::Installing(..) | Status::Installed(_) => return Task::none(),
             // Asked again behind what is on show: a newer version stays offered meanwhile.
@@ -18,7 +13,7 @@ impl App {
             _ => self.release = Status::Checking,
         }
         let api = crate::release::latest_url(self.release_repository);
-        Task::perform(async move { crate::release::check(&api, &token).await }, Message::ReleaseChecked)
+        Task::perform(async move { crate::release::check(&api).await }, Message::ReleaseChecked)
     }
 
     pub(super) fn on_release_checked(&mut self, result: Result<crate::release::Release, String>) -> Task<Message> {
@@ -59,9 +54,7 @@ impl App {
     pub(super) fn press_updates(&mut self) -> Task<Message> {
         use crate::release::Status;
         match self.release.clone() {
-            // Asking needs a token; pressing the row is where it is given.
-            Status::Off => self.type_release_token(),
-            Status::Current | Status::Failed(_, None) => self.check_release(),
+            Status::Unasked | Status::Current | Status::Failed(_, None) => self.check_release(),
             Status::Out(release) | Status::Failed(_, Some(release)) => self.install_release(release),
             Status::Checking | Status::Installing(..) => Task::none(),
             Status::Installed(_) => self.restart(),
@@ -87,13 +80,11 @@ impl App {
             ));
             return Task::none();
         }
-        let token = self.settings.release_token.clone().unwrap_or_default();
         self.release = Status::Installing(release.clone(), 0.0);
-        let api = crate::release::latest_url(self.release_repository);
         Task::run(
             iced::stream::channel(8, move |mut output: Sender<Event>| async move {
                 let mut progress = output.clone();
-                let result = crate::release::install(&api, token.trim(), &release, &target, |fraction| {
+                let result = crate::release::install(&release, &target, |fraction| {
                     // Dropped rather than awaited when the UI is behind: only the latest one matters.
                     let _ = progress.try_send(Event::Progress(fraction));
                 })

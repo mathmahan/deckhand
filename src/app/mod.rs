@@ -689,7 +689,7 @@ impl App {
             save_folder: None,
             retroarch_found: None,
             save_sync: SaveSync::Idle,
-            release: crate::release::Status::Off,
+            release: crate::release::Status::Unasked,
             release_repository: crate::release::REPOSITORY,
             release_announced: None,
             appimage: fixtures.is_none().then(crate::release::running_appimage).flatten(),
@@ -733,7 +733,6 @@ impl App {
             // rather than carried, because every path that reads one would otherwise reach a real
             // server with rom ids that only exist here — a download press most of all.
             app.settings.connection = None;
-            app.settings.release_token = None;
             app.library = Arc::new(crate::fixtures::library(count));
             app.rebuild_collections();
             app.rebuild_shelves();
@@ -1418,7 +1417,6 @@ struct PendingEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Typing {
-    ReleaseToken,
     LaunchCommand,
     /// The command for one ES-DE system's games.
     SystemCommand(String),

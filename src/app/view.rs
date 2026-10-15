@@ -505,7 +505,6 @@ impl App {
                     retroarch_found: self.retroarch_found.as_ref(),
                     save_sync: &self.save_sync,
                     release: &self.release,
-                    token_needed: crate::release::needs_token(self.release_repository),
                     appimage: self.appimage.is_some(),
                     retrodeck: self.retrodeck,
                     steam: self.steam_found.then(|| {
