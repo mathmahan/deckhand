@@ -50,11 +50,15 @@ impl App {
         if let Some(pending) = &self.pick {
             return crate::ui::picker::view(&pending.picker);
         }
-        let mut page = column![];
-        if let Some(banner) = &self.banner {
-            page = page.push(banner_view(banner, self.chrome == Some(Chrome::Banner)));
-        }
-        page = page.push(chrome);
+        // The banner's place is always there, empty without one, so the page keeps its place in the
+        // widget tree. Pushed in only when a banner came, it moved the page down a slot, and every
+        // scrollable in it started over at the top — Settings jumped up as an update was found and
+        // again as its banner went.
+        let banner: Element<Message> = match &self.banner {
+            Some(banner) => banner_view(banner, self.chrome == Some(Chrome::Banner)),
+            None => Space::new().height(Length::Fixed(0.0)).into(),
+        };
+        let page = column![banner, chrome];
 
         container(page)
             .width(Length::Fill)

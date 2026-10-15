@@ -1,8 +1,7 @@
 //! Downloading a game from RomM onto this device, and remembering what is here.
 //!
 //! A port of `browse/data/DownloadQueue.kt`, with the parts that only exist to feed RetroDECK left
-//! out — see "What is deliberately missing" in `docs/DETAILS.md`. What is here is the queue's own shape,
-//! which is what makes a download feel like one:
+//! out. What is here is the queue's own shape, which is what makes a download feel like one:
 //!
 //! - **The badge is optimistic.** A press marks the game *Downloading* before any request is made,
 //!   so pressing it is obviously acknowledged even when the tile is not in view.

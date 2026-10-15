@@ -2,7 +2,7 @@
 //!
 //! It pairs with a RomM server, browses it, downloads games from it, launches them, and keeps their
 //! saves and states in step with it — from the window, or around a game another launcher starts
-//! (`deckhand pre|post`, in `cli`). What is not built yet is listed in `docs/DETAILS.md`.
+//! (`deckhand pre|post`, in `cli`).
 
 mod achievements;
 mod animation;
