@@ -35,10 +35,10 @@
 //!   emulated NAND, `<ID>.wii.zip`. The Kotlin app has no Wii handler, so this name is this app's.
 //!
 //! Save states sync too, one file per slot under its own name — the Kotlin app's
-//! `SerialStateHandler`: PCSX2's and PPSSPP's, found by serial, and Dolphin's, by the game's id. A
-//! Dolphin state loads only in a Dolphin that saves states the same way, which a version apart
-//! often does not; one that will not load is refused by Dolphin with a message, and the game's own
-//! save, synced separately, is untouched.
+//! `SerialStateHandler`: PCSX2's, PPSSPP's and DuckStation's, found by serial, and Dolphin's, by the
+//! game's id. A Dolphin state loads only in a Dolphin that saves states the same way, which a
+//! version apart often does not; one that will not load is refused by Dolphin with a message, and
+//! the game's own save, synced separately, is untouched.
 //!
 //! A PS2 or PSP folder is named after the disc serial, which nothing in RomM carries, so the serial
 //! is read out of the game's own disc — a CHD or a CSO too — by [`crate::sigil`]. A folder RomM has
@@ -69,7 +69,8 @@ pub enum Emulator {
     Vita3k,
     Azahar,
     Cemu,
-    /// PS1 memory cards. Synced through sigil only: the engine before it never kept them.
+    /// PS1 memory cards, synced through sigil only: the engine before it never kept them. Its save
+    /// states as well.
     DuckStation,
 }
 
@@ -325,6 +326,12 @@ fn is_state_of(emulator: Emulator, name: &str) -> bool {
                 && slot.bytes().all(|b| b.is_ascii_digit())
                 && slot != "00"
         }),
+        // `SLUS-00594_1.sav`, and `SLUS-00594_resume.sav` — what "save state on exit" writes.
+        Emulator::DuckStation => name.strip_suffix(".sav").and_then(|stem| stem.rsplit_once('_')).is_some_and(|(serial, slot)| {
+            serial.len() == 10
+                && ps2_serial(serial).is_some()
+                && (slot == "resume" || (!slot.is_empty() && slot.bytes().all(|b| b.is_ascii_digit())))
+        }),
         _ => false,
     }
 }
@@ -348,6 +355,7 @@ fn state_files(emulator: Emulator, rom: &Path) -> Option<Result<StateFiles, Stri
             ".config/ppsspp/PSP/PPSSPP_STATE",
         ))
         .ok_or_else(|| "no PPSSPP_STATE folder found".to_string()),
+        Emulator::DuckStation => duckstation_ini().map(|ini| duckstation_states(&ini)),
         // None of the others has a state format worth carrying to another machine.
         _ => return None,
     };
@@ -365,12 +373,14 @@ fn state_files(emulator: Emulator, rom: &Path) -> Option<Result<StateFiles, Stri
     }))
 }
 
-/// The serials on the game's discs — `SLUS-20946` for PCSX2's names, `ULUS10538` for PPSSPP's — read
-/// out of each disc by sigil: every disc an `.m3u` lists, else the file itself.
+/// The serials on the game's discs — `SLUS-20946` for PCSX2's names, `ULUS10538` for PPSSPP's,
+/// `SLUS-00594` for DuckStation's — read out of each disc by sigil: every disc an `.m3u` lists, else
+/// the file itself.
 fn disc_serials(emulator: Emulator, rom: &Path) -> Result<Vec<String>, String> {
     let platform = match emulator {
         Emulator::Pcsx2 => "ps2",
         Emulator::Ppsspp => "psp",
+        Emulator::DuckStation => "psx",
         _ => return Ok(Vec::new()),
     };
     let mut serials = Vec::new();
@@ -395,7 +405,8 @@ fn disc_serials(emulator: Emulator, rom: &Path) -> Result<Vec<String>, String> {
 /// starts with.
 fn of_serials(emulator: Emulator, name: &str, serials: &[String]) -> bool {
     match emulator {
-        Emulator::Pcsx2 => ps2_serial(name).is_some_and(|s| serials.contains(&s)),
+        // A PS1 disc's serial has a PS2 one's shape, `SLUS-00594`.
+        Emulator::Pcsx2 | Emulator::DuckStation => ps2_serial(name).is_some_and(|s| serials.contains(&s)),
         Emulator::Ppsspp => psp_serial(name).is_some_and(|s| serials.iter().any(|id| id.replace('-', "") == s.replace('-', ""))),
         _ => false,
     }
@@ -435,6 +446,25 @@ fn pcsx2_states() -> Result<PathBuf, String> {
     let (ini, settings) = pcsx2_ini()?;
     let base = ini.parent().and_then(Path::parent).unwrap_or(Path::new("/"));
     Ok(settings.get("SaveStates").map_or_else(|| base.join("sstates"), |s| base.join(s)))
+}
+
+/// DuckStation's `settings.ini`.
+fn duckstation_ini() -> Result<PathBuf, String> {
+    installs(
+        "config/duckstation/settings.ini",
+        ("org.duckstation.DuckStation", "config/duckstation/settings.ini"),
+        ".local/share/duckstation/settings.ini",
+    )
+    .into_iter()
+    .find(|p| p.is_file())
+    .ok_or_else(|| "no DuckStation settings.ini found".to_string())
+}
+
+/// DuckStation's state folder: `SaveStates` in its `settings.ini`, else `savestates` beside it — under
+/// RetroDECK a link into `states/psx/duckstation`.
+fn duckstation_states(ini: &Path) -> PathBuf {
+    let base = ini.parent().unwrap_or(Path::new("."));
+    ini_value(ini, "SaveStates").map_or_else(|| base.join("savestates"), |s| base.join(s))
 }
 
 impl Run<'_> {
@@ -1301,16 +1331,11 @@ pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sig
         Emulator::Azahar => ("azahar", "3ds", named(&azahar_sdmc(), "sdmc", "Azahar's SD card")?, Vec::new(), None),
         Emulator::Cemu => ("cemu", "wiiu", named(&cemu_mlc(), "mlc01", "Cemu's mlc01")?, Vec::new(), None),
         Emulator::DuckStation => {
-            let ini = installs(
-                "config/duckstation/settings.ini",
-                ("org.duckstation.DuckStation", "config/duckstation/settings.ini"),
-                ".local/share/duckstation/settings.ini",
-            );
-            let file = ini.iter().find(|p| p.is_file()).ok_or("no DuckStation settings.ini found")?;
-            let cards = ini_value(file, "Directory")
+            let file = duckstation_ini()?;
+            let cards = ini_value(&file, "Directory")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join("memcards"));
-            ("duckstation", "psx", named(&cards, "memcards", "DuckStation's memory cards folder")?, ini, None)
+            ("duckstation", "psx", named(&cards, "memcards", "DuckStation's memory cards folder")?, vec![file], None)
         }
     };
     // The settings sigil says this layout's files turn on, from the emulator's own config.
@@ -1531,6 +1556,10 @@ mod tests {
         assert!(of_serials(Emulator::Ppsspp, "ULUS10538DATA00", &dj_max));
         assert!(of_serials(Emulator::Ppsspp, "ULUS10538_2.00_0.ppst", &dj_max));
         assert!(!of_serials(Emulator::Ppsspp, "ULUS10539", &dj_max));
+        let ape_escape = ["SCUS-94423".to_string()];
+        assert!(of_serials(Emulator::DuckStation, "SCUS-94423_1.sav", &ape_escape));
+        assert!(of_serials(Emulator::DuckStation, "SCUS-94423_resume.sav", &ape_escape));
+        assert!(!of_serials(Emulator::DuckStation, "SCUS-94424_1.sav", &ape_escape));
     }
 
     #[test]
@@ -1731,6 +1760,27 @@ mod tests {
         assert!(!is_state_of(Emulator::Dolphin, "lastState.sav"), "nor the state Dolphin keeps to undo a load");
         assert!(!is_state_of(Emulator::Dolphin, "GALE01.s00"));
         assert!(!is_state_of(Emulator::Dolphin, "gale01.s01"));
+        assert!(is_state_of(Emulator::DuckStation, "SCUS-94423_1.sav"));
+        assert!(is_state_of(Emulator::DuckStation, "SCUS-94423_10.sav"));
+        assert!(is_state_of(Emulator::DuckStation, "SCUS-94423_resume.sav"), "the state saved on exit");
+        assert!(!is_state_of(Emulator::DuckStation, "SCUS-94423_1.sav.backup"));
+        assert!(!is_state_of(Emulator::DuckStation, "savestate_1.sav"), "a state of no game in particular");
+        assert!(!is_state_of(Emulator::DuckStation, "resume.sav"));
+        assert!(!is_state_of(Emulator::DuckStation, "Ape Escape (USA).state"), "RetroArch's, not DuckStation's");
+        assert!(!is_state_of(Emulator::DuckStation, "SCUS-94423_1.sync-conflict-x.sav"));
+    }
+
+    #[test]
+    fn duckstations_states_are_where_its_settings_say() {
+        let dir = temp("duckstation-states");
+        let ini = dir.join("settings.ini");
+        fs::write(&ini, "[Main]\nSaveStateOnExit = true\n").unwrap();
+        assert_eq!(duckstation_states(&ini), dir.join("savestates"), "beside the settings, by default");
+        fs::write(&ini, "[Main]\nSaveStateOnExit = true\n[Folders]\nSaveStates = states\n").unwrap();
+        assert_eq!(duckstation_states(&ini), dir.join("states"));
+        fs::write(&ini, "[Folders]\nSaveStates = /media/states/psx\n").unwrap();
+        assert_eq!(duckstation_states(&ini), PathBuf::from("/media/states/psx"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

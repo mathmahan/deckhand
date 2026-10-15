@@ -54,7 +54,7 @@ over on each game's first sync.
 | Everything RetroArch runs | RetroArch, any core | ✅ Saves and save states, memory cards and backup RAM included |
 | PlayStation 2 | PCSX2 | ✅ The game's saves off a folder or file memory card, save states |
 | PSP | PPSSPP | ✅ Save folders, save states |
-| PlayStation | DuckStation | ✅ Memory cards |
+| PlayStation | DuckStation | ✅ Memory cards, save states |
 | PlayStation 3 | RPCS3 | ✅ Save folders |
 | PS Vita | Vita3K | ✅ Save folders |
 | GameCube | Dolphin | ✅ Memory card saves, save states |
