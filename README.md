@@ -37,7 +37,8 @@ and keep saves and save states in sync with your server.
   the window is open, as soon as a save changes. An older save can be restored from a game's Saves
   page. See [Save sync](#save-sync) for what each system syncs.
 - **Steam and ES-DE.** Downloaded games can be added to Steam with their art, and still sync when
-  started there. Games started from ES-DE sync too, through hooks Deckhand installs.
+  started there. Games started from ES-DE sync too, through hooks Deckhand installs. Add Deckhand
+  itself to Steam as a non-Steam game and it gives itself a cover, banner, logo and backdrop.
 - **Made for a pad.** The d-pad reaches every page and button, and L1/R1 move between tabs.
 - **Updates itself** from this repository's releases.
 

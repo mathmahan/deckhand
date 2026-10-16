@@ -742,6 +742,9 @@ impl App {
             return (app, measure);
         }
 
+        // Deckhand's own shortcut in Steam, when the player added one, gets its art.
+        let measure = Task::batch([measure, dress_own_shortcut()]);
+
         if !paired {
             return (app, measure);
         }
@@ -1195,6 +1198,16 @@ impl App {
 
 /// Run `work` on tokio's blocking pool — the disk, process and config work the app keeps off the UI
 /// thread. A `work` that panicked answers why, for its caller to say or fall back from.
+/// Give the shortcut that starts Deckhand in Steam Deckhand's art — see [`crate::steam::dress_own`].
+/// Nothing is said either way: it is done again at the next start.
+fn dress_own_shortcut() -> Task<Message> {
+    Task::future(off_thread(|| {
+        let (Some(steam), Some(deckhand)) = (crate::steam::Steam::find(), crate::steam::deckhand_path()) else { return };
+        let _ = crate::steam::dress_own(&steam, &deckhand, !crate::steam::running());
+    }))
+    .discard()
+}
+
 async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
     tokio::task::spawn_blocking(work).await.map_err(|e| format!("it stopped unexpectedly ({e})"))
 }
