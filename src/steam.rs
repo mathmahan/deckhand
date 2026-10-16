@@ -22,6 +22,10 @@
 //!   colours that Steam's logo sits on. Not the banner, which has the wordmark drawn in already and
 //!   would show it twice. Steam keeps nothing else for a shortcut — no description, developer or
 //!   release date to fill in.
+//! - **Deckhand's own shortcut**, the one a player adds by hand to start the app, gets Deckhand's
+//!   art (`packaging/art/`) at each start, wherever it has none: only files in `config/grid/`, so
+//!   Steam may run meanwhile, and never over art the player chose. Its icon is named in the
+//!   shortcut itself, so that one waits for a start with Steam closed.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -594,6 +598,100 @@ impl Bindings {
     }
 }
 
+/// Deckhand's own art, drawn by `packaging/art/render.py`, in [`art_files`]' order: the portrait
+/// capsule, the wide one, the hero, the logo and the icon.
+const OWN_ART: [&[u8]; 5] = [
+    include_bytes!("../packaging/art/steam/capsule.png"),
+    include_bytes!("../packaging/art/steam/wide.png"),
+    include_bytes!("../packaging/art/steam/hero.png"),
+    include_bytes!("../packaging/art/steam/logo.png"),
+    include_bytes!("../packaging/art/steam/icon.png"),
+];
+
+/// The ids of the shortcuts in `file` that start Deckhand itself: `deckhand` as the program, and not
+/// a game's `play <rom id>`. The player adds this one by hand, so its id is read, not worked out.
+pub fn own_shortcuts(file: &[(String, Value)], deckhand: &Path) -> Vec<u32> {
+    let Some((_, Value::Map(entries))) = file.iter().find(|(k, _)| k.eq_ignore_ascii_case("shortcuts")) else {
+        return Vec::new();
+    };
+    let same = |exe: &str| {
+        let exe = Path::new(exe.trim().trim_matches('"'));
+        exe == deckhand || exe.canonicalize().ok().zip(deckhand.canonicalize().ok()).is_some_and(|(a, b)| a == b)
+    };
+    let text = |entry: &Value, key: &str| match entry.get(key) {
+        Some(Value::Str(v)) => v.clone(),
+        _ => String::new(),
+    };
+    entries
+        .iter()
+        .filter(|(_, entry)| same(&text(entry, "Exe")) && !text(entry, "LaunchOptions").trim_start().starts_with("play "))
+        .filter_map(|(_, entry)| id_of(entry))
+        .collect()
+}
+
+/// Whether the grid has a picture under `name`'s stem, in any of the formats Steam reads there —
+/// art the player chose may be a JPEG.
+fn has_art(grid: &Path, name: &str) -> bool {
+    let stem = name.trim_end_matches(".png");
+    ["png", "jpg", "jpeg"].iter().any(|ext| grid.join(format!("{stem}.{ext}")).is_file())
+}
+
+/// Give Deckhand's own shortcuts in `steam` Deckhand's art, each piece only where it has none, and,
+/// when Steam is `closed`, the icon. Returns how many files were written.
+pub fn dress_own(steam: &Steam, deckhand: &Path, closed: bool) -> Result<usize, String> {
+    let file = match std::fs::read(steam.shortcuts_file()) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("could not read Steam's shortcuts ({e})")),
+    };
+    let parsed = vdf::parse(&file)?;
+    let ids = own_shortcuts(&parsed, deckhand);
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let grid = steam.grid();
+    std::fs::create_dir_all(&grid).map_err(|e| e.to_string())?;
+    let mut written = 0;
+    for id in &ids {
+        for (name, png) in art_files(*id).iter().zip(OWN_ART) {
+            if !has_art(&grid, name) {
+                std::fs::write(grid.join(name), png).map_err(|e| e.to_string())?;
+                written += 1;
+            }
+        }
+    }
+    // The icon is named in the shortcut, which Steam writes over on exit: only set with it closed,
+    // and only where the shortcut names none.
+    let mut with_icons = parsed;
+    let mut changed = false;
+    for (_, entry) in shortcuts(&mut with_icons).iter_mut() {
+        if let Some(id) = id_of(entry).filter(|id| ids.contains(id)) {
+            changed |= set_icon(entry, &grid.join(format!("{id}_icon.png")));
+        }
+    }
+    if changed && closed {
+        rewrite(steam, |_| with_icons)?;
+    }
+    Ok(written)
+}
+
+/// `entry`'s icon set to `icon`, when it names none. Whether it changed.
+fn set_icon(entry: &mut Value, icon: &Path) -> bool {
+    let Value::Map(fields) = entry else { return false };
+    let icon = Value::Str(icon.display().to_string());
+    match fields.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case("icon")) {
+        Some((_, Value::Str(v))) if !v.trim().is_empty() => false,
+        Some((_, value)) => {
+            *value = icon;
+            true
+        }
+        None => {
+            fields.push(("icon".into(), icon));
+            true
+        }
+    }
+}
+
 /// Where the shortcut points: the AppImage this runs from — kept at one path across updates — or
 /// this binary.
 pub fn deckhand_path() -> Option<PathBuf> {
@@ -710,6 +808,61 @@ mod tests {
         assert_eq!(names(&steam), [Value::Str("Grand Theft Auto: San Andreas".into())]);
         assert!(!steam.grid().join(format!("{id}p.png")).exists());
         assert!(!icon.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deckhands_own_art_is_each_size_steam_asks_for() {
+        let sizes: Vec<(u32, u32)> = OWN_ART.iter().map(|png| image::load_from_memory(png).unwrap()).map(|i| (i.width(), i.height())).collect();
+        assert_eq!(sizes[0], (600, 900), "the portrait capsule");
+        assert_eq!(sizes[1], (920, 430), "the wide one");
+        assert_eq!(sizes[2], HERO, "the hero");
+        assert!(sizes[3].0 >= 640, "the logo");
+        assert_eq!(sizes[4], (ICON, ICON), "the icon");
+    }
+
+    #[test]
+    fn deckhands_own_shortcut_gets_its_art_where_it_has_none_and_its_icon_with_steam_closed() {
+        let root = std::env::temp_dir().join(format!("deckhand-steam-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let steam = Steam { root: root.clone(), user: root.join("userdata/42"), flatpak: false };
+        std::fs::create_dir_all(steam.grid()).unwrap();
+        let deckhand = Path::new("/d/Deckhand.AppImage");
+        // Added by hand, as a player does: Deckhand with no launch options. Beside it, a game that
+        // Deckhand added, which runs the same program with `play`.
+        let own = Shortcut {
+            name: "Deckhand".into(),
+            exe: format!("\"{}\"", deckhand.display()),
+            start_dir: "\"/d\"".into(),
+            launch_options: String::new(),
+            tags: Vec::new(),
+            icon: String::new(),
+        };
+        let game = Shortcut::for_game(deckhand, 7, "Chrono Trigger", "snes");
+        let file = merged(vdf::parse(&real_file()).unwrap(), &[own.clone(), game.clone()]);
+        std::fs::write(steam.shortcuts_file(), vdf::write(&file)).unwrap();
+        assert_eq!(own_shortcuts(&file, deckhand), [own.appid()], "not the game, not another program");
+
+        // A hero the player chose stays.
+        let id = own.appid();
+        std::fs::write(steam.grid().join(format!("{id}_hero.jpg")), b"theirs").unwrap();
+        let before = std::fs::read(steam.shortcuts_file()).unwrap();
+        assert_eq!(dress_own(&steam, deckhand, false).unwrap(), 4);
+        assert!(!steam.grid().join(format!("{id}_hero.png")).exists());
+        assert_eq!(std::fs::read(steam.grid().join(format!("{id}p.png"))).unwrap(), OWN_ART[0]);
+        assert_eq!(std::fs::read(steam.shortcuts_file()).unwrap(), before, "with Steam running, its file is left to it");
+        assert!(!steam.grid().join(format!("{}p.png", game.appid())).exists(), "a game's art is the game's");
+        assert_eq!(dress_own(&steam, deckhand, false).unwrap(), 0, "once is enough");
+
+        dress_own(&steam, deckhand, true).unwrap();
+        let file = vdf::parse(&std::fs::read(steam.shortcuts_file()).unwrap()).unwrap();
+        let icon_of = |n: &str| file[0].1.get(n).unwrap().get("icon").cloned();
+        let icon = steam.grid().join(format!("{id}_icon.png"));
+        assert_eq!(icon_of("1"), Some(Value::Str(icon.display().to_string())), "with Steam closed, the icon is named");
+        assert_eq!(icon_of("2"), Some(Value::Str(String::new())), "the game's is not touched");
+        let written = std::fs::read(steam.shortcuts_file()).unwrap();
+        dress_own(&steam, deckhand, true).unwrap();
+        assert_eq!(std::fs::read(steam.shortcuts_file()).unwrap(), written, "and not written again");
         let _ = std::fs::remove_dir_all(&root);
     }
 
