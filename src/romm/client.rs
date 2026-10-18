@@ -776,7 +776,7 @@ impl RommClient {
         emulator: &str,
         file_name: &str,
         bytes: Vec<u8>,
-        screenshot: Option<Vec<u8>>,
+        screenshot: Option<(Vec<u8>, &str)>,
     ) -> Result<SaveAsset> {
         let mut url = reqwest::Url::parse(&format!("{}/api/states", conn.host.trim_end_matches('/')))
             .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
@@ -786,11 +786,12 @@ impl RommClient {
             .mime_str("application/octet-stream")
             .map_err(|_| ApiError::new(-1, "Could not build the upload."))?;
         let mut form = reqwest::multipart::Form::new().part("stateFile", part);
-        // RetroArch's `<state>.png`, which RomM keeps as the state's screenshot.
-        if let Some(png) = screenshot {
-            let shot = reqwest::multipart::Part::bytes(png)
-                .file_name(format!("{file_name}.png"))
-                .mime_str("image/png")
+        // The picture taken with the state, by its extension, which RomM keeps as its screenshot.
+        if let Some((picture, ext)) = screenshot {
+            let mime = if ext == "jpg" { "image/jpeg" } else { "image/png" };
+            let shot = reqwest::multipart::Part::bytes(picture)
+                .file_name(format!("{file_name}.{ext}"))
+                .mime_str(mime)
                 .map_err(|_| ApiError::new(-1, "Could not build the upload."))?;
             form = form.part("screenshotFile", shot);
         }

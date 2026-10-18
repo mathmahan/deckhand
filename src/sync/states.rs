@@ -27,9 +27,11 @@
 //! one menu away. Only into a slot this app last wrote, though: RetroArch's slot number is one the
 //! player can wind as far as they like, so a state they saved there themselves is theirs and is
 //! never traded for a copy of something RomM holds. Thumbnails travel both ways: RetroArch's
-//! `<state>.png` goes up as the state's screenshot, and RomM's comes down beside the slot.
+//! `<state>.png` goes up as the state's screenshot, and RomM's comes down beside the slot. A
+//! standalone emulator's state sends the picture it took too ([`picture`]), and takes none back.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -131,6 +133,28 @@ fn thumbnail(state: &Path) -> PathBuf {
     let mut name = state.file_name().unwrap_or_default().to_os_string();
     name.push(".png");
     state.with_file_name(name)
+}
+
+/// The biggest picture read out of a state: PCSX2's is a few hundred KB.
+const MOST_PICTURE: u64 = 16 << 20;
+
+/// The picture an emulator took with `state`, and its extension: PCSX2's `Screenshot.png` inside the
+/// `.p2s`, which is a zip, PPSSPP's `.jpg` beside the `.ppst`, and otherwise RetroArch's
+/// [`thumbnail`]. Sent with every upload: without one RomM keeps the slot's old picture, and a state
+/// that synced looks as if it had not.
+fn picture(state: &Path) -> Option<(Vec<u8>, &'static str)> {
+    let name = file_name(state);
+    if name.ends_with(".p2s") {
+        let mut zip = zip::ZipArchive::new(fs::File::open(state).ok()?).ok()?;
+        let entry = zip.by_name("Screenshot.png").ok()?;
+        let mut png = Vec::new();
+        entry.take(MOST_PICTURE).read_to_end(&mut png).ok()?;
+        return Some((png, "png"));
+    }
+    if name.ends_with(".ppst") {
+        return fs::read(state.with_extension("jpg")).ok().map(|jpg| (jpg, "jpg"));
+    }
+    fs::read(thumbnail(state)).ok().map(|png| (png, "png"))
 }
 
 /// What marks a state this app uploaded — and its name before the rename, still recognised.
@@ -318,7 +342,7 @@ impl Run<'_> {
         history: &[&SaveAsset],
     ) {
         // RetroArch writes the thumbnail beside whichever file it saved: `.state.png`, `.state.auto.png`.
-        let shot = slot.live.as_ref().and_then(|live| fs::read(thumbnail(live)).ok());
+        let shot = slot.live.as_ref().and_then(|live| picture(live));
         let created = match self.client.upload_state(self.connection, rom_id, emulator, &slot.upload_as, bytes, shot).await {
             Ok(created) => created,
             Err(e) => return self.report.failed.push(format!("{name}: {}", describe(&e))),
@@ -390,6 +414,10 @@ impl Run<'_> {
     /// The state's thumbnail from RomM, beside the slot file, where RetroArch's menu shows it. A
     /// thumbnail is not progress: one that fails is skipped without a word.
     async fn pull_thumbnail(&mut self, key: &Path, remote: &SaveAsset) {
+        // A standalone emulator reads no `<state>.png`: there it would only be a stray file.
+        if !file_name(key).contains(".state") {
+            return;
+        }
         let Some(path) = remote.screenshot.as_ref().and_then(|s| s.download_path.as_deref()).filter(|p| !p.trim().is_empty()) else {
             return;
         };
@@ -710,5 +738,42 @@ mod tests {
         assert_eq!(rolling_name("Chrono", t), "Chrono [2026-07-01 10-00-00-123].deckhand.state");
         assert!(is_own(&rolling_name("x", t)) && is_state(&rolling_name("x", t)));
         assert!(!is_state("Game.p2s"));
+    }
+
+    #[test]
+    fn a_state_goes_up_with_the_picture_its_emulator_took() {
+        let dir = std::env::temp_dir().join(format!("deckhand-state-pictures-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // PCSX2's, inside the state.
+        let p2s = dir.join("SLUS-20946 (399A49CA).01.p2s");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&p2s).unwrap());
+        let stored = zip::write::SimpleFileOptions::default();
+        zip.start_file("eeMemory.bin", stored).unwrap();
+        std::io::Write::write_all(&mut zip, b"memory").unwrap();
+        zip.start_file("Screenshot.png", stored).unwrap();
+        std::io::Write::write_all(&mut zip, b"pcsx2 png").unwrap();
+        zip.finish().unwrap();
+        assert_eq!(picture(&p2s), Some((b"pcsx2 png".to_vec(), "png")));
+
+        // PPSSPP's, beside it under the same stem.
+        let ppst = dir.join("ULUS10538_2.00_0.ppst");
+        fs::write(&ppst, b"state").unwrap();
+        fs::write(dir.join("ULUS10538_2.00_0.jpg"), b"ppsspp jpg").unwrap();
+        assert_eq!(picture(&ppst), Some((b"ppsspp jpg".to_vec(), "jpg")));
+
+        // RetroArch's, beside it with `.png` appended.
+        let state = dir.join("Chrono Trigger (USA).state1");
+        fs::write(&state, b"state").unwrap();
+        assert_eq!(picture(&state), None, "no thumbnail, no picture");
+        fs::write(dir.join("Chrono Trigger (USA).state1.png"), b"retroarch png").unwrap();
+        assert_eq!(picture(&state), Some((b"retroarch png".to_vec(), "png")));
+
+        // A state that is no zip, or holds no picture, goes up without one.
+        let bare = dir.join("SLUS-20946 (399A49CA).02.p2s");
+        fs::write(&bare, b"not a zip").unwrap();
+        assert_eq!(picture(&bare), None);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
