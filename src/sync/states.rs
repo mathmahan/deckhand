@@ -28,7 +28,8 @@
 //! player can wind as far as they like, so a state they saved there themselves is theirs and is
 //! never traded for a copy of something RomM holds. Thumbnails travel both ways: RetroArch's
 //! `<state>.png` goes up as the state's screenshot, and RomM's comes down beside the slot. A
-//! standalone emulator's state sends the picture it took too ([`picture`]), and takes none back.
+//! standalone emulator's state sends the picture it took too ([`picture`]), and PPSSPP's takes
+//! RomM's back as its `.jpg` ([`picture_beside`]).
 
 use std::fs;
 use std::io::Read;
@@ -133,6 +134,21 @@ fn thumbnail(state: &Path) -> PathBuf {
     let mut name = state.file_name().unwrap_or_default().to_os_string();
     name.push(".png");
     state.with_file_name(name)
+}
+
+/// Where a pulled state's picture goes for its emulator to show: RetroArch's [`thumbnail`] beside a
+/// `.state`, and PPSSPP's `<stem>.jpg` beside a `.ppst`. PPSSPP tells a PNG from a JPEG by its
+/// content, so RomM's picture is written as it comes, whichever it is. None for an emulator that
+/// reads no picture beside its state: there it would only be a stray file.
+fn picture_beside(state: &Path) -> Option<PathBuf> {
+    let name = file_name(state);
+    if name.contains(".state") {
+        Some(thumbnail(state))
+    } else if name.ends_with(".ppst") {
+        Some(state.with_extension("jpg"))
+    } else {
+        None
+    }
 }
 
 /// The biggest picture read out of a state: PCSX2's is a few hundred KB.
@@ -470,22 +486,22 @@ impl Run<'_> {
     /// The state's thumbnail from RomM, beside the slot file, where RetroArch's menu shows it. A
     /// thumbnail is not progress: one that fails is skipped without a word.
     async fn pull_thumbnail(&mut self, key: &Path, remote: &SaveAsset) {
-        // A standalone emulator reads no `<state>.png`: there it would only be a stray file.
-        if !file_name(key).contains(".state") {
-            return;
-        }
+        let Some(shot) = picture_beside(key) else { return };
         let Some(path) = remote.screenshot.as_ref().and_then(|s| s.download_path.as_deref()).filter(|p| !p.trim().is_empty()) else {
+            // PPSSPP would go on showing the replaced state's picture over this one.
+            if file_name(key).ends_with(".ppst") && fs::remove_file(&shot).is_ok() {
+                self.report.written.push(shot);
+            }
             return;
         };
         let host = self.connection.host.trim_end_matches('/');
         let url = if path.starts_with("http") { path.to_string() } else { format!("{host}/{}", path.trim_start_matches('/')) };
-        if let Ok(bytes) = self.client.fetch_asset(self.connection, &url).await {
-            let shot = thumbnail(key);
-            if write_atomic(&shot, &bytes).is_ok() {
-                // The watcher sees the state folder, and `<state>.png` holds `.state` in its name:
-                // left unsaid, a thumbnail this sync fetched would read back as a state to sync.
-                self.report.written.push(shot);
-            }
+        if let Ok(bytes) = self.client.fetch_asset(self.connection, &url).await
+            && write_atomic(&shot, &bytes).is_ok()
+        {
+            // The watcher sees the state folder, and `<state>.png` holds `.state` in its name:
+            // left unsaid, a thumbnail this sync fetched would read back as a state to sync.
+            self.report.written.push(shot);
         }
     }
 
@@ -794,6 +810,59 @@ mod tests {
         assert_eq!(rolling_name("Chrono", t), "Chrono [2026-07-01 10-00-00-123].deckhand.state");
         assert!(is_own(&rolling_name("x", t)) && is_state(&rolling_name("x", t)));
         assert!(!is_state("Game.p2s"));
+    }
+
+    #[tokio::test]
+    async fn a_pulled_ppsspp_state_brings_its_picture_where_ppsspp_shows_it() {
+        let dir = std::env::temp_dir().join(format!("deckhand-ppsspp-pull-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let png = b"\x89PNG a picture".to_vec();
+        let host = stub_server::start_bytes(vec![
+            ("GET /api/raw/assets/states/7.ppst", 200, b"romm's state".to_vec()),
+            ("GET /api/screenshots/5/content", 200, png.clone()),
+        ])
+        .await;
+        let conn = Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None };
+        let client = RommClient::new().unwrap();
+        let remote = |screenshot: serde_json::Value| -> SaveAsset {
+            serde_json::from_value(serde_json::json!({
+                "id": 7, "rom_id": 1, "file_name": "ULUS99999_1.00_0.ppst", "emulator": "ppsspp",
+                "updated_at": "2026-07-01T10:00:00Z", "download_path": "/api/raw/assets/states/7.ppst",
+                "screenshot": screenshot,
+            }))
+            .unwrap()
+        };
+        let state = dir.join("ULUS99999_1.00_0.ppst");
+        let jpg = dir.join("ULUS99999_1.00_0.jpg");
+
+        let with = remote(serde_json::json!({ "download_path": "/api/screenshots/5/content" }));
+        let mut run = Run::with_index(&client, &conn, &dir.join("store"), dir.clone(), "state-index.json");
+        run.state_file(state.clone(), Some(&with), 1, "ppsspp").await;
+        assert_eq!(run.report.pulled.len(), 1, "{:?}", run.report);
+        assert_eq!(fs::read(&state).unwrap(), b"romm's state");
+        assert_eq!(fs::read(&jpg).unwrap(), png, "PPSSPP's name, RomM's picture as it came");
+        assert!(!dir.join("ULUS99999_1.00_0.ppst.png").exists(), "and no stray one");
+
+        // A state with no picture on RomM does not keep the one it replaced.
+        fs::remove_file(&state).unwrap();
+        let without = remote(serde_json::Value::Null);
+        let mut run = Run::with_index(&client, &conn, &dir.join("store2"), dir.clone(), "state-index.json");
+        run.state_file(state.clone(), Some(&without), 1, "ppsspp").await;
+        assert_eq!(run.report.pulled.len(), 1, "{:?}", run.report);
+        assert!(!jpg.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pulled_states_picture_goes_where_its_emulator_reads_one() {
+        let dir = Path::new("/states");
+        assert_eq!(picture_beside(&dir.join("Game.state")), Some(dir.join("Game.state.png")));
+        assert_eq!(picture_beside(&dir.join("Game.state3")), Some(dir.join("Game.state3.png")));
+        assert_eq!(picture_beside(&dir.join("ULUS99999_1.00_0.ppst")), Some(dir.join("ULUS99999_1.00_0.jpg")));
+        assert_eq!(picture_beside(&dir.join("SLUS-99999 (0000ABCD).01.p2s")), None, "PCSX2's is inside the state");
+        assert_eq!(picture_beside(&dir.join("SCUS-99999_1.sav")), None, "and DuckStation's");
+        assert_eq!(picture_beside(&dir.join("GALE01.s01")), None, "Dolphin reads none");
     }
 
     /// A DuckStation state of `version` whose picture is `width` by `height`, stored as `stored`
