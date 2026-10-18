@@ -1,4 +1,5 @@
-# Every push to a branch, and every pull request: the tests, then clippy.
+# Every pull request, and every push to main: the tests, then clippy. A feature branch is tested
+# through its pull request alone; testing its pushes too ran every commit twice.
 #
 # The job runs in Debian bookworm, as the release builds do. Its image is a Node one because it
 # comes with git, which actions/checkout needs to fetch the submodules; Rust is installed on top.
@@ -9,7 +10,7 @@ name: test
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 jobs:
