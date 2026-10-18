@@ -139,11 +139,14 @@ fn thumbnail(state: &Path) -> PathBuf {
 const MOST_PICTURE: u64 = 16 << 20;
 
 /// The picture an emulator took with `state`, and its extension: PCSX2's `Screenshot.png` inside the
-/// `.p2s`, which is a zip, PPSSPP's `.jpg` beside the `.ppst`, and otherwise RetroArch's
-/// [`thumbnail`]. Sent with every upload: without one RomM keeps the slot's old picture, and a state
-/// that synced looks as if it had not.
+/// `.p2s`, which is a zip, PPSSPP's `.jpg` beside the `.ppst`, DuckStation's in the `.sav`'s own
+/// header ([`duckstation_picture`]), and otherwise RetroArch's [`thumbnail`]. Sent with every upload:
+/// without one RomM keeps the slot's old picture, and a state that synced looks as if it had not.
 fn picture(state: &Path) -> Option<(Vec<u8>, &'static str)> {
     let name = file_name(state);
+    if name.ends_with(".sav") {
+        return duckstation_picture(&fs::read(state).ok()?).map(|png| (png, "png"));
+    }
     if name.ends_with(".p2s") {
         let mut zip = zip::ZipArchive::new(fs::File::open(state).ok()?).ok()?;
         let entry = zip.by_name("Screenshot.png").ok()?;
@@ -155,6 +158,59 @@ fn picture(state: &Path) -> Option<(Vec<u8>, &'static str)> {
         return fs::read(state.with_extension("jpg")).ok().map(|jpg| (jpg, "jpg"));
     }
     fs::read(thumbnail(state)).ok().map(|png| (png, "png"))
+}
+
+/// `DUCC`, which a DuckStation state starts with.
+const DUCKSTATION_MAGIC: u32 = 0x4343_5544;
+
+/// The first version whose header says how its picture is compressed. Before it, the picture is
+/// stored raw, and the field is unused.
+const DUCKSTATION_COMPRESSED_PICTURE: u32 = 69;
+
+/// DuckStation's picture in `state`, a PNG. DuckStation stores it as raw RGBA pixels after its header
+/// (`SAVE_STATE_HEADER` in its `save_state_version.h`): little-endian `u32`s for its magic and
+/// version, then the title (128 bytes) and serial (32), then the media path's length, offset and
+/// subimage, then the picture's compression, width, height, stored size and offset. Compressed with
+/// zstd by default, or with zlib. A state compressed with XZ, or anything unexpected, gives none.
+fn duckstation_picture(state: &[u8]) -> Option<Vec<u8>> {
+    let word = |at: usize| state.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    // The fields after the title and serial.
+    let field = |n: usize| word(8 + 128 + 32 + 4 * n);
+    if word(0)? != DUCKSTATION_MAGIC {
+        return None;
+    }
+    let (width, height) = (field(4)?, field(5)?);
+    if width == 0 || height == 0 || width >= 32768 || height >= 32768 {
+        return None;
+    }
+    let raw = (width as usize).checked_mul(height as usize)?.checked_mul(4)?;
+    if raw as u64 > MOST_PICTURE * 4 {
+        return None;
+    }
+    let (compression, stored) =
+        if word(4)? >= DUCKSTATION_COMPRESSED_PICTURE { (field(3)?, field(6)? as usize) } else { (0, raw) };
+    let offset = field(7)? as usize;
+    let stored = state.get(offset..offset.checked_add(stored)?)?;
+    let mut pixels = Vec::with_capacity(raw);
+    let limit = raw as u64 + 1;
+    match compression {
+        0 => pixels.extend_from_slice(stored),
+        1 => {
+            flate2::read::ZlibDecoder::new(stored).take(limit).read_to_end(&mut pixels).ok()?;
+        }
+        2 => {
+            ruzstd::decoding::StreamingDecoder::new(stored).ok()?.take(limit).read_to_end(&mut pixels).ok()?;
+        }
+        _ => return None,
+    }
+    if pixels.len() != raw {
+        return None;
+    }
+    // Its alpha is not meant to be seen through.
+    let rgb = image::DynamicImage::ImageRgba8(image::RgbaImage::from_raw(width, height, pixels)?).into_rgb8();
+    let mut png = std::io::Cursor::new(Vec::new());
+    rgb.write_to(&mut png, image::ImageFormat::Png).ok()?;
+    Some(png.into_inner())
 }
 
 /// What marks a state this app uploaded — and its name before the rename, still recognised.
@@ -740,6 +796,23 @@ mod tests {
         assert!(!is_state("Game.p2s"));
     }
 
+    /// A DuckStation state of `version` whose picture is `width` by `height`, stored as `stored`
+    /// under `compression`, followed by a little state data.
+    fn duckstation_state(version: u32, compression: u32, width: u32, height: u32, stored: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(DUCKSTATION_MAGIC.to_le_bytes());
+        b.extend(version.to_le_bytes());
+        b.extend([0u8; 128 + 32]);
+        let header = b.len() + 12 * 4;
+        let data = header + stored.len();
+        for field in [0, 0, 0, compression, width, height, stored.len() as u32, header as u32, 0, 4, 4, data as u32] {
+            b.extend(field.to_le_bytes());
+        }
+        b.extend(stored);
+        b.extend(b"data");
+        b
+    }
+
     #[test]
     fn a_state_goes_up_with_the_picture_its_emulator_took() {
         let dir = std::env::temp_dir().join(format!("deckhand-state-pictures-{}", std::process::id()));
@@ -769,6 +842,30 @@ mod tests {
         assert_eq!(picture(&state), None, "no thumbnail, no picture");
         fs::write(dir.join("Chrono Trigger (USA).state1.png"), b"retroarch png").unwrap();
         assert_eq!(picture(&state), Some((b"retroarch png".to_vec(), "png")));
+
+        // DuckStation's, raw or compressed in its own header, as a PNG.
+        let pixels: Vec<u8> = (0..2 * 3).flat_map(|i| [i as u8 * 40, 200, 10, 0]).collect();
+        let deflated = {
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            std::io::Write::write_all(&mut z, &pixels).unwrap();
+            z.finish().unwrap()
+        };
+        let zstd = ruzstd::encoding::compress_to_vec(&pixels[..], ruzstd::encoding::CompressionLevel::Fastest);
+        for (version, compression, stored) in [(66, 7, &pixels), (88, 0, &pixels), (88, 1, &deflated), (88, 2, &zstd)] {
+            let sav = dir.join("SCUS-94423_1.sav");
+            fs::write(&sav, duckstation_state(version, compression, 2, 3, stored)).unwrap();
+            let (png, ext) = picture(&sav).unwrap_or_else(|| panic!("version {version}, compression {compression}"));
+            assert_eq!(ext, "png");
+            let shown = image::load_from_memory(&png).unwrap().into_rgba8();
+            assert_eq!((shown.width(), shown.height()), (2, 3));
+            assert_eq!(shown.get_pixel(1, 0).0, [40, 200, 10, 255], "opaque, whatever its alpha said");
+        }
+        let xz = dir.join("SCUS-94423_2.sav");
+        fs::write(&xz, duckstation_state(88, 3, 2, 3, &pixels)).unwrap();
+        assert_eq!(picture(&xz), None, "XZ is not read");
+        let short = duckstation_state(88, 0, 2, 3, &pixels);
+        assert_eq!(duckstation_picture(&short[..short.len() - b"data".len() - 1]), None, "a cut-off picture");
+        assert_eq!(duckstation_picture(&duckstation_state(88, 0, 3, 3, &pixels)), None, "fewer pixels than its size");
 
         // A state that is no zip, or holds no picture, goes up without one.
         let bare = dir.join("SLUS-20946 (399A49CA).02.p2s");

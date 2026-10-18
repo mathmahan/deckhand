@@ -40,6 +40,10 @@ gilrs = "0.11"
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma"] }
 # A downloaded rom in a .7z is unpacked too. Pure Rust; reading only.
 sevenz-rust2 = { version = "0.23", default-features = false, features = ["bzip2", "ppmd"] }
+# DuckStation's state pictures, stored raw in its own header, zstd-compressed by default and
+# zlib-compressed by choice. Pure Rust, as above.
+ruzstd = "0.9"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 
 dirs = "6"
 
