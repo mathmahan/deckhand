@@ -228,25 +228,24 @@ impl Launcher {
         }
     }
 
-    /// The argv that plays `rom` as `system` booting straight into RetroArch's state slot 0 — the
-    /// newest state, as save sync lays them out. None when what runs it is not RetroArch, which has
-    /// no such switch.
+    /// The argv that plays `rom` as `system` booting straight into RetroArch's state slot `slot`.
+    /// None when what runs it is not RetroArch, which has no such switch.
     ///
     /// RetroDECK passes nothing on to the emulator, but takes the command itself with `-e`, filling
     /// in its placeholders as it does for its own choice: so the command it would choose, read from
-    /// the same tables, goes with `--entryslot 0` on the end.
-    pub fn resume_command(&self, system: &str, rom: &Path) -> Option<Vec<String>> {
+    /// the same tables, goes with `--entryslot <slot>` on the end.
+    pub fn resume_command(&self, system: &str, rom: &Path, slot: u32) -> Option<Vec<String>> {
         match self {
             Launcher::RetroDeck(rd) => {
                 let text = rd.command_text(system, rom).filter(|t| t.contains("%EMULATOR_RETROARCH%"))?;
                 let rom = rom.to_string_lossy().into_owned();
-                Some(["flatpak", "run", RETRODECK, "-e", &format!("{text} --entryslot 0"), "-s", system, &rom].map(String::from).to_vec())
+                Some(["flatpak", "run", RETRODECK, "-e", &format!("{text} --entryslot {slot}"), "-s", system, &rom].map(String::from).to_vec())
             }
             Launcher::Custom(_) => {
                 // RetroArch, by a core or not — nothing else boots into a slot.
                 self.emulator(system, rom).syncs()?;
                 let mut command = self.command(system, rom);
-                command.extend(["--entryslot".to_string(), "0".to_string()]);
+                command.extend(["--entryslot".to_string(), slot.to_string()]);
                 Some(command)
             }
         }
@@ -808,9 +807,14 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: 
     // as it closed. Before this one's marker can take the place of the game's own.
     finish_left(&ctx).await;
     notes.extend(ready(&ctx, &plan).await);
-    // Into the newest state, when asked to and there is one here — the save sync just laid it into
-    // slot 0. Only when the file is there: RetroArch refuses to start at all over a missing one.
-    let resumed = resume.then(|| newest_state(&ctx, &plan)).flatten().and_then(|_| launcher.resume_command(&plan.system, &plan.rom));
+    // Into the newest state, when asked to and there is one here — the save sync has just brought
+    // down any newer from elsewhere. Only into a file that is there: RetroArch refuses to start at
+    // all over a missing one.
+    let resumed = resume.then(|| newest_state(&ctx, &plan)).flatten().and_then(|from| match from {
+        Resume::Slot(slot) => launcher.resume_command(&plan.system, &plan.rom, slot),
+        // RetroArch loads it by itself, and would not with a slot named.
+        Resume::Auto => Some(launcher.command(&plan.system, &plan.rom)),
+    });
     if resumed.is_some() {
         notes.push("resumed from the newest save state".into());
     }
@@ -1002,14 +1006,29 @@ async fn while_playing<T>(ctx: &Context, rom_id: i64, held: Option<&crate::playi
     out
 }
 
-/// The game's newest save state on this device — slot 0, where save sync lays the newest — if
-/// RetroArch runs it and the file is there.
-fn newest_state(ctx: &Context, plan: &Plan) -> Option<PathBuf> {
+/// Where a resumed game starts: in RetroArch's state slot N, or in the auto slot's state, which
+/// RetroArch loads by itself on start when "load state on start" is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    Slot(u32),
+    Auto,
+}
+
+/// Where the game's newest save state on this device is, if RetroArch runs it and has one to start
+/// in: the newest of its slots RetroArch can be started in — any numbered one, and the auto slot
+/// only when RetroArch loads that by itself.
+fn newest_state(ctx: &Context, plan: &Plan) -> Option<Resume> {
     let core = plan.emulator.syncs()?;
-    let install = sync::retroarch::locate(ctx.retroarch_config.as_deref()).ok()?;
-    let dir = install.for_game(&plan.rom, core).game_states_dir(&plan.rom, core).ok()?;
+    let install = sync::retroarch::locate(ctx.retroarch_config.as_deref()).ok()?.for_game(&plan.rom, core);
+    let dir = install.game_states_dir(&plan.rom, core).ok()?;
     let stem = plan.rom.file_stem()?.to_string_lossy().into_owned();
-    Some(dir.join(format!("{stem}.state"))).filter(|p| p.is_file())
+    let mut here = sync::states::on_disk(&dir, &stem);
+    here.sort_by_key(|(_, written)| std::cmp::Reverse(*written));
+    here.into_iter().find_map(|(slot, _)| match slot {
+        // `--entryslot` takes 0 to 999.
+        sync::states::Slot::Number(n) => (n <= 999).then_some(Resume::Slot(n)),
+        sync::states::Slot::Auto => install.loads_auto_state().then_some(Resume::Auto),
+    })
 }
 
 /// A session shorter than this is a game that crashed on boot or was closed from its menu, not play.
@@ -1313,7 +1332,7 @@ mod tests {
         let rd = Launcher::RetroDeck(tree.retrodeck());
         let rom = Path::new("/g/snes/Chrono.sfc");
         assert_eq!(
-            rd.resume_command("snes", rom).unwrap(),
+            rd.resume_command("snes", rom, 0).unwrap(),
             [
                 "flatpak",
                 "run",
@@ -1326,12 +1345,12 @@ mod tests {
             ],
             "the command RetroDECK would choose, as RetroDECK's -e takes one"
         );
-        assert_eq!(rd.resume_command("gc", Path::new("/g/gc/Game.rvz")), None, "Dolphin has no state slots to boot into");
+        assert_eq!(rd.resume_command("gc", Path::new("/g/gc/Game.rvz"), 0), None, "Dolphin has no state slots to boot into");
 
         let ra = Launcher::Custom(vec!["retroarch".into(), "-L".into(), "/c/snes9x_libretro.so".into()]);
-        assert_eq!(ra.resume_command("snes", rom).unwrap(), ["retroarch", "-L", "/c/snes9x_libretro.so", "/g/snes/Chrono.sfc", "--entryslot", "0"]);
+        assert_eq!(ra.resume_command("snes", rom, 7).unwrap(), ["retroarch", "-L", "/c/snes9x_libretro.so", "/g/snes/Chrono.sfc", "--entryslot", "7"]);
         let other = Launcher::Custom(vec!["dolphin-emu".into(), "-b".into()]);
-        assert_eq!(other.resume_command("gc", rom), None);
+        assert_eq!(other.resume_command("gc", rom, 0), None);
     }
 
     #[test]

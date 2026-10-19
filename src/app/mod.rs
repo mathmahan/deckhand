@@ -248,6 +248,9 @@ pub enum Message {
     /// Putting an older version of a save back went — see [`crate::sync::restore`]. Keyed by the
     /// game's tile, whose Saves page reads it again.
     SaveRestored(i64, Result<crate::sync::Report, String>),
+    /// A state from RomM went into one of a game's slots, or why not — see [`crate::sync::put_state`].
+    /// Keyed by the game's tile, whose Saves page reads RomM again.
+    StatePut(i64, Result<(crate::sync::states::Slot, crate::sync::Report), String>),
     /// Games went into Steam's library (`add`) or came out, each with its shortcut's app id, and
     /// what art any went in without — or why not. See [`crate::steam`].
     SteamChanged { add: bool, games: Vec<(i64, u32)>, restarted: bool, result: Result<crate::steam::Gaps, String> },
@@ -1362,6 +1365,9 @@ enum Then {
     SystemEmulator { system: String, choices: Vec<EmulatorChoice> },
     /// Put this older version of a save back: the first row says yes.
     Restore { tile: i64, version: Box<crate::romm::models::SaveAsset> },
+    /// Put this state from RomM into a slot: the next free one, slot 0, or the auto slot, row for
+    /// row; the last row leaves it.
+    PutState { tile: i64, state: Box<crate::romm::models::SaveAsset> },
     /// Close Steam, put these games in its library (or take them out), and open it again: the first
     /// row says yes.
     Steam { games: Vec<i64>, add: bool },

@@ -9,9 +9,10 @@
 //! What this one keeps and decides is written from two sources only: RomM's published API description
 //! (`/openapi.json`, 5.4.0), for the requests and the shape of every answer, and what a real RomM 5.4
 //! was seen to answer in the cases the description leaves open — when a device's save counts as
-//! changed, when a push is refused, what happens to an open session. [`contract`] at the bottom of
-//! this file replays those observations against this server on every test run, and against a real
-//! RomM when one is named, so the two cannot drift apart unnoticed.
+//! changed, when a push is refused, what happens to an open session, what a state sent up under a
+//! name the game has already does. [`contract`] at the bottom of this file replays those observations
+//! against this server on every test run, and against a real RomM when one is named, so the two
+//! cannot drift apart unnoticed.
 //!
 //! Its clock is its own: it moves a second with every write, and otherwise only when a test moves
 //! it, so a test can place a device's file times exactly against the server's. Times are kept to the
@@ -49,6 +50,21 @@ pub struct Version {
     pub origin: Option<String>,
 }
 
+/// One save state. A game has one per name: a state sent up under a name the game has already is
+/// that state, replaced where it is.
+#[derive(Debug, Clone)]
+pub struct State {
+    pub id: i64,
+    pub rom_id: i64,
+    pub file_name: String,
+    /// The emulator, or core, the last upload under its name said made it.
+    pub emulator: Option<String>,
+    pub updated_at: SystemTime,
+    pub bytes: Vec<u8>,
+    /// Its screenshot: the screenshot's own id, and the picture.
+    pub picture: Option<(i64, Vec<u8>)>,
+}
+
 /// What the server remembers of one device and one version.
 #[derive(Debug, Clone, Default)]
 struct Holding {
@@ -82,6 +98,7 @@ pub struct Play {
 struct Server {
     clock: SystemTime,
     versions: Vec<Version>,
+    states: Vec<State>,
     holdings: HashMap<(String, i64), Holding>,
     /// Every device the server knows, and whether its sync is on.
     devices: HashMap<String, bool>,
@@ -104,6 +121,7 @@ impl Default for Server {
         Server {
             clock: SystemTime::UNIX_EPOCH + START,
             versions: Vec::new(),
+            states: Vec::new(),
             holdings: HashMap::new(),
             devices: HashMap::new(),
             sessions: BTreeMap::new(),
@@ -242,6 +260,26 @@ impl FakeRomm {
         let server = self.lock();
         let Some(version) = server.versions.iter().find(|v| v.id == save_id) else { return false };
         server.holding(device, save_id).had.is_some_and(|had| had >= version.updated_at)
+    }
+
+    /// A state sent up by some other client — another device, the web player — under `name`, which
+    /// replaces the game's state of that name as an upload from this app's would. Answers its id.
+    pub fn state_from(&self, rom_id: i64, name: &str, emulator: &str, bytes: &[u8], picture: Option<&[u8]>) -> i64 {
+        let query = HashMap::from([("rom_id".to_string(), rom_id.to_string()), ("emulator".to_string(), emulator.to_string())]);
+        let (_, answer) = self.lock().store_state(&query, name, bytes.to_vec(), picture.map(<[u8]>::to_vec));
+        answer["id"].as_i64().expect("a stored state")
+    }
+
+    /// A game's states, oldest first.
+    pub fn states(&self, rom_id: i64) -> Vec<State> {
+        let mut states: Vec<State> = self.lock().states.iter().filter(|s| s.rom_id == rom_id).cloned().collect();
+        states.sort_by_key(|s| (s.updated_at, s.id));
+        states
+    }
+
+    /// A state deleted on the server, as from RomM's web page.
+    pub fn delete_state(&self, id: i64) {
+        self.lock().states.retain(|s| s.id != id);
     }
 
     /// The actions negotiations answered, in order.
@@ -480,6 +518,58 @@ impl Server {
         }
     }
 
+    /// `POST /api/states`: a state kept under its name. A name the game has already is that state,
+    /// replaced where it is — same id, new bytes, a new time, and the emulator the upload names,
+    /// whichever that is; a picture sent with it replaces the state's, and one not sent leaves it.
+    fn store_state(&mut self, query: &HashMap<String, String>, name: &str, bytes: Vec<u8>, picture: Option<Vec<u8>>) -> (u16, Value) {
+        let Some(rom_id) = query.get("rom_id").and_then(|r| r.parse::<i64>().ok()) else {
+            return (422, json!({ "detail": "rom_id is needed" }));
+        };
+        let at = self.tick();
+        let existing = self.states.iter().position(|s| s.rom_id == rom_id && s.file_name == name);
+        let kept_picture = existing.and_then(|i| self.states[i].picture.as_ref().map(|(id, _)| *id));
+        let picture = picture.map(|p| (kept_picture.unwrap_or_else(|| self.next_id()), p));
+        let index = match existing {
+            Some(index) => index,
+            None => {
+                let id = self.next_id();
+                self.states.push(State { id, rom_id, file_name: name.to_string(), emulator: None, updated_at: at, bytes: Vec::new(), picture: None });
+                self.states.len() - 1
+            }
+        };
+        let state = &mut self.states[index];
+        state.emulator = query.get("emulator").cloned();
+        state.updated_at = at;
+        state.bytes = bytes;
+        if picture.is_some() {
+            state.picture = picture;
+        }
+        let mut answer = Self::state_json(state);
+        // A new one is answered before the database has rounded its time off, as a save push is; one
+        // replaced, with the time the database keeps.
+        if existing.is_none() {
+            answer["updated_at"] = json!(written(at + Duration::from_micros(516_854)));
+        }
+        (200, answer)
+    }
+
+    fn state_json(state: &State) -> Value {
+        json!({
+            "id": state.id,
+            "rom_id": state.rom_id,
+            "file_name": state.file_name,
+            "emulator": state.emulator,
+            "updated_at": written(state.updated_at),
+            "file_size_bytes": state.bytes.len(),
+            "download_path": format!("/api/states/{}/content", state.id),
+            "screenshot": state.picture.as_ref().map(|(id, _)| json!({
+                "id": id,
+                "file_name": format!("{}.png", state.file_name),
+                "download_path": format!("/api/screenshots/{id}/content"),
+            })),
+        })
+    }
+
     /// `PUT /api/saves/{id}`: new bytes for a version where it is, at a new time.
     fn replace(&mut self, save_id: i64, bytes: Vec<u8>) -> Option<Value> {
         let at = self.tick();
@@ -603,7 +693,32 @@ impl Server {
                     }
                 }
             }
-            ("GET", ["api", "states"]) => (200, json!([])),
+            ("GET", ["api", "states"]) => {
+                let rom_id: Option<i64> = query.get("rom_id").and_then(|r| r.parse().ok());
+                (200, Value::Array(self.states.iter().filter(|s| rom_id.is_none_or(|r| s.rom_id == r)).map(Self::state_json).collect()))
+            }
+            ("POST", ["api", "states"]) => match file_part(headers, &body, "stateFile") {
+                Some((name, bytes)) => {
+                    let picture = file_part(headers, &body, "screenshotFile").map(|(_, picture)| picture);
+                    self.store_state(query, &name, bytes, picture)
+                }
+                None => (422, json!({ "detail": "a stateFile part is needed" })),
+            },
+            ("GET", ["api", "states", state, "content"]) => match self.states.iter().find(|s| s.id == id(state)) {
+                Some(state) => return (200, Value::Null, Some(state.bytes.clone())),
+                None => (404, json!({ "detail": "Not Found" })),
+            },
+            ("GET", ["api", "screenshots", shot, "content"]) => {
+                match self.states.iter().find_map(|s| s.picture.as_ref().filter(|(i, _)| *i == id(shot))) {
+                    Some((_, picture)) => return (200, Value::Null, Some(picture.clone())),
+                    None => (404, json!({ "detail": "Not Found" })),
+                }
+            }
+            ("POST", ["api", "states", "delete"]) => {
+                let ids: Vec<i64> = json_body()["states"].as_array().map(|ids| ids.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+                self.states.retain(|s| !ids.contains(&s.id));
+                (200, json!(ids))
+            }
             ("GET", ["api", "devices"]) => (200, Value::Array(self.devices.keys().map(|id| json!({ "id": id })).collect())),
             ("POST", ["api", "devices"]) => {
                 let id = format!("device-{}", self.next_id());
@@ -728,6 +843,11 @@ async fn request(socket: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
 
 /// The file sent as a multipart body's `saveFile` part: its name and bytes.
 fn save_file(headers: &str, body: &[u8]) -> Option<(String, Vec<u8>)> {
+    file_part(headers, body, "saveFile")
+}
+
+/// The file sent as a multipart body's part named `field`: its name and bytes.
+fn file_part(headers: &str, body: &[u8], field: &str) -> Option<(String, Vec<u8>)> {
     let content_type = headers.lines().filter_map(|l| l.split_once(':')).find(|(name, _)| name.trim().eq_ignore_ascii_case("content-type"))?.1;
     let boundary = content_type.split(';').find_map(|p| p.trim().strip_prefix("boundary="))?.trim_matches('"');
     let separator = format!("--{boundary}");
@@ -738,7 +858,7 @@ fn save_file(headers: &str, body: &[u8]) -> Option<(String, Vec<u8>)> {
         let head = String::from_utf8_lossy(&rest[..head_end]);
         let content = &rest[head_end + 4..];
         let end = position(content, separator.as_bytes()).map_or(content.len(), |e| e.saturating_sub(2));
-        if head.contains("name=\"saveFile\"") {
+        if head.contains(&format!("name=\"{field}\"")) {
             let name = head.split("filename=\"").nth(1)?.split('"').next()?.to_string();
             return Some((name, content[..end].to_vec()));
         }
@@ -781,7 +901,8 @@ fn query_pairs(query: &str) -> HashMap<String, String> {
 }
 
 /// The observations this server is built on, replayed: one conversation of throwaway devices with a
-/// save in a slot of its own, whose every answer is checked against what a real RomM 5.4 gave.
+/// save in a slot of its own, and a save state under a name of its own, whose every answer is checked
+/// against what a real RomM 5.4 gave.
 ///
 /// It runs against this server on every test run. Against a real RomM it runs only when asked —
 ///
@@ -790,13 +911,16 @@ fn query_pairs(query: &str) -> HashMap<String, String> {
 /// ```
 ///
 /// — using the pairing in Deckhand's own settings, so the server's address is in no file here. It
-/// registers its own devices and keeps to a slot no client uses, so nothing it does meets a real save,
-/// and it removes its saves and devices when it is done. The sync sessions it opened stay in RomM's
+/// registers its own devices and keeps to a slot and a state name no client uses, so nothing it does
+/// meets a real save, and it removes its saves, its state and its devices when it is done. The sync sessions it opened stay in RomM's
 /// history, as any client's do.
 mod contract {
     use super::*;
 
     const SLOT: &str = "deckhand-contract-check";
+
+    /// The state the conversation sends up: a name no game's states have.
+    const STATE: &str = "deckhand-contract-check probe.state";
 
     /// A RomM to talk to, plain HTTP: what this checks is the server, not Deckhand's client.
     struct Api {
@@ -834,6 +958,31 @@ mod contract {
             let url = format!("{}/api/saves?rom_id={}&slot={SLOT}&emulator=probe&device_id={device}{more}", self.host, self.rom);
             let response = self.http.post(url).bearer_auth(&self.token).multipart(form).send().await.expect("the server to answer");
             (response.status().as_u16(), response.json().await.unwrap_or(Value::Null))
+        }
+
+        /// Send a state up under `name`, as `emulator`, with a picture or without.
+        async fn state(&self, name: &str, bytes: &[u8], emulator: &str, picture: Option<&[u8]>) -> (u16, Value) {
+            let mut form = reqwest::multipart::Form::new().part("stateFile", reqwest::multipart::Part::bytes(bytes.to_vec()).file_name(name.to_string()));
+            if let Some(picture) = picture {
+                let part = reqwest::multipart::Part::bytes(picture.to_vec()).file_name(format!("{name}.png")).mime_str("image/png").expect("a type");
+                form = form.part("screenshotFile", part);
+            }
+            let url = format!("{}/api/states?rom_id={}&emulator={emulator}", self.host, self.rom);
+            let response = self.http.post(url).bearer_auth(&self.token).multipart(form).send().await.expect("the server to answer");
+            (response.status().as_u16(), response.json().await.unwrap_or(Value::Null))
+        }
+
+        /// The bytes at a path the server gave — a state's, its picture's.
+        async fn bytes(&self, path: &str) -> Vec<u8> {
+            let url = format!("{}/{}", self.host, path.trim_start_matches('/'));
+            let response = self.http.get(url).bearer_auth(&self.token).send().await.expect("the server to answer");
+            response.bytes().await.map(|b| b.to_vec()).unwrap_or_default()
+        }
+
+        /// The game's states sent up under `name`.
+        async fn states_named(&self, name: &str) -> Vec<Value> {
+            let (_, states) = self.call(reqwest::Method::GET, &format!("/api/states?rom_id={}", self.rom), None).await;
+            states.as_array().into_iter().flatten().filter(|s| s["file_name"] == name).cloned().collect()
         }
 
         async fn replace(&self, save_id: i64, bytes: &[u8]) -> u16 {
@@ -879,6 +1028,9 @@ mod contract {
             let (_, saves) = self.call(reqwest::Method::GET, &format!("/api/saves?rom_id={}&slot={SLOT}", self.rom), None).await;
             for id in saves.as_array().into_iter().flatten().filter_map(|s| s["id"].as_i64()) {
                 self.call(reqwest::Method::POST, "/api/saves/delete", Some(json!({ "saves": [id] }))).await;
+            }
+            for id in self.states_named(STATE).await.iter().filter_map(|s| s["id"].as_i64()) {
+                self.call(reqwest::Method::POST, "/api/states/delete", Some(json!({ "states": [id] }))).await;
             }
             let devices = std::mem::take(&mut *self.devices.lock().unwrap());
             for device in devices {
@@ -933,6 +1085,10 @@ mod contract {
         "a session left open by a newer negotiation completes: 200",
         "A overwrites without having had v2: 200, a new version",
         "A pushes in a session, keeping one: 200, 1 done, 1 left",
+        "a state sent up: 200, a new state with its picture",
+        "the same name from another core: 200, the same state, its content, picture, core and time replaced",
+        "the same name without a picture: 200, the picture kept",
+        "the game's states of that name: 1",
     ];
 
     /// The conversation, as said: each step and what the server answered.
@@ -1028,6 +1184,49 @@ mod contract {
             left.as_array().map_or(0, Vec::len)
         ));
         close(session).await;
+
+        // Save states: one per name, replaced where it is by a second upload under it.
+        let (status, first) = api.state(STATE, b"state one", "probe-a", Some(b"\x89PNG one")).await;
+        let pictured = match first["screenshot"]["download_path"].as_str() {
+            Some(path) => api.bytes(path).await == b"\x89PNG one",
+            None => false,
+        };
+        said.push(format!("a state sent up: {status}, a new state{}", if pictured { " with its picture" } else { "" }));
+        api.pause().await;
+        let (status, second) = api.state(STATE, b"state two", "probe-b", Some(b"\x89PNG two")).await;
+        let mut replaced = Vec::new();
+        if second["id"] == first["id"] {
+            replaced.push("the same state");
+        }
+        if api.bytes(&format!("/api/states/{}/content", second["id"])).await == b"state two" {
+            replaced.push("its content");
+        }
+        if let Some(path) = second["screenshot"]["download_path"].as_str()
+            && api.bytes(path).await == b"\x89PNG two"
+        {
+            replaced.push("picture");
+        }
+        if second["emulator"] == "probe-b" {
+            replaced.push("core");
+        }
+        let time = |state: &Value| state["updated_at"].as_str().and_then(parse_timestamp);
+        if time(&second).zip(time(&first)).is_some_and(|(two, one)| two > one) {
+            replaced.push("time");
+        }
+        let replaced = match replaced.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last} replaced", rest.join(", ")),
+            Some((only, _)) => format!("{only} replaced"),
+            None => "nothing replaced".into(),
+        };
+        said.push(format!("the same name from another core: {status}, {replaced}"));
+        api.pause().await;
+        let (status, third) = api.state(STATE, b"state three", "probe-b", None).await;
+        let kept = match third["screenshot"]["download_path"].as_str() {
+            Some(path) => api.bytes(path).await == b"\x89PNG two",
+            None => false,
+        };
+        said.push(format!("the same name without a picture: {status}, the picture {}", if kept { "kept" } else { "gone" }));
+        said.push(format!("the game's states of that name: {}", api.states_named(STATE).await.len()));
         said
     }
 

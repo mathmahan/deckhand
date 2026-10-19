@@ -37,8 +37,8 @@ pub struct GameSaves {
     pub on_device: HashSet<i64>,
     /// The other devices holding each save's current version, by name, as RomM records them.
     pub elsewhere: HashMap<i64, Vec<String>>,
-    /// The RetroArch slot each state is laid into, by id — see [`slots`].
-    pub slots: HashMap<i64, u32>,
+    /// The RetroArch slot each state is this device's, by id — see [`states::layout`].
+    pub slots: HashMap<i64, states::Slot>,
     /// The core the game runs under here, by RetroArch's name for it, when that is known.
     pub core: Option<String>,
     /// The RetroArch states another core made, which this device's cannot load — see
@@ -84,7 +84,7 @@ pub async fn load(
             }
         }
     }
-    let slots = slots(&states, &core);
+    let slots = states::layout(&states, &core);
     let other_core = states.iter().filter(|s| is_retroarch_state(s) && !core.loads(s)).map(|s| s.id).collect();
     Ok(GameSaves { states, saves, on_device, elsewhere, slots, core: core.name().map(str::to_string), other_core })
 }
@@ -92,35 +92,6 @@ pub async fn load(
 /// A RetroArch state, as against another emulator's (a `.p2s`, a `.ppst`).
 fn is_retroarch_state(state: &SaveAsset) -> bool {
     state.file_name.to_lowercase().ends_with(".state")
-}
-
-/// Where each RetroArch state lands among RetroArch's slots — the layout the sync writes, so the
-/// page can say which slot to load: the player's own `.slotN` states in their slot, the newest of
-/// the rest in slot 0, and the history after it from [`states::FIRST_HISTORY`] up. `states` must be
-/// newest first. Another emulator's states (a `.p2s`, a `.ppst`) have no RetroArch slot, and nor do
-/// another core's, which `core` cannot load.
-pub fn slots(states: &[SaveAsset], core: &states::Core) -> HashMap<i64, u32> {
-    let mut out = HashMap::new();
-    let mut claimed = HashSet::new();
-    let mut rank = 0u32;
-    for state in states.iter().filter(|s| is_retroarch_state(s) && core.loads(s)) {
-        match states::slot_of(&state.file_name) {
-            // A slot saved twice: the newer owns it, the older is not anywhere on disk.
-            Some(slot) => {
-                if claimed.insert(slot) {
-                    out.insert(state.id, slot);
-                }
-            }
-            None => {
-                let slot = if rank == 0 { 0 } else { states::FIRST_HISTORY + rank - 1 };
-                if rank < states::HISTORY as u32 {
-                    out.insert(state.id, slot);
-                }
-                rank += 1;
-            }
-        }
-    }
-    out
 }
 
 /// The page's cursor: a tab, and a row per tab, remembered while switching between them.
@@ -174,46 +145,6 @@ mod tests {
 
     fn state(id: i64, name: &str) -> SaveAsset {
         serde_json::from_value(serde_json::json!({ "id": id, "file_name": name })).unwrap()
-    }
-
-    #[test]
-    fn states_land_in_the_slots_the_sync_lays_them_into() {
-        // Newest first, as the page holds them.
-        let states = vec![
-            state(9, "Game.slot2.deckhand.state"),
-            state(8, "Game [2026-07-03 10-00-00-000].deckhand.state"),
-            state(7, "Game.slot2.deckhand.state"),
-            state(6, "Game [2026-07-02 10-00-00-000].deckhand.state"),
-            state(5, "Game.state"),
-            state(4, "SLUS-20946 (2C6BE434).01.p2s"),
-        ];
-        let slots = slots(&states, &states::Core::default());
-        assert_eq!(slots.get(&9), Some(&2), "the player's slot");
-        assert_eq!(slots.get(&7), None, "superseded by a newer save of the same slot");
-        assert_eq!(slots.get(&8), Some(&0), "the newest of the rest is slot 0");
-        assert_eq!(slots.get(&6), Some(&states::FIRST_HISTORY));
-        assert_eq!(slots.get(&5), Some(&(states::FIRST_HISTORY + 1)));
-        assert_eq!(slots.get(&4), None, "not RetroArch's");
-    }
-
-    #[test]
-    fn another_cores_states_land_in_no_slot() {
-        let by = |id: i64, name: &str, core: &str| -> SaveAsset {
-            serde_json::from_value(serde_json::json!({ "id": id, "file_name": name, "emulator": core })).unwrap()
-        };
-        let states = vec![
-            by(9, "Game [2026-07-03 10-00-00-000].deckhand.state", "pcsx_rearmed"),
-            by(8, "Game.slot2.deckhand.state", "pcsx_rearmed"),
-            by(7, "Game [2026-07-02 10-00-00-000].deckhand.state", "swanstation"),
-        ];
-        let dir = std::env::temp_dir().join(format!("deckhand-game-saves-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("retroarch.cfg"), "").unwrap();
-        let install = crate::sync::retroarch::read(&dir.join("retroarch.cfg")).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        let slots = slots(&states, &states::Core::of(Some("swanstation"), &install));
-        assert_eq!(slots.get(&7), Some(&0), "this core's newest is slot 0");
-        assert_eq!((slots.get(&9), slots.get(&8)), (None, None), "{slots:?}");
     }
 
     #[test]

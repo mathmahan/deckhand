@@ -1,20 +1,27 @@
-//! RetroArch save states, kept in step with RomM for one game — the slot model the Kotlin app and
-//! DeckhandTV share, so all three read and write one history.
+//! RetroArch save states, kept one-to-one with RomM for one game: every slot RetroArch writes is a
+//! state on RomM, and a slot's state on RomM is what the slot holds.
 //!
-//! RetroArch keeps slot 0 in `<rom>.state` and slot N in `<rom>.stateN`. Two bands of that sync:
+//! RetroArch keeps slot 0 in `<rom>.state`, slot N in `<rom>.stateN`, and what "save state on close"
+//! writes in `<rom>.state.auto` — here a slot of its own, [`Slot::Auto`]. Each goes up under one name
+//! for good, which says the slot and the core that made it: `<rom>.slot3.snes9x.deckhand.state`. RomM
+//! keeps one state per name: an upload under a name the game has already replaces that state where
+//! it is — the same id, new bytes and time, and a new picture when one comes — whichever core sends
+//! it, which is why the core is in the name. So slot 3 is the same state on every device that runs
+//! the game under that core, and there are as many slots as RetroArch writes: one that numbers each
+//! new state one past the last (`savestate_auto_index`) has every one of them on RomM.
 //!
-//! - **Slot 0 is the game's current state**, two-way against the newest of RomM's *rolling* states.
-//!   RomM keeps no history of states and prunes none, so a push is a new state under a fresh
-//!   timestamped name, `<rom> [2026-07-01 10-00-00-000].deckhand.state`, and this app prunes its
-//!   own down to [`HISTORY`] afterwards. `.state.auto` — what "save state on close" writes — is the
-//!   same slot: whichever of the two is newer is the one that syncs, and a pull overwrites both.
-//! - **Slots 1 to [`SLOTS`] are the player's own**, each two-way against one fixed server state,
-//!   `<rom>.slotN.deckhand.state`, uploaded under that name every time. Never pruned, never part of
-//!   slot 0's history, so slot 2 is the same save on every device.
+//! What changed is decided the way saves decide it — content against the index — in an index of its
+//! own, `state-index.json`, keyed by the slot's path. RomM keeps no hash of a state, and a state
+//! replaced keeps its id, so RomM's side has moved when its time has: the index keeps the time of the
+//! version last agreed on too ([`Entry::synced_at`]). A conflict keeps the newer side, and whichever
+//! copy loses is kept in `save-backups/` first.
 //!
-//! What changed is decided the way saves decide it — by content against the index, see
-//! [`super::plan`] — in an index of its own, `state-index.json`, keyed by the slot's path. A
-//! conflict keeps the newer side, and a local state that loses is copied into `save-backups/` first.
+//! **Nothing is deleted on RomM.** That is the player's to do, on RomM's own page. A state deleted
+//! here stays on RomM, and one deleted on RomM stays here, and neither comes back by itself: a slot
+//! this device had and no longer has is not downloaded again until RomM's changes, and a state gone
+//! from RomM is not sent up again until the slot changes. A state on RomM that no slot here holds —
+//! the web player's, another app's, another build's of the core — is on the game's Saves page, which
+//! puts one into a slot ([`Target`]).
 //!
 //! **Only the core's own states take part.** A state is a core's memory, and RetroArch refuses one
 //! another core wrote, even for the same console — a game played under SwanStation here and PCSX
@@ -22,15 +29,17 @@
 //! core wrote a state is read from its `emulator` tag ([`Core::loads`]); one whose tag names no core
 //! is offered as it always was.
 //!
-//! Beyond the two-way bands, RomM's older rolling states are laid into slots [`FIRST_HISTORY`] and
-//! up, newest first and download-only, as the Kotlin app does — a state from a few sessions back is
-//! one menu away. Only into a slot this app last wrote, though: RetroArch's slot number is one the
-//! player can wind as far as they like, so a state they saved there themselves is theirs and is
-//! never traded for a copy of something RomM holds. Thumbnails travel both ways: RetroArch's
-//! `<state>.png` goes up as the state's screenshot, and RomM's comes down beside the slot. A
-//! standalone emulator's state sends the picture it took too ([`picture`]), and PPSSPP's takes
-//! RomM's back as its `.jpg` ([`picture_beside`]).
+//! Before this, slot 0 was a rolling history of this app's uploads, `<rom> [2026-07-01
+//! 10-00-00-000].deckhand.state`, and slots 1 to 4 were `<rom>.slotN.deckhand.state`, the same for
+//! every core. Those stay on RomM. Until a slot has a state under its own name, the old one stands in
+//! for it ([`stand_in`]), and a slot that holds one of the old history's states as it came down is
+//! not sent up again until it changes.
+//!
+//! Thumbnails travel both ways: RetroArch's `<state>.png` goes up as the state's screenshot, and
+//! RomM's comes down beside the slot. A standalone emulator's state sends the picture it took too
+//! ([`picture`]), and PPSSPP's takes RomM's back as its `.jpg` ([`picture_beside`]).
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -38,7 +47,7 @@ use std::time::SystemTime;
 
 use super::index::Entry;
 use super::retroarch::Install;
-use super::{Plan, Run, describe, file_name, md5_hex, names, plan, write_atomic};
+use super::{Run, describe, file_name, md5_hex, names, write_atomic};
 use crate::romm::models::SaveAsset;
 
 /// The core a game runs under on this device: what the states it makes are tagged with on RomM,
@@ -120,14 +129,102 @@ fn fold(tag: &str) -> String {
     }
 }
 
-/// The player's own slots, shared with DeckhandTV's slot model.
-pub const SLOTS: u32 = 4;
+/// One of RetroArch's save state slots for a game.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Slot {
+    /// Slot N: `<rom>.state` for 0, `<rom>.stateN` past it.
+    Number(u32),
+    /// `<rom>.state.auto`: what "save state on close" writes, and "load state on start" reads.
+    Auto,
+}
 
-/// How many of its own rolling states this app keeps on RomM for a game.
-pub const HISTORY: usize = 10;
+impl Slot {
+    /// The slot `name` is, of the game whose content stem is `stem` — `<stem>.state`, `<stem>.stateN`,
+    /// `<stem>.state.auto` — if it is one. Not a thumbnail beside one, nor a `.state0` or `.state07`,
+    /// which RetroArch never writes.
+    pub fn of_file(name: &str, stem: &str) -> Option<Slot> {
+        let rest = name.strip_prefix(stem)?.to_lowercase();
+        match rest.strip_prefix(".state")? {
+            "" => Some(Slot::Number(0)),
+            ".auto" => Some(Slot::Auto),
+            digits => digits.parse::<u32>().ok().filter(|n| *n > 0 && n.to_string() == digits).map(Slot::Number),
+        }
+    }
 
-/// The first slot the older rolling history is laid into, after the player's own.
-pub const FIRST_HISTORY: u32 = SLOTS + 1;
+    /// The file RetroArch keeps it in.
+    pub fn file(self, stem: &str) -> String {
+        match self {
+            Slot::Number(0) => format!("{stem}.state"),
+            Slot::Number(n) => format!("{stem}.state{n}"),
+            Slot::Auto => format!("{stem}.state.auto"),
+        }
+    }
+
+    /// The name it goes up to RomM under, made by the core tagged `core`: the same every time.
+    pub fn remote_name(self, stem: &str, core: &str) -> String {
+        match self {
+            Slot::Number(n) => format!("{stem}.slot{n}.{core}{OWN}"),
+            Slot::Auto => format!("{stem}.auto.{core}{OWN}"),
+        }
+    }
+
+    /// The slot a state's name on RomM says it is, and the core it says made it, when it is named
+    /// the way [`Slot::remote_name`] names one.
+    pub fn of_remote(name: &str) -> Option<(Slot, &str)> {
+        let rest = strip_suffix_ci(name, OWN)?;
+        let (rest, core) = rest.rsplit_once('.')?;
+        let (_, slot) = rest.rsplit_once('.')?;
+        // A core's tag is a library's id: letters, digits, `_` and `-`. Anything else in that place
+        // is a name of another shape — the old `<rom>.slot2.deckhand.state` among them.
+        let tag = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+        if core.is_empty() || !core.chars().all(tag) || numbered(core).is_some() {
+            return None;
+        }
+        let slot = if slot.eq_ignore_ascii_case("auto") { Slot::Auto } else { Slot::Number(numbered(slot)?) };
+        Some((slot, core))
+    }
+
+    /// How the Saves page names it.
+    pub fn label(self) -> String {
+        match self {
+            Slot::Number(n) => format!("Slot {n}"),
+            Slot::Auto => "Auto slot".into(),
+        }
+    }
+
+    /// How a sentence names it: `slot 3`, `the auto slot`.
+    pub fn in_words(self) -> String {
+        match self {
+            Slot::Number(n) => format!("slot {n}"),
+            Slot::Auto => "the auto slot".into(),
+        }
+    }
+
+    /// The slot as RetroArch's menu numbers it: its number, or `auto`.
+    pub fn number(self) -> String {
+        match self {
+            Slot::Number(n) => n.to_string(),
+            Slot::Auto => "auto".into(),
+        }
+    }
+}
+
+/// N from `slotN`, whatever its case.
+fn numbered(part: &str) -> Option<u32> {
+    let digits = part.get(..4).filter(|p| p.eq_ignore_ascii_case("slot")).and(part.get(4..))?;
+    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())).then(|| digits.parse().ok()).flatten()
+}
+
+/// Where the Saves page puts a state from RomM, on this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// The slot past every numbered one here and on RomM: one nothing is in, on either side.
+    Next,
+    /// Slot 0.
+    Zero,
+    /// The auto slot, which RetroArch loads by itself on start when "load state on start" is on.
+    Auto,
+}
 
 /// Where RetroArch keeps a state file's thumbnail: beside it, `.png` appended.
 fn thumbnail(state: &Path) -> PathBuf {
@@ -244,33 +341,58 @@ fn is_own(name: &str) -> bool {
     name.ends_with(OWN) || name.ends_with(LEGACY)
 }
 
-/// Whether `name` is a save state RetroArch keeps for the content `stem`: `<stem>.state` for slot 0,
-/// `<stem>.state.auto` for the one "save state on close" writes, `<stem>.stateN` for slot N.
+/// `name` without `suffix` on its end, whatever the case of either.
+fn strip_suffix_ci<'a>(name: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = name.len().checked_sub(suffix.len())?;
+    (name.is_char_boundary(cut) && name[cut..].eq_ignore_ascii_case(suffix)).then(|| &name[..cut])
+}
+
+/// Whether `name` is a save state RetroArch keeps for the content `stem`: one of its [`Slot`]s.
 ///
 /// What tells a changed file in the state folder from another game's — see [`super::changed_states`].
 pub(super) fn is_slot_of(name: &str, stem: &str) -> bool {
-    let Some(rest) = name.strip_prefix(stem).map(str::to_lowercase) else { return false };
-    let Some(slot) = rest.strip_prefix(".state") else { return false };
-    slot.is_empty() || slot == ".auto" || slot.chars().all(|c| c.is_ascii_digit())
+    Slot::of_file(name, stem).is_some()
 }
 
-/// The manual slot a server state's name declares: `.slotN` ending its stem, or followed by a dot.
-pub fn slot_of(name: &str) -> Option<u32> {
-    let lower = name.to_lowercase();
-    let stem = lower.strip_suffix(OWN).or_else(|| lower.strip_suffix(LEGACY)).unwrap_or(&lower);
-    let at = stem.rfind(".slot")? + ".slot".len();
-    let digits: String = stem[at..].chars().take_while(char::is_ascii_digit).collect();
-    let rest = &stem[at + digits.len()..];
-    let slot: u32 = digits.parse().ok()?;
-    ((rest.is_empty() || rest.starts_with('.')) && (1..=SLOTS).contains(&slot)).then_some(slot)
+/// The slot an old name gives a state — `<rom>.slotN.deckhand.state`, slot 1 to 4 — from when the
+/// player's slots were four, named the same for every core.
+fn old_slot(name: &str) -> Option<u32> {
+    let rest = strip_suffix_ci(name, OWN).or_else(|| strip_suffix_ci(name, LEGACY)).or_else(|| strip_suffix_ci(name, ".state"))?;
+    let (_, slot) = rest.rsplit_once('.')?;
+    numbered(slot).filter(|n| (1..=4).contains(n))
 }
 
-/// The name a slot-0 push goes up under: unique, and sorting by when it was made.
-fn rolling_name(stem: &str, now: SystemTime) -> String {
-    let millis = now.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.subsec_millis());
-    // `2026-07-01T10:00:00Z` → `2026-07-01 10-00-00-123`, the Kotlin app's spelling.
-    let stamp = names::format_timestamp_no_zone(now).replace('T', " ").replace(':', "-");
-    format!("{stem} [{stamp}-{millis:03}]{OWN}")
+/// Whether a state is one of this app's old slot-0 history, `<rom> [stamp].deckhand.state`.
+fn old_history(name: &str) -> bool {
+    is_own(name) && Slot::of_remote(name).is_none() && old_slot(name).is_none()
+}
+
+/// The slot a state on RomM is, for the core tagged `core`: by its own name, or by an old one that
+/// stands in for it ([`stand_in`]).
+fn slot_of(state: &SaveAsset, core: &str) -> Option<Slot> {
+    match Slot::of_remote(&state.file_name) {
+        Some((slot, by)) => (fold(by) == fold(core)).then_some(slot),
+        None if old_history(&state.file_name) => Some(Slot::Number(0)),
+        None => old_slot(&state.file_name).map(Slot::Number),
+    }
+}
+
+/// RomM's state for `slot`, among `server` — the states the core tagged `core` loads: the newest
+/// under the slot's own name, or while there is none, the one that stands in for it.
+fn remote_for<'s>(server: &'s [SaveAsset], slot: Slot, core: &str) -> Option<&'s SaveAsset> {
+    let own = server.iter().filter(|s| Slot::of_remote(&s.file_name).is_some_and(|(of, by)| of == slot && fold(by) == fold(core)));
+    newest(own).or_else(|| stand_in(server, slot))
+}
+
+/// The state that stands in for `slot` while RomM has none under the slot's own name: for slots 1
+/// to 4 the newest under the old name they shared, and for slot 0 the newest of this app's old
+/// history, which slot 0 was. None for any other.
+fn stand_in(server: &[SaveAsset], slot: Slot) -> Option<&SaveAsset> {
+    match slot {
+        Slot::Number(0) => newest(server.iter().filter(|s| old_history(&s.file_name))),
+        Slot::Number(n) => newest(server.iter().filter(|s| old_slot(&s.file_name) == Some(n))),
+        Slot::Auto => None,
+    }
 }
 
 /// The newest of `states`, by RomM's time and then id.
@@ -278,94 +400,177 @@ fn newest<'a>(states: impl Iterator<Item = &'a SaveAsset>) -> Option<&'a SaveAss
     states.max_by_key(|s| (s.updated_at.as_deref().and_then(names::parse_timestamp), s.id))
 }
 
-/// One slot, as a sync sees it.
-struct Slot<'s> {
+/// Whether RomM's `remote` is still the version `agreed` records. A state sent up again keeps its
+/// id, so its time is what says it moved — to the second, since RomM answers an upload to the
+/// microsecond and keeps the whole seconds of it. An entry from before the time was kept goes by the
+/// id alone.
+fn same_version(agreed: &Entry, remote: &SaveAsset) -> bool {
+    let second = |t: Option<&str>| {
+        let t = t.and_then(names::parse_timestamp)?;
+        Some(t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()))
+    };
+    agreed.save_id == remote.id
+        && match (second(agreed.synced_at.as_deref()), second(remote.updated_at.as_deref())) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+}
+
+/// The game's slots on this device that hold a state, with when RetroArch wrote each, in slot order.
+pub fn on_disk(dir: &Path, stem: &str) -> Vec<(Slot, SystemTime)> {
+    let mut found: Vec<(Slot, SystemTime)> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let slot = Slot::of_file(&entry.file_name().to_string_lossy(), stem)?;
+            let meta = fs::metadata(entry.path()).ok().filter(|m| m.is_file() && m.len() > 0)?;
+            Some((slot, meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Which of RetroArch's slots each of a game's states on RomM is here, by id — for the Saves page,
+/// which says where to load one: the pairing a sync makes ([`remote_for`]). `states` newest first,
+/// across the game's builds. Another core's and another emulator's are in none.
+pub fn layout(states: &[SaveAsset], core: &Core) -> HashMap<i64, Slot> {
+    let tag = core.tag();
+    let ours: Vec<&SaveAsset> = states.iter().filter(|s| is_state(&s.file_name) && core.loads(s)).collect();
+    // A slot's own state first; an old one stands in only for a slot that has none.
+    let own = ours.iter().filter_map(|s| Some((*s, Slot::of_remote(&s.file_name).filter(|(_, by)| fold(by) == fold(tag))?.0)));
+    let old = ours.iter().filter_map(|s| Some((*s, Slot::Number(old_slot(&s.file_name)?))));
+    let history = ours.iter().filter(|s| old_history(&s.file_name)).map(|s| (*s, Slot::Number(0)));
+    let mut claimed = HashSet::new();
+    let mut out = HashMap::new();
+    for (state, slot) in own.chain(old).chain(history) {
+        if claimed.insert(slot) {
+            out.insert(state.id, slot);
+        }
+    }
+    out
+}
+
+/// One slot, as a sync of it sees it: the file here, and the state on RomM it is paired with.
+struct Pair<'s> {
     /// The file the index is keyed by, and the one a pull writes.
     key: PathBuf,
-    /// The file holding the slot's current content, if any.
+    /// The same file when it holds a state.
     live: Option<PathBuf>,
-    /// Other files that hold this slot and must follow a pull: `.state.auto` for slot 0.
-    mirrors: Vec<PathBuf>,
+    /// The name it goes up under.
     upload_as: String,
     remote: Option<&'s SaveAsset>,
-    rolling: bool,
 }
 
 impl Run<'_> {
     /// Sync the states of the game whose content stem is `stem`, kept in `dir`, run by `core` — the
     /// one whose states are synced, and what this device's are tagged with.
     pub(super) async fn states(&mut self, dir: &Path, stem: &str, rom_id: i64, core: &Core) {
-        let emulator = core.tag();
-        let (server, foreign): (Vec<SaveAsset>, Vec<SaveAsset>) = match self.client.fetch_states(self.connection, rom_id).await {
-            Ok(all) => all
-                .into_iter()
-                .filter(|s| s.rom_id.is_none_or(|id| id == rom_id) && is_state(&s.file_name))
-                .partition(|s| core.loads(s)),
-            Err(e) => return self.report.failed.push(format!("{stem}.state: {}", describe(&e))),
+        let (server, foreign) = match self.fetch_states(rom_id, core).await {
+            Ok(states) => states,
+            Err(why) => return self.report.failed.push(format!("{stem}.state: {why}")),
         };
-        let history: Vec<&SaveAsset> = server.iter().filter(|s| slot_of(&s.file_name).is_none()).collect();
-
-        let state = dir.join(format!("{stem}.state"));
-        let auto = dir.join(format!("{stem}.state.auto"));
-        let live = [&auto, &state]
-            .into_iter()
-            .filter(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() > 0))
-            .max_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
-            .cloned();
+        let tag = core.tag();
+        let here = on_disk(dir, stem);
 
         // Another core's newest state, when it is newer than anything this one has here or on RomM:
         // progress made elsewhere that cannot come here, which the player may be looking for.
         let time = |s: &SaveAsset| s.updated_at.as_deref().and_then(names::parse_timestamp);
-        let local_time = live.as_ref().and_then(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
-        if let Some(other) = newest(foreign.iter().filter(|s| slot_of(&s.file_name).is_none()))
+        let newest_here = here.iter().map(|(_, at)| *at).max();
+        if let Some(other) = newest(foreign.iter())
             && let Some(at) = time(other)
-            && newest(history.iter().copied()).and_then(time).is_none_or(|t| at > t)
-            && local_time.is_none_or(|t| at > t)
+            && newest(server.iter()).and_then(time).is_none_or(|t| at > t)
+            && newest_here.is_none_or(|t| at > t)
         {
             let maker = made_by(other).unwrap_or("another core");
             let here = core.name().unwrap_or("this core");
             self.report.other_cores.push(format!("a newer save state made with {maker} stays on RomM — {here} can't load it"));
         }
-        let slot_zero = Slot {
-            key: state,
-            live,
-            mirrors: vec![auto],
-            upload_as: rolling_name(stem, SystemTime::now()),
-            remote: newest(history.iter().copied()),
-            rolling: true,
-        };
-        self.state(slot_zero, rom_id, emulator, &history).await;
 
-        for n in 1..=SLOTS {
-            let path = dir.join(format!("{stem}.state{n}"));
-            let live = fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0).then(|| path.clone());
-            let slot = Slot {
-                key: path,
-                live,
-                mirrors: Vec::new(),
-                upload_as: format!("{stem}.slot{n}{OWN}"),
-                remote: newest(server.iter().filter(|s| slot_of(&s.file_name) == Some(n))),
-                rolling: false,
-            };
-            self.state(slot, rom_id, emulator, &history).await;
+        // What the slots here agreed on with this app's old history: content RomM has already.
+        let old: HashSet<i64> = server.iter().filter(|s| old_history(&s.file_name)).map(|s| s.id).collect();
+        let held: Vec<Entry> = self.index.iter().filter(|(_, e)| e.rom_id == rom_id && old.contains(&e.save_id)).map(|(_, e)| e.clone()).collect();
+
+        // Every slot on either side.
+        let slots: BTreeSet<Slot> = here.iter().map(|(slot, _)| *slot).chain(server.iter().filter_map(|s| slot_of(s, tag))).collect();
+        for slot in slots {
+            let key = dir.join(slot.file(stem));
+            let live = here.iter().any(|(s, _)| *s == slot).then(|| key.clone());
+            let pair = Pair { key, live, upload_as: slot.remote_name(stem, tag), remote: remote_for(&server, slot, tag) };
+            self.state(pair, rom_id, tag, &held).await;
         }
-        self.lay_out_history(dir, stem, rom_id, &history).await;
+    }
+
+    /// The game's RetroArch states on RomM: those `core` loads, and the rest.
+    async fn fetch_states(&mut self, rom_id: i64, core: &Core) -> Result<(Vec<SaveAsset>, Vec<SaveAsset>), String> {
+        let all = self.client.fetch_states(self.connection, rom_id).await.map_err(|e| describe(&e))?;
+        Ok(all.into_iter().filter(|s| s.rom_id.is_none_or(|id| id == rom_id) && is_state(&s.file_name)).partition(|s| core.loads(s)))
+    }
+
+    /// Put RomM's `state` into `target`, one of this device's slots for the game whose content stem
+    /// is `stem` — the Saves page's doing — and send it up as that slot's own. What the slot held is
+    /// kept in `save-backups/` first. Answers the slot it went into.
+    pub(super) async fn put(&mut self, dir: &Path, stem: &str, rom_id: i64, core: &Core, state: &SaveAsset, target: Target) -> Result<Slot, String> {
+        let tag = core.tag();
+        let (server, _) = self.fetch_states(rom_id, core).await?;
+        let slot = match target {
+            Target::Zero => Slot::Number(0),
+            Target::Auto => Slot::Auto,
+            Target::Next => {
+                let here = on_disk(dir, stem).into_iter().map(|(slot, _)| slot);
+                let there = server.iter().filter_map(|s| slot_of(s, tag));
+                let top = here.chain(there).filter_map(|slot| match slot {
+                    Slot::Number(n) => Some(n),
+                    Slot::Auto => None,
+                });
+                Slot::Number(top.max().map_or(1, |n| n + 1))
+            }
+        };
+        let key = dir.join(slot.file(stem));
+        let name = file_name(&key);
+        let bytes = self.client.download_state(self.connection, state).await.map_err(|e| describe(&e))?;
+        if let Ok(held) = fs::read(&key)
+            && !held.is_empty()
+            && held != bytes
+        {
+            let kept = self.back_up(&key, &held, &name).ok_or_else(|| format!("could not keep a copy of what {name} held"))?;
+            self.report.notes.push(format!("what {name} held is at {}", kept.display()));
+        }
+        fs::create_dir_all(dir).map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+        write_atomic(&key, &bytes).map_err(|e| format!("could not write {name}: {e}"))?;
+        self.report.written.push(key.clone());
+        // RomM's picture of it beside it — or none, rather than the picture of what it replaced.
+        if state.screenshot.is_some() {
+            self.pull_thumbnail(&key, state).await;
+        } else if fs::remove_file(thumbnail(&key)).is_ok() {
+            self.report.written.push(thumbnail(&key));
+        }
+        let pair = Pair { live: Some(key.clone()), key, upload_as: slot.remote_name(stem, tag), remote: remote_for(&server, slot, tag) };
+        self.state(pair, rom_id, tag, &[]).await;
+        Ok(slot)
     }
 
     /// One state file that is a save of its own — a standalone emulator's slot, uploaded under its
-    /// own name every time and never pruned. See [`super::standalone`].
+    /// own name every time. See [`super::standalone`].
     pub(super) async fn state_file(&mut self, path: PathBuf, remote: Option<&SaveAsset>, rom_id: i64, emulator: &str) {
         let live = fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > 0).then(|| path.clone());
-        let slot = Slot { upload_as: file_name(&path), key: path, live, mirrors: Vec::new(), remote, rolling: false };
-        self.state(slot, rom_id, emulator, &[]).await;
+        let pair = Pair { upload_as: file_name(&path), key: path, live, remote };
+        self.state(pair, rom_id, emulator, &[]).await;
     }
 
-    async fn state(&mut self, slot: Slot<'_>, rom_id: i64, emulator: &str, history: &[&SaveAsset]) {
-        let name = file_name(&slot.key);
-        let Some(live) = slot.live.clone() else {
-            // Nothing here: a fresh device takes RomM's. Nothing on either side is not news.
-            if let Some(remote) = slot.remote {
-                self.pull_state(&slot, rom_id, remote, &name).await;
+    /// Sync one slot. `held` is what slots of this game's agreed on with RomM states of this app's
+    /// old history — content RomM has already, which a slot holding it as it is does not send again.
+    async fn state(&mut self, pair: Pair<'_>, rom_id: i64, emulator: &str, held: &[Entry]) {
+        let name = file_name(&pair.key);
+        let agreed = self.index.agreed(&pair.key, rom_id, self.stamp.as_ref()).cloned();
+        let Some(live) = pair.live.clone() else {
+            match pair.remote {
+                // Deleted here since the two last agreed. RomM's stays, and stays there, unless it
+                // changes: then it is another state, which comes down as one would to a fresh device.
+                Some(remote) if agreed.as_ref().is_some_and(|e| same_version(e, remote)) => {}
+                Some(remote) => self.pull_state(&pair, rom_id, remote, &name, None).await,
+                None => {}
             }
             return;
         };
@@ -374,14 +579,29 @@ impl Run<'_> {
             Err(e) => return self.report.failed.push(format!("{name}: {e}")),
         };
         let hash = md5_hex(&bytes);
-        match (plan(&hash, self.index.agreed(&slot.key, rom_id, self.stamp.as_ref()), slot.remote.map(|r| r.id)), slot.remote) {
-            (Plan::InSync, _) => self.report.in_sync += 1,
-            (Plan::Push, _) => self.push_state(&slot, rom_id, emulator, bytes, hash, &name, history).await,
-            (Plan::Pull, Some(remote)) => self.pull_state(&slot, rom_id, remote, &name).await,
-            (Plan::Conflict, Some(remote)) => {
+        let local_changed = agreed.as_ref().is_none_or(|e| e.hash != hash);
+        let server_changed = pair.remote.is_some_and(|r| agreed.as_ref().is_none_or(|e| !same_version(e, r)));
+        match (local_changed, server_changed, pair.remote) {
+            (false, false, _) => self.report.in_sync += 1,
+            (true, false, remote) => {
+                // A slot new to the index that holds one of the old history's states as it came: RomM
+                // has it, and this slot sends its own up the next time it changes.
+                if agreed.is_none()
+                    && remote.is_none()
+                    && let Some(old) = held.iter().find(|e| e.hash == hash)
+                {
+                    if self.remember_state(&pair.key, rom_id, hash, old.save_id, old.synced_at.clone(), &name) {
+                        self.report.in_sync += 1;
+                    }
+                    return;
+                }
+                self.push_state(&pair, rom_id, emulator, bytes, hash, &name).await;
+            }
+            (false, true, Some(remote)) => self.pull_state(&pair, rom_id, remote, &name, Some(&hash)).await,
+            (true, true, Some(remote)) => {
                 let Some(theirs) = self.download_state(remote, &name).await else { return };
                 if md5_hex(&theirs) == hash {
-                    if self.remember_state(&slot.key, rom_id, hash, remote.id, &name) {
+                    if self.remember_state(&pair.key, rom_id, hash, remote.id, remote.updated_at.clone(), &name) {
                         self.report.in_sync += 1;
                     }
                     return;
@@ -390,65 +610,57 @@ impl Run<'_> {
                 let remote_time = remote.updated_at.as_deref().and_then(names::parse_timestamp);
                 if super::choose(&name, local_time, remote_time, bytes.len() as u64).await == super::Choice::Remote {
                     let Some(kept) = self.back_up(&live, &bytes, &name) else { return };
-                    if self.write_state(&slot, rom_id, remote, &theirs, &name) {
+                    if self.write_state(&pair, rom_id, remote, &theirs, &name) {
                         self.report.conflicts.push(format!("{name}: kept RomM's state; this device's is at {}", kept.display()));
                     }
-                } else {
-                    self.push_state(&slot, rom_id, emulator, bytes, hash, &name, history).await;
+                } else if remote.file_name.eq_ignore_ascii_case(&pair.upload_as) {
+                    // The push replaces RomM's where it is, so its copy is kept here first.
+                    let Some(kept) = self.back_up(&live, &theirs, &name) else { return };
+                    if self.push_state(&pair, rom_id, emulator, bytes, hash, &name).await {
+                        self.report.conflicts.push(format!("{name}: kept this device's state; RomM's is at {}", kept.display()));
+                    }
+                } else if self.push_state(&pair, rom_id, emulator, bytes, hash, &name).await {
                     self.report.conflicts.push(format!("{name}: kept this device's state; RomM keeps the other"));
                 }
             }
-            (Plan::Pull | Plan::Conflict, None) => unreachable!("a server change with no server state"),
+            (_, true, None) => unreachable!("a server change with no server state"),
         }
     }
 
+    /// Send a slot up under its name, answering whether it went.
     #[allow(clippy::too_many_arguments)]
-    async fn push_state(
-        &mut self,
-        slot: &Slot<'_>,
-        rom_id: i64,
-        emulator: &str,
-        bytes: Vec<u8>,
-        hash: String,
-        name: &str,
-        history: &[&SaveAsset],
-    ) {
+    async fn push_state(&mut self, pair: &Pair<'_>, rom_id: i64, emulator: &str, bytes: Vec<u8>, hash: String, name: &str) -> bool {
         // RetroArch writes the thumbnail beside whichever file it saved: `.state.png`, `.state.auto.png`.
-        let shot = slot.live.as_ref().and_then(|live| picture(live));
-        let created = match self.client.upload_state(self.connection, rom_id, emulator, &slot.upload_as, bytes, shot).await {
+        let shot = pair.live.as_ref().and_then(|live| picture(live));
+        let created = match self.client.upload_state(self.connection, rom_id, emulator, &pair.upload_as, bytes, shot).await {
             Ok(created) => created,
-            Err(e) => return self.report.failed.push(format!("{name}: {}", describe(&e))),
+            Err(e) => {
+                self.report.failed.push(format!("{name}: {}", describe(&e)));
+                return false;
+            }
         };
-        if self.remember_state(&slot.key, rom_id, hash, created.id, name) {
+        if self.remember_state(&pair.key, rom_id, hash, created.id, created.updated_at.clone(), name) {
             self.report.pushed.push(name.to_string());
+            return true;
         }
-        if slot.rolling {
-            self.prune(history, &created).await;
-        }
+        false
     }
 
-    /// Keep this app's newest [`HISTORY`] rolling states for the game and drop the rest. Only its
-    /// own: a state the web player or another app uploaded is not this app's to delete.
-    async fn prune(&mut self, history: &[&SaveAsset], created: &SaveAsset) {
-        // The one just uploaded is this app's whatever name RomM gave it back.
-        let mut own: Vec<&SaveAsset> =
-            history.iter().copied().filter(|s| is_own(&s.file_name)).chain(std::iter::once(created)).collect();
-        own.sort_by_key(|s| std::cmp::Reverse((s.updated_at.as_deref().and_then(names::parse_timestamp), s.id)));
-        own.dedup_by_key(|s| s.id);
-        let stale: Vec<i64> = own.iter().skip(HISTORY).map(|s| s.id).filter(|id| *id != created.id).collect();
-        if !stale.is_empty()
-            && let Err(e) = self.client.delete_states(self.connection, &stale).await
-        {
-            self.report.notes.push(format!("older states not pruned from RomM: {}", describe(&e)));
+    /// Bring RomM's state for a slot down into it. `here` is the hash of what the slot holds, when it
+    /// holds something: the same content come back under a newer time — sent up again elsewhere — is
+    /// agreed on, and not written over itself.
+    async fn pull_state(&mut self, pair: &Pair<'_>, rom_id: i64, remote: &SaveAsset, name: &str, here: Option<&str>) {
+        let Some(bytes) = self.download_state(remote, name).await else { return };
+        let hash = md5_hex(&bytes);
+        if here == Some(hash.as_str()) {
+            if self.remember_state(&pair.key, rom_id, hash, remote.id, remote.updated_at.clone(), name) {
+                self.report.in_sync += 1;
+            }
+            return;
         }
-    }
-
-    async fn pull_state(&mut self, slot: &Slot<'_>, rom_id: i64, remote: &SaveAsset, name: &str) {
-        if let Some(bytes) = self.download_state(remote, name).await
-            && self.write_state(slot, rom_id, remote, &bytes, name)
-        {
+        if self.write_state(pair, rom_id, remote, &bytes, name) {
             self.report.pulled.push(name.to_string());
-            self.pull_thumbnail(&slot.key, remote).await;
+            self.pull_thumbnail(&pair.key, remote).await;
         }
     }
 
@@ -462,25 +674,19 @@ impl Run<'_> {
         }
     }
 
-    /// `remote`'s content into the slot, and into each mirror already on disk — a `.state.auto` left
-    /// older than the pulled `.state` would be the newer of the two by its old time, and push back.
-    fn write_state(&mut self, slot: &Slot<'_>, rom_id: i64, remote: &SaveAsset, bytes: &[u8], name: &str) -> bool {
-        let time = remote.updated_at.as_deref().and_then(names::parse_timestamp);
-        let targets: Vec<PathBuf> =
-            std::iter::once(&slot.key).chain(slot.mirrors.iter().filter(|m| m.is_file())).cloned().collect();
-        for path in &targets {
-            if let Err(e) = write_atomic(path, bytes) {
-                self.report.failed.push(format!("{name}: {e}"));
-                return false;
-            }
-            if let Some(time) = time
-                && let Ok(file) = fs::File::options().write(true).open(path)
-            {
-                let _ = file.set_modified(time);
-            }
+    /// `remote`'s content into the slot, dated as RomM dates it.
+    fn write_state(&mut self, pair: &Pair<'_>, rom_id: i64, remote: &SaveAsset, bytes: &[u8], name: &str) -> bool {
+        if let Err(e) = write_atomic(&pair.key, bytes) {
+            self.report.failed.push(format!("{name}: {e}"));
+            return false;
         }
-        self.report.written.extend(targets);
-        self.remember_state(&slot.key, rom_id, md5_hex(bytes), remote.id, name)
+        if let Some(time) = remote.updated_at.as_deref().and_then(names::parse_timestamp)
+            && let Ok(file) = fs::File::options().write(true).open(&pair.key)
+        {
+            let _ = file.set_modified(time);
+        }
+        self.report.written.push(pair.key.clone());
+        self.remember_state(&pair.key, rom_id, md5_hex(bytes), remote.id, remote.updated_at.clone(), name)
     }
 
     /// The state's thumbnail from RomM, beside the slot file, where RetroArch's menu shows it. A
@@ -505,55 +711,9 @@ impl Run<'_> {
         }
     }
 
-    /// RomM's older rolling states, laid into slots [`FIRST_HISTORY`] and up, newest first — so a
-    /// state from a few sessions back is one menu away, as in the Kotlin app. Download-only: they are
-    /// RomM's history, not the player's slots. One already holding that state is left as it is.
-    ///
-    /// And so is one holding anything else this app did not put there. RetroArch's slot is a number
-    /// the player can wind up as far as they like from its own menu, so a `.state7` may be a state
-    /// they saved themselves; it is never traded for a copy of RomM's history, which is on RomM.
-    async fn lay_out_history(&mut self, dir: &Path, stem: &str, rom_id: i64, history: &[&SaveAsset]) {
-        let mut newest_first: Vec<&SaveAsset> = history.to_vec();
-        newest_first.sort_by_key(|s| std::cmp::Reverse((s.updated_at.as_deref().and_then(names::parse_timestamp), s.id)));
-        let mut theirs: Vec<String> = Vec::new();
-        // The newest is slot 0's; the next ones go after the player's own slots.
-        for (rank, remote) in newest_first.iter().skip(1).take(HISTORY - 1).enumerate() {
-            let key = dir.join(format!("{stem}.state{}", FIRST_HISTORY + rank as u32));
-            let here = self.index.agreed(&key, rom_id, self.stamp.as_ref()).is_some_and(|e| e.save_id == remote.id) && key.is_file();
-            if here {
-                continue;
-            }
-            if !self.laid_this_down(&key) {
-                theirs.push(file_name(&key));
-                continue;
-            }
-            let name = file_name(&key);
-            let Some(bytes) = self.download_state(remote, &name).await else { continue };
-            let slot = Slot { key: key.clone(), live: None, mirrors: Vec::new(), upload_as: String::new(), remote: None, rolling: false };
-            if self.write_state(&slot, rom_id, remote, &bytes, &name) {
-                self.pull_thumbnail(&key, remote).await;
-            }
-        }
-        if !theirs.is_empty() {
-            self.report.notes.push(format!(
-                "RomM's older states were kept out of {} — this device has a state of its own there",
-                theirs.join(", ")
-            ));
-        }
-    }
-
-    /// Whether a history slot is this app's to write: empty, or still holding the very bytes this
-    /// app last laid in it. Anything else is the player's own state, saved into that slot since.
-    fn laid_this_down(&self, key: &Path) -> bool {
-        match fs::read(key) {
-            // Nothing there (or nothing readable, which a write would fail on anyway).
-            Err(_) => true,
-            Ok(bytes) => self.index.get(key).is_some_and(|e| e.hash == md5_hex(&bytes)),
-        }
-    }
-
-    fn remember_state(&mut self, key: &Path, rom_id: i64, hash: String, save_id: i64, name: &str) -> bool {
-        match self.index.set(key, Entry { rom_id, hash, save_id, stamp: self.stamp.clone(), ..Default::default() }) {
+    /// The slot and RomM agree on `hash`, RomM's state `save_id` as it was at `synced_at`.
+    fn remember_state(&mut self, key: &Path, rom_id: i64, hash: String, save_id: i64, synced_at: Option<String>, name: &str) -> bool {
+        match self.index.set(key, Entry { rom_id, hash, save_id, synced_at, stamp: self.stamp.clone(), ..Default::default() }) {
             Ok(()) => true,
             Err(e) => {
                 self.report.failed.push(format!("{name}: synced, but could not record it ({e})"));
@@ -568,6 +728,7 @@ mod tests {
     use super::*;
 
     use crate::config::Connection;
+    use crate::fake_romm::FakeRomm;
     use crate::romm::RommClient;
     use crate::stub_server;
 
@@ -605,6 +766,16 @@ mod tests {
                 .await
                 .unwrap()
         }
+
+        /// The Saves page's "put into a slot", for `state`.
+        async fn put(&self, host: String, state: &SaveAsset, target: Target) -> Result<(Slot, super::super::Report), String> {
+            let install = super::super::retroarch::read(&self.0.join("ra/retroarch.cfg")).unwrap();
+            let conn = Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None };
+            let (client, dir) = (RommClient::new().unwrap(), self.0.join("states/snes"));
+            let mut run = Run::with_index(&client, &conn, &self.0.join("store"), dir.clone(), "state-index.json");
+            let slot = run.put(&dir, CHRONO, 1, &Core::of(Some("snes9x"), &install), state, target).await?;
+            Ok((slot, run.report))
+        }
     }
 
     impl Drop for Device {
@@ -613,108 +784,241 @@ mod tests {
         }
     }
 
-    fn state(id: i64, name: &str, iso: &str) -> serde_json::Value {
-        serde_json::json!({
-            "id": id, "rom_id": 1, "file_name": name, "emulator": "snes9x", "updated_at": iso,
-            "download_path": format!("/api/raw/assets/states/{id}.state"),
-        })
+    /// The name this app sends `slot` up under, from snes9x.
+    fn own(slot: &str) -> String {
+        format!("{CHRONO}.{slot}.snes9x.deckhand.state")
+    }
+
+    fn write(path: PathBuf, bytes: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn named(romm: &FakeRomm, name: &str) -> crate::fake_romm::State {
+        romm.states(1).into_iter().find(|s| s.file_name == name).unwrap_or_else(|| panic!("{name} on RomM"))
     }
 
     #[tokio::test]
-    async fn a_fresh_device_gets_the_newest_state_in_slot_zero_and_each_slot_in_its_own() {
-        let device = Device::new("fresh");
-        let states = serde_json::json!([
-            state(5, &format!("{CHRONO} [2026-06-01 10-00-00-000].deckhand.state"), "2026-06-01T10:00:00Z"),
-            state(6, &format!("{CHRONO} [2026-07-01 10-00-00-000].deckhand.state"), "2026-07-01T10:00:00Z"),
-            state(7, &format!("{CHRONO}.slot2.deckhand.state"), "2026-07-02T10:00:00Z"),
-        ]);
-        let host = stub_server::start(vec![
-            ("GET /api/saves", 200, "[]".into()),
-            ("GET /api/raw/assets/states/6.state", 200, "newest rolling".into()),
-            ("GET /api/raw/assets/states/7.state", 200, "slot two".into()),
-            ("GET /api/raw/assets/states/5.state", 200, "older rolling".into()),
-            ("GET /api/states?rom_id=1", 200, states.to_string()),
-        ])
-        .await;
-        let report = device.sync(host.clone()).await;
+    async fn every_slot_goes_up_under_a_name_of_its_own_and_comes_down_into_the_same_slot() {
+        let romm = FakeRomm::start().await;
+        let a = Device::new("own-a");
+        for (file, bytes) in [("state", "zero"), ("state.auto", "on close"), ("state3", "three"), ("state12", "twelve")] {
+            write(a.state(&format!("{CHRONO}.{file}")), bytes);
+        }
+        fs::write(a.state(&format!("{CHRONO}.state3.png")), b"\x89PNG three").unwrap();
+        let report = a.sync(romm.host.clone()).await;
+        assert_eq!(report.pushed.len(), 4, "{report:?}");
+        let mut names: Vec<String> = romm.states(1).into_iter().map(|s| s.file_name).collect();
+        names.sort();
+        assert_eq!(names, [own("auto"), own("slot0"), own("slot12"), own("slot3")], "past slot 4 too");
+        assert!(romm.states(1).iter().all(|s| s.emulator.as_deref() == Some("snes9x")), "tagged with the core");
+        assert_eq!(named(&romm, &own("slot3")).picture.map(|(_, p)| p), Some(b"\x89PNG three".to_vec()));
+
+        let again = a.sync(romm.host.clone()).await;
+        assert!(again.pushed.is_empty() && again.pulled.is_empty(), "{again:?}");
+        assert_eq!(again.in_sync, 4);
+
+        // Another device takes each into the slot it was in.
+        let b = Device::new("own-b");
+        let report = b.sync(romm.host.clone()).await;
+        assert_eq!(report.pulled.len(), 4, "{report:?}");
+        assert_eq!(fs::read_to_string(b.state(&format!("{CHRONO}.state12"))).unwrap(), "twelve");
+        assert_eq!(fs::read_to_string(b.state(&format!("{CHRONO}.state.auto"))).unwrap(), "on close");
+        assert_eq!(fs::read(b.state(&format!("{CHRONO}.state3.png"))).unwrap(), b"\x89PNG three");
+        assert_eq!(romm.requests("POST /api/states/delete"), 0, "nothing is deleted on RomM");
+    }
+
+    #[tokio::test]
+    async fn a_slot_saved_again_replaces_its_state_where_it_is_and_the_other_device_takes_it() {
+        let romm = FakeRomm::start().await;
+        let (a, b) = (Device::new("again-a"), Device::new("again-b"));
+        write(a.state(&format!("{CHRONO}.state2")), "first");
+        a.sync(romm.host.clone()).await;
+        b.sync(romm.host.clone()).await;
+        let id = named(&romm, &own("slot2")).id;
+
+        write(a.state(&format!("{CHRONO}.state2")), "second");
+        let report = a.sync(romm.host.clone()).await;
+        assert_eq!(report.pushed, [format!("{CHRONO}.state2")], "{report:?}");
+        assert_eq!(romm.states(1).len(), 1, "one state for the slot, however often it is saved");
+        assert_eq!(named(&romm, &own("slot2")).id, id, "replaced where it is");
+
+        // The id did not move; the time did, and that is what the other device goes by.
+        let report = b.sync(romm.host.clone()).await;
+        assert_eq!(report.pulled, [format!("{CHRONO}.state2")], "{report:?}");
+        assert_eq!(fs::read_to_string(b.state(&format!("{CHRONO}.state2"))).unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn a_state_deleted_on_either_side_stays_on_the_other_and_does_not_come_back() {
+        let romm = FakeRomm::start().await;
+        let (a, b) = (Device::new("deleted-a"), Device::new("deleted-b"));
+        write(a.state(&format!("{CHRONO}.state1")), "one");
+        write(a.state(&format!("{CHRONO}.state2")), "two");
+        a.sync(romm.host.clone()).await;
+
+        // Deleted here: RomM keeps it, and the next sync does not bring it back.
+        fs::remove_file(a.state(&format!("{CHRONO}.state1"))).unwrap();
+        let report = a.sync(romm.host.clone()).await;
+        assert!(report.pulled.is_empty() && report.pushed.is_empty(), "{report:?}");
+        assert!(!a.state(&format!("{CHRONO}.state1")).exists());
+        assert_eq!(romm.states(1).len(), 2);
+        // Until another device saves into that slot: that is a state of its own, and comes down.
+        b.sync(romm.host.clone()).await;
+        write(b.state(&format!("{CHRONO}.state1")), "one, played on");
+        b.sync(romm.host.clone()).await;
+        let report = a.sync(romm.host.clone()).await;
+        assert_eq!(report.pulled, [format!("{CHRONO}.state1")], "{report:?}");
+
+        // Deleted on RomM: kept here, and not sent up again while it is as it was.
+        romm.delete_state(named(&romm, &own("slot2")).id);
+        let report = a.sync(romm.host.clone()).await;
+        assert!(report.pushed.is_empty(), "{report:?}");
+        assert_eq!(fs::read_to_string(a.state(&format!("{CHRONO}.state2"))).unwrap(), "two");
+        // Saved into again, it goes up as a new state.
+        write(a.state(&format!("{CHRONO}.state2")), "two again");
+        let report = a.sync(romm.host.clone()).await;
+        assert_eq!(report.pushed, [format!("{CHRONO}.state2")], "{report:?}");
+        assert_eq!(romm.requests("POST /api/states/delete"), 0, "nothing is deleted on RomM");
+    }
+
+    #[tokio::test]
+    async fn the_old_names_stand_in_until_a_slot_has_its_own_and_stay_on_romm() {
+        let romm = FakeRomm::start().await;
+        // What this app sent up before: a history for slot 0, and slot 2 under the name every core shared.
+        romm.state_from(1, &format!("{CHRONO} [2026-06-01 10-00-00-000].deckhand.state"), "snes9x", b"older", None);
+        romm.state_from(1, &format!("{CHRONO} [2026-07-01 10-00-00-000].deckhand.state"), "snes9x", b"newest", None);
+        romm.state_from(1, &format!("{CHRONO}.slot2.deckhand.state"), "snes9x", b"slot two", None);
+        // The web player's: in no slot, on the Saves page.
+        romm.state_from(1, &format!("{CHRONO}.state"), "snes9x", b"web", None);
+
+        let device = Device::new("old-names");
+        let report = device.sync(romm.host.clone()).await;
         assert_eq!(report.pulled, [format!("{CHRONO}.state"), format!("{CHRONO}.state2")], "{report:?}");
-        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state"))).unwrap(), "newest rolling");
+        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state"))).unwrap(), "newest", "slot 0 was the history");
         assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state2"))).unwrap(), "slot two");
-        assert_eq!(
-            fs::read_to_string(device.state(&format!("{CHRONO}.state5"))).unwrap(),
-            "older rolling",
-            "the history after the newest goes after the player's slots"
-        );
-        assert!(report.failed.is_empty(), "{report:?}");
+        assert!(!device.state(&format!("{CHRONO}.state5")).exists(), "the older history stays on RomM");
 
-        let again = device.sync(host).await;
-        assert!(again.pulled.is_empty() && again.pushed.is_empty(), "{again:?}");
-        assert_eq!(again.in_sync, 2);
+        // What slot 0 holds is on RomM already, and so is the same content in the auto slot.
+        fs::copy(device.state(&format!("{CHRONO}.state")), device.state(&format!("{CHRONO}.state.auto"))).unwrap();
+        let report = device.sync(romm.host.clone()).await;
+        assert!(report.pushed.is_empty() && report.pulled.is_empty(), "{report:?}");
+        assert_eq!(report.in_sync, 3);
+
+        // Saved into, a slot goes up under its own name; the old state stays where it is.
+        write(device.state(&format!("{CHRONO}.state2")), "slot two, played on");
+        let report = device.sync(romm.host.clone()).await;
+        assert_eq!(report.pushed, [format!("{CHRONO}.state2")], "{report:?}");
+        assert_eq!(named(&romm, &own("slot2")).bytes, b"slot two, played on");
+        assert_eq!(named(&romm, &format!("{CHRONO}.slot2.deckhand.state")).bytes, b"slot two");
+        assert_eq!(romm.states(1).len(), 5);
+        assert_eq!(romm.requests("POST /api/states/delete"), 0, "nothing is deleted on RomM");
     }
 
     #[tokio::test]
-    async fn new_states_go_up_under_the_shared_names_and_old_rolling_ones_are_pruned() {
-        let device = Device::new("push");
-        fs::create_dir_all(device.state("")).unwrap();
-        fs::write(device.state(&format!("{CHRONO}.state.auto")), "played on close").unwrap();
-        fs::write(device.state(&format!("{CHRONO}.state3")), "my slot").unwrap();
-        // Ten of this app's rolling states already, the oldest first, and one the web player made.
-        let mut existing: Vec<serde_json::Value> = (1..=10)
-            .map(|i| state(i, &format!("{CHRONO} [2026-01-{i:02} 10-00-00-000].deckhand.state"), &format!("2026-01-{i:02}T10:00:00Z")))
-            .collect();
-        existing.push(state(50, &format!("{CHRONO}.state"), "2025-01-01T00:00:00Z"));
-        let created = state(99, "created", "2026-08-01T10:00:00Z");
-        let (host, requests) = stub_server::start_recording(vec![
-            ("GET /api/saves", 200, "[]".into()),
-            ("GET /api/raw/assets/states/", 200, "another device's".into()),
-            ("POST /api/states/delete", 200, "{}".into()),
-            ("POST /api/states", 201, created.to_string()),
-            ("GET /api/states?rom_id=1", 200, serde_json::Value::Array(existing).to_string()),
-        ])
-        .await;
-        // Both sides changed for slot 0 (RomM has states this device never agreed on): the local
-        // one is newer, so it goes up and RomM keeps the rest.
-        let report = device.sync(host).await;
-        assert_eq!(report.pushed, [format!("{CHRONO}.state"), format!("{CHRONO}.state3")], "{report:?}");
+    async fn a_conflict_kept_here_keeps_romms_copy_here_before_replacing_it() {
+        let romm = FakeRomm::start().await;
+        let (a, b) = (Device::new("conflict-a"), Device::new("conflict-b"));
+        write(a.state(&format!("{CHRONO}.state1")), "agreed");
+        a.sync(romm.host.clone()).await;
+        b.sync(romm.host.clone()).await;
+        write(b.state(&format!("{CHRONO}.state1")), "b's");
+        b.sync(romm.host.clone()).await;
+        // Saved here since, and after RomM's: this side is the newer.
+        write(a.state(&format!("{CHRONO}.state1")), "a's");
+        let report = a.sync(romm.host.clone()).await;
         assert_eq!(report.conflicts.len(), 1, "{report:?}");
-
-        let lines = requests.lock().unwrap().clone();
-        let uploads: Vec<&String> = lines.iter().filter(|l| l.starts_with("POST /api/states?")).collect();
-        assert_eq!(uploads.len(), 2);
-        assert!(uploads.iter().all(|l| l.contains("emulator=snes9x")), "tagged with the core: {uploads:?}");
-        assert!(lines.iter().any(|l| l.starts_with("POST /api/states/delete")), "the oldest own state goes: {lines:?}");
+        assert!(report.conflicts[0].contains("RomM's is at"), "{report:?}");
+        assert_eq!(named(&romm, &own("slot1")).bytes, b"a's");
+        let backups: Vec<String> = fs::read_dir(a.0.join("store/save-backups"))
+            .unwrap()
+            .flatten()
+            .map(|e| fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert_eq!(backups, ["b's"], "the copy RomM no longer has");
     }
 
     #[tokio::test]
     async fn another_cores_states_stay_on_romm_and_its_newer_one_is_mentioned() {
+        let romm = FakeRomm::start().await;
+        romm.state_from(1, &own("slot0"), "snes9x", b"snes9x's", None);
+        romm.advance(std::time::Duration::from_secs(60));
+        romm.state_from(1, &format!("{CHRONO}.slot0.bsnes.deckhand.state"), "bsnes", b"bsnes's", None);
+        romm.state_from(1, &format!("{CHRONO}.slot2.bsnes.deckhand.state"), "bsnes", b"bsnes's two", None);
         let device = Device::new("other-core");
-        let by = |id: i64, name: String, iso: &str, core: &str| {
-            let mut s = state(id, &name, iso);
-            s["emulator"] = core.into();
-            s
-        };
-        let states = serde_json::json!([
-            state(5, &format!("{CHRONO} [2026-06-01 10-00-00-000].deckhand.state"), "2026-06-01T10:00:00Z"),
-            by(6, format!("{CHRONO} [2026-07-01 10-00-00-000].deckhand.state"), "2026-07-01T10:00:00Z", "bsnes"),
-            by(7, format!("{CHRONO}.slot2.deckhand.state"), "2026-07-02T10:00:00Z", "bsnes"),
-        ]);
-        let (host, requests) = stub_server::start_recording(vec![
-            ("GET /api/saves", 200, "[]".into()),
-            ("GET /api/raw/assets/states/5.state", 200, "snes9x's".into()),
-            ("GET /api/raw/assets/states/", 200, "bsnes's".into()),
-            ("GET /api/states?rom_id=1", 200, states.to_string()),
-        ])
-        .await;
-        let report = device.sync(host).await;
+        let report = device.sync(romm.host.clone()).await;
 
         assert_eq!(report.pulled, [format!("{CHRONO}.state")], "{report:?}");
-        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state"))).unwrap(), "snes9x's", "this core's newest");
+        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state"))).unwrap(), "snes9x's", "this core's own");
         assert!(!device.state(&format!("{CHRONO}.state2")).exists(), "bsnes's slot is not snes9x's");
-        assert!(!device.state(&format!("{CHRONO}.state5")).exists(), "nor is its history");
-        let lines = requests.lock().unwrap().clone();
-        assert!(!lines.iter().any(|l| l.contains("/states/6.state") || l.contains("/states/7.state")), "never fetched: {lines:?}");
         assert_eq!(report.other_cores.len(), 1, "{report:?}");
         assert!(report.other_cores[0].contains("bsnes"), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn a_state_put_into_a_slot_lands_past_every_slot_and_goes_up_as_that_slot() {
+        let romm = FakeRomm::start().await;
+        let device = Device::new("put");
+        write(device.state(&format!("{CHRONO}.state1")), "one");
+        write(device.state(&format!("{CHRONO}.state3")), "three");
+        // Slot 5 is on RomM, from another device, and not here.
+        romm.state_from(1, &own("slot5"), "snes9x", b"five", None);
+        let web = romm.state_from(1, &format!("{CHRONO}.state"), "snes9x", b"web", Some(b"\x89PNG web"));
+        let web: SaveAsset = serde_json::from_value(serde_json::json!({
+            "id": web, "rom_id": 1, "file_name": format!("{CHRONO}.state"), "emulator": "snes9x",
+            "download_path": format!("/api/states/{web}/content"),
+            "screenshot": { "download_path": format!("/api/screenshots/{}/content", named(&romm, &format!("{CHRONO}.state")).picture.unwrap().0) },
+        }))
+        .unwrap();
+
+        let (slot, report) = device.put(romm.host.clone(), &web, Target::Next).await.unwrap();
+        assert_eq!(slot, Slot::Number(6), "past slot 5 too, which is RomM's");
+        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state6"))).unwrap(), "web");
+        assert_eq!(fs::read(device.state(&format!("{CHRONO}.state6.png"))).unwrap(), b"\x89PNG web");
+        assert_eq!(report.pushed, [format!("{CHRONO}.state6")], "{report:?}");
+        assert_eq!(named(&romm, &own("slot6")).bytes, b"web");
+
+        // Into a slot that holds something: that goes to save-backups first.
+        let (slot, report) = device.put(romm.host.clone(), &web, Target::Auto).await.unwrap();
+        assert_eq!(slot, Slot::Auto);
+        assert!(report.notes.is_empty(), "nothing was there: {report:?}");
+        write(device.state(&format!("{CHRONO}.state")), "zero");
+        let (_, report) = device.put(romm.host.clone(), &web, Target::Zero).await.unwrap();
+        assert!(report.notes.iter().any(|n| n.contains("save-backups")), "{report:?}");
+        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state"))).unwrap(), "web");
+        assert_eq!(romm.requests("POST /api/states/delete"), 0, "nothing is deleted on RomM");
+    }
+
+    #[test]
+    fn the_saves_page_says_which_slot_each_state_is_in() {
+        let by = |id: i64, name: String, emulator: &str| -> SaveAsset {
+            serde_json::from_value(serde_json::json!({ "id": id, "file_name": name, "emulator": emulator })).unwrap()
+        };
+        // Newest first, as the page holds them.
+        let states = vec![
+            by(9, own("slot2"), "snes9x"),
+            by(8, format!("{CHRONO}.slot2.deckhand.state"), "snes9x"),
+            by(7, format!("{CHRONO}.slot3.deckhand.state"), "snes9x"),
+            by(6, format!("{CHRONO} [2026-07-03 10-00-00-000].deckhand.state"), "snes9x"),
+            by(5, format!("{CHRONO} [2026-07-02 10-00-00-000].deckhand.state"), "snes9x"),
+            by(4, own("auto"), "snes9x"),
+            by(3, format!("{CHRONO}.slot7.bsnes.deckhand.state"), "bsnes"),
+            by(2, format!("{CHRONO}.state"), "snes9x"),
+            by(1, "SLUS-20946 (2C6BE434).01.p2s".into(), "pcsx2"),
+        ];
+        let dir = std::env::temp_dir().join(format!("deckhand-states-layout-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("retroarch.cfg"), "").unwrap();
+        let install = super::super::retroarch::read(&dir.join("retroarch.cfg")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let slots = layout(&states, &Core::of(Some("snes9x"), &install));
+        assert_eq!(slots.get(&9), Some(&Slot::Number(2)), "the slot's own");
+        assert_eq!(slots.get(&8), None, "an old name only stands in for a slot with none");
+        assert_eq!(slots.get(&7), Some(&Slot::Number(3)));
+        assert_eq!(slots.get(&6), Some(&Slot::Number(0)), "the old history's newest was slot 0");
+        assert_eq!(slots.get(&5), None);
+        assert_eq!(slots.get(&4), Some(&Slot::Auto));
+        assert_eq!((slots.get(&3), slots.get(&2), slots.get(&1)), (None, None, None), "another core's, the web player's, PCSX2's");
     }
 
     #[test]
@@ -761,54 +1065,47 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_is_read_from_its_name_and_only_within_the_shared_range() {
-        assert_eq!(slot_of("Chrono Trigger (USA).slot2.deckhand.state"), Some(2));
-        assert_eq!(slot_of("Game.slot4.state"), Some(4));
-        assert_eq!(slot_of("Game.slot7.deckhand.state"), None, "past the family's four");
-        assert_eq!(slot_of("Game [2026-07-01 10-00-00-000].deckhand.state"), None);
-        assert_eq!(slot_of("Game.slotmachine.state"), None);
-    }
+    fn a_slot_is_named_for_its_file_and_its_core_and_read_back_from_either() {
+        let stem = "Chrono Trigger (USA)";
+        for (file, slot) in [("state", Slot::Number(0)), ("state3", Slot::Number(3)), ("state120", Slot::Number(120)), ("state.auto", Slot::Auto)] {
+            let name = format!("{stem}.{file}");
+            assert_eq!(Slot::of_file(&name, stem), Some(slot), "{name}");
+            assert_eq!(slot.file(stem), name);
+            assert_eq!(Slot::of_remote(&slot.remote_name(stem, "mupen64plus_next")), Some((slot, "mupen64plus_next")));
+        }
+        assert_eq!(Slot::Number(3).remote_name(stem, "snes9x"), "Chrono Trigger (USA).slot3.snes9x.deckhand.state");
+        assert_eq!(Slot::Auto.remote_name("Game v1.1", "snes9x"), "Game v1.1.auto.snes9x.deckhand.state");
+        assert_eq!(Slot::of_remote("Game v1.1.auto.snes9x.deckhand.state"), Some((Slot::Auto, "snes9x")), "dots in the stem");
 
-    #[tokio::test]
-    async fn a_state_the_player_saved_in_a_history_slot_is_not_traded_for_romms() {
-        let device = Device::new("history-slot");
-        fs::create_dir_all(device.state("")).unwrap();
-        // RetroArch's slot is a number the player can wind as far as they like: slot 5 is theirs.
-        fs::write(device.state(&format!("{CHRONO}.state5")), "my own slot five").unwrap();
-        let states = serde_json::json!([
-            state(6, &format!("{CHRONO} [2026-07-01 10-00-00-000].deckhand.state"), "2026-07-01T10:00:00Z"),
-            state(5, &format!("{CHRONO} [2026-06-01 10-00-00-000].deckhand.state"), "2026-06-01T10:00:00Z"),
-        ]);
-        let host = stub_server::start(vec![
-            ("GET /api/saves", 200, "[]".into()),
-            ("GET /api/raw/assets/states/6.state", 200, "newest rolling".into()),
-            ("GET /api/raw/assets/states/5.state", 200, "older rolling".into()),
-            ("GET /api/states?rom_id=1", 200, states.to_string()),
-        ])
-        .await;
-        let report = device.sync(host).await;
+        for not_a_slot in ["state.png", "state3.png", "state.auto.png", "state0", "state07", "srm"] {
+            assert_eq!(Slot::of_file(&format!("{stem}.{not_a_slot}"), stem), None, "{not_a_slot}");
+        }
+        assert!(is_slot_of("Chrono Trigger (USA).state7", stem));
+        assert!(!is_slot_of("Secret of Mana (USA).state", stem), "another game's");
 
-        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state5"))).unwrap(), "my own slot five");
-        assert!(report.notes.iter().any(|n| n.contains(".state5")), "and it is said: {report:?}");
-        // Slot 0 is still RomM's newest — the player's own slots are the only ones held back.
-        assert_eq!(fs::read_to_string(device.state(&format!("{CHRONO}.state"))).unwrap(), "newest rolling");
+        // Names of other shapes are not read as a slot's own.
+        for other in [
+            "Game.slot2.deckhand.state",
+            "Game [2026-07-01 10-00-00-000].deckhand.state",
+            "Game.state",
+            "Game.slot2.snes 9x.deckhand.state",
+            "Game.slotmachine.snes9x.deckhand.state",
+        ] {
+            assert_eq!(Slot::of_remote(other), None, "{other}");
+        }
     }
 
     #[test]
-    fn a_state_file_is_recognised_as_its_games_slot() {
-        assert!(is_slot_of("Chrono Trigger (USA).state", "Chrono Trigger (USA)"));
-        assert!(is_slot_of("Chrono Trigger (USA).state.auto", "Chrono Trigger (USA)"));
-        assert!(is_slot_of("Chrono Trigger (USA).state7", "Chrono Trigger (USA)"));
-        assert!(!is_slot_of("Chrono Trigger (USA).state.png", "Chrono Trigger (USA)"), "a thumbnail is not a state");
-        assert!(!is_slot_of("Chrono Trigger (USA).srm", "Chrono Trigger (USA)"));
-        assert!(!is_slot_of("Secret of Mana (USA).state", "Chrono Trigger (USA)"));
-    }
-
-    #[test]
-    fn a_rolling_name_is_the_kotlin_apps_spelling() {
-        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1_782_900_000_123);
-        assert_eq!(rolling_name("Chrono", t), "Chrono [2026-07-01 10-00-00-123].deckhand.state");
-        assert!(is_own(&rolling_name("x", t)) && is_state(&rolling_name("x", t)));
+    fn the_old_names_are_read_for_the_slot_they_were() {
+        assert_eq!(old_slot("Chrono Trigger (USA).slot2.deckhand.state"), Some(2));
+        assert_eq!(old_slot("Game.slot4.romsync.state"), Some(4));
+        assert_eq!(old_slot("Game.slot4.state"), Some(4));
+        assert_eq!(old_slot("Game.slot7.deckhand.state"), None, "there were four");
+        assert_eq!(old_slot("Game.slot2.snes9x.deckhand.state"), None, "a slot's own name");
+        assert!(old_history("Game [2026-07-01 10-00-00-000].deckhand.state"));
+        assert!(!old_history("Game.slot2.deckhand.state"));
+        assert!(!old_history("Game.slot2.snes9x.deckhand.state"));
+        assert!(!old_history("Game.state"), "the web player's");
         assert!(!is_state("Game.p2s"));
     }
 

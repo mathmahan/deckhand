@@ -766,9 +766,9 @@ impl RommClient {
 
     /// Upload a save state (`POST /api/states`) under `file_name`, answering with RomM's record.
     ///
-    /// RomM keeps no history of states and prunes none, so a name is the whole identity: a rolling
-    /// state is uploaded under a fresh timestamped name and pruned by the caller, a slot under the
-    /// one name it always has.
+    /// RomM keeps one state per name for a game: under a name it has already, the upload replaces
+    /// that state where it is — the same id, new bytes and time, the emulator this upload names, and
+    /// the picture when one is sent (one not sent leaves the old). So a name is the whole identity.
     pub async fn upload_state(
         &self,
         conn: &Connection,
@@ -799,14 +799,6 @@ impl RommClient {
             .api(conn, reqwest::Method::POST, url)
             .multipart(form);
         self.execute_json(request).await
-    }
-
-    /// `POST /api/states/delete` — drop states from RomM, by id.
-    pub async fn delete_states(&self, conn: &Connection, ids: &[i64]) -> Result<()> {
-        let request = self
-            .post(conn, "/api/states/delete")
-            .json(&serde_json::json!({ "states": ids }));
-        self.execute(request).await.map(|_| ())
     }
 
     pub async fn upload_save(
