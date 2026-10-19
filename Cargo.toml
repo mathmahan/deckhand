@@ -4,7 +4,7 @@ version = "0.9.4"
 edition = "2024"
 rust-version = "1.93"  # edition 2024; sevenz-rust2 0.23 requires 1.93
 description = "A gamepad-first desktop companion for the RomM ROM manager — Rust/iced port"
-license = "GPL-3.0"
+license = "MIT"
 # Where new versions are published — see `release`.
 repository = "https://github.com/mathmahan/deckhand"
 

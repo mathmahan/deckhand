@@ -1,21 +1,27 @@
-//! A RomM that keeps state, for testing the save sync against: RomM 5.3.1's sync protocol ported from
-//! its own source (`endpoints/sync.py`, `handler/sync/comparison.py`, `endpoints/saves.py`) onto a
-//! real socket.
+//! A stand-in RomM for the save-sync tests — one that remembers, on a real socket.
 //!
-//! [`crate::stub_server`] answers canned responses, which tests one request at a time. A sync is a
-//! conversation — negotiate, transfer, acknowledge, complete — whose answers depend on what came
-//! before, and on what *other* devices did in between; testing it means a server that remembers.
-//! So this one holds rows, device records and sessions the way RomM does, decides the way RomM
-//! decides, and refuses what RomM refuses: a push to a slot whose newest version the pushing device
-//! has not synced (409), a negotiation from a device whose sync is off.
+//! [`crate::stub_server`] answers each request with a canned reply, which tests one request at a
+//! time. A sync is a conversation instead: the device says what it holds, the server says what to do
+//! about each save, files move, and the session is closed. What the server says depends on what came
+//! before — which versions exist, which of them each device last had, what another device did in the
+//! meantime — so testing it takes a server that keeps all of that.
 //!
-//! Its clock is its own and only moves when a test or a write moves it, a second at a time, so a test
-//! can say exactly how a device's file times sit against the server's.
+//! What this one keeps and decides is written from two sources only: RomM's published API description
+//! (`/openapi.json`, 5.4.0), for the requests and the shape of every answer, and what a real RomM 5.4
+//! was seen to answer in the cases the description leaves open — when a device's save counts as
+//! changed, when a push is refused, what happens to an open session. [`contract`] at the bottom of
+//! this file replays those observations against this server on every test run, and against a real
+//! RomM when one is named, so the two cannot drift apart unnoticed.
+//!
+//! Its clock is its own: it moves a second with every write, and otherwise only when a test moves
+//! it, so a test can place a device's file times exactly against the server's. Times are kept to the
+//! second, as RomM's database keeps them — though a push is answered with its time to the
+//! microsecond, as RomM answers it before the database has rounded it off.
 
 #![cfg(test)]
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
@@ -24,144 +30,151 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::sync::{format_timestamp_precise, hash, parse_timestamp};
 
-/// One version of one save.
+/// Where the clock starts: a September 2026 afternoon.
+const START: Duration = Duration::from_secs(1_790_000_000);
+
+/// One stored version of a save.
 #[derive(Debug, Clone)]
-pub struct Row {
+pub struct Version {
     pub id: i64,
     pub rom_id: i64,
     pub file_name: String,
+    /// None is a save kept apart from syncing — an archive copy, never paired with a device's save.
     pub slot: Option<String>,
     pub emulator: Option<String>,
     pub content_hash: String,
     pub updated_at: SystemTime,
     pub bytes: Vec<u8>,
+    /// The device that sent it, if one did.
     pub origin: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Synced {
-    at: SystemTime,
+/// What the server remembers of one device and one version.
+#[derive(Debug, Clone, Default)]
+struct Holding {
+    /// The version's time when the device last had it.
+    had: Option<SystemTime>,
+    /// The version's content when the device last had it: a device still listing that, after the
+    /// version was replaced, holds a version the server no longer has.
+    had_hash: Option<String>,
+    /// The device asked for the version to be left out of its syncs.
     untracked: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionRecord {
-    pub id: i64,
-    pub device_id: String,
-    pub status: &'static str,
-    pub completed: i64,
-    pub failed: i64,
+struct Session {
+    device: String,
+    open: bool,
+    completed: i64,
+    failed: i64,
 }
 
-#[derive(Debug, Default)]
-pub struct State {
-    pub now: Option<SystemTime>,
-    pub rows: Vec<Row>,
-    syncs: HashMap<(String, i64), Synced>,
-    pub sessions: Vec<SessionRecord>,
-    /// Device id → sync enabled.
-    pub devices: HashMap<String, bool>,
-    /// Play sessions taken: (rom id, start time, sync session id).
-    pub plays: Vec<(Option<i64>, String, Option<i64>)>,
+/// A play session taken in, and the sync session it came with, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Play {
+    pub rom_id: Option<i64>,
+    pub start: String,
+    pub session: Option<i64>,
+}
+
+/// Everything the server holds.
+#[derive(Debug)]
+struct Server {
+    clock: SystemTime,
+    versions: Vec<Version>,
+    holdings: HashMap<(String, i64), Holding>,
+    /// Every device the server knows, and whether its sync is on.
+    devices: HashMap<String, bool>,
+    sessions: BTreeMap<i64, Session>,
+    plays: Vec<Play>,
+    last_id: i64,
     /// Every request line, in order.
-    pub log: Vec<String>,
-    /// Every operation a negotiation answered, in order: (action, reason).
-    pub answered: Vec<(String, String)>,
-    /// When false, `/api/sync/*` is a route this RomM does not have.
-    pub no_sessions: bool,
-    /// Pushed by "another device" just before the next push from anyone — a race.
-    pub race: Option<(i64, String, Vec<u8>)>,
-    /// How many negotiations are answered before the rest fail — a server that goes away part way
-    /// through a library too big for one of them.
-    pub negotiations_before_failing: Option<usize>,
-    next_id: i64,
+    log: Vec<String>,
+    /// Every action a negotiation answered, in order.
+    answered: Vec<String>,
+    /// What a test has arranged: a server from before sync sessions, another device's push landing
+    /// just ahead of the next one, a server that stops answering negotiations.
+    legacy: bool,
+    racer: Option<(i64, String, Vec<u8>)>,
+    negotiations_left: Option<usize>,
 }
 
-impl State {
-    fn now(&self) -> SystemTime {
-        self.now.unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000))
-    }
-
-    /// Writes take a second each, as RomM's names for them (`[2026-07-01_10-00-00]`) need.
-    fn tick(&mut self) -> SystemTime {
-        let now = self.now() + Duration::from_secs(1);
-        self.now = Some(now);
-        now
-    }
-
-    fn id(&mut self) -> i64 {
-        self.next_id += 1;
-        self.next_id
-    }
-
-    fn sync(&mut self, device: &str, save_id: i64, at: SystemTime) {
-        let untracked = false;
-        self.syncs.insert((device.to_string(), save_id), Synced { at, untracked });
-    }
-
-    /// The newest version of every non-null slot in `scope`.
-    fn current(&self, scope: Option<&HashSet<i64>>) -> HashMap<(i64, String), &Row> {
-        let mut map: HashMap<(i64, String), &Row> = HashMap::new();
-        for row in &self.rows {
-            let Some(slot) = &row.slot else { continue };
-            if scope.is_some_and(|s| !s.contains(&row.rom_id)) {
-                continue;
-            }
-            let key = (row.rom_id, slot.clone());
-            if map.get(&key).is_none_or(|c| row.updated_at > c.updated_at) {
-                map.insert(key, row);
-            }
+impl Default for Server {
+    fn default() -> Self {
+        Server {
+            clock: SystemTime::UNIX_EPOCH + START,
+            versions: Vec::new(),
+            holdings: HashMap::new(),
+            devices: HashMap::new(),
+            sessions: BTreeMap::new(),
+            plays: Vec::new(),
+            last_id: 0,
+            log: Vec::new(),
+            answered: Vec::new(),
+            legacy: false,
+            racer: None,
+            negotiations_left: None,
         }
-        map
     }
 }
 
-/// A running fake RomM.
+/// A running stand-in RomM.
 pub struct FakeRomm {
     pub host: String,
-    pub state: Arc<Mutex<State>>,
+    server: Arc<Mutex<Server>>,
 }
 
 impl FakeRomm {
     pub async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind an ephemeral port");
-        let addr = listener.local_addr().expect("the bound address");
-        let state = Arc::new(Mutex::new(State::default()));
-        let shared = state.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a free local port");
+        let host = format!("http://{}", listener.local_addr().expect("the port it got"));
+        let server = Arc::new(Mutex::new(Server::default()));
+        let shared = server.clone();
         tokio::spawn(async move {
-            loop {
-                let Ok((socket, _)) = listener.accept().await else { break };
-                let state = shared.clone();
-                tokio::spawn(async move { serve(socket, state).await });
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(answer(socket, shared.clone()));
             }
         });
-        FakeRomm { host: format!("http://{addr}"), state }
+        FakeRomm { host, server }
     }
 
-    /// A device RomM knows, with its sync on.
+    fn lock(&self) -> MutexGuard<'_, Server> {
+        self.server.lock().unwrap()
+    }
+
+    /// Make `id` a device the server knows, with its sync on.
     pub fn device(&self, id: &str) {
-        self.state.lock().unwrap().devices.insert(id.to_string(), true);
+        self.lock().devices.insert(id.to_string(), true);
+    }
+
+    /// Turn `id`'s sync off, as its settings in RomM would.
+    pub fn sync_off(&self, id: &str) {
+        self.lock().devices.insert(id.to_string(), false);
+    }
+
+    /// Forget every device, as a rebuilt server would.
+    pub fn forget_devices(&self) {
+        self.lock().devices.clear();
     }
 
     pub fn now(&self) -> SystemTime {
-        self.state.lock().unwrap().now()
+        self.lock().clock
     }
 
     pub fn advance(&self, by: Duration) {
-        let mut state = self.state.lock().unwrap();
-        let now = state.now() + by;
-        state.now = Some(now);
+        self.lock().clock += by;
     }
 
-    /// A version pushed by another client, as RomM's own player would — straight into the slot.
+    /// A version sent straight into `slot` by some other client — another device, or the web player
+    /// — which then holds it. Answers its id.
     pub fn push_from(&self, device: Option<&str>, rom_id: i64, slot: &str, name: &str, bytes: &[u8]) -> i64 {
-        let mut state = self.state.lock().unwrap();
-        let at = state.tick();
-        let id = state.id();
-        state.rows.push(Row {
+        let mut server = self.lock();
+        let at = server.tick();
+        let id = server.next_id();
+        server.versions.push(Version {
             id,
             rom_id,
-            file_name: tagged(name, at),
+            file_name: stamped(name, at),
             slot: Some(slot.into()),
             emulator: Some("snes9x".into()),
             content_hash: hash::of_upload(bytes),
@@ -170,496 +183,898 @@ impl FakeRomm {
             origin: device.map(str::to_string),
         });
         if let Some(device) = device {
-            state.sync(device, id, at);
+            server.had(device, id);
         }
         id
     }
 
-    /// RomM's own player saving over a version in place: same id, new bytes, new time.
+    /// A version replaced where it is — same id, new bytes, new time — as the web player saves.
     pub fn rewrite(&self, save_id: i64, bytes: &[u8]) {
-        let mut state = self.state.lock().unwrap();
-        let at = state.tick();
-        let row = state.rows.iter_mut().find(|r| r.id == save_id).expect("a row to rewrite");
-        row.bytes = bytes.to_vec();
-        row.content_hash = hash::of_upload(bytes);
-        row.updated_at = at;
+        let mut server = self.lock();
+        server.replace(save_id, bytes.to_vec()).expect("a version to replace");
     }
 
-    /// The player deleting every version of a game's saves on RomM.
+    /// The bytes stored for `save_id` changed under the hash recorded for them — a damaged disk.
+    pub fn garble(&self, save_id: i64, bytes: &[u8]) {
+        let mut server = self.lock();
+        let version = server.versions.iter_mut().find(|v| v.id == save_id).expect("a version to damage");
+        version.bytes = bytes.to_vec();
+    }
+
+    /// Every version of a game's saves deleted on the server.
     pub fn delete_all(&self, rom_id: i64) {
-        self.state.lock().unwrap().rows.retain(|r| r.rom_id != rom_id);
+        self.lock().versions.retain(|v| v.rom_id != rom_id);
     }
 
     pub fn untrack(&self, device: &str, save_id: i64) {
-        let mut state = self.state.lock().unwrap();
-        let at = state.now();
-        state.syncs.entry((device.into(), save_id)).or_insert(Synced { at, untracked: true }).untracked = true;
+        self.lock().holdings.entry((device.into(), save_id)).or_default().untracked = true;
     }
 
-    pub fn rows(&self, rom_id: i64) -> Vec<Row> {
-        let mut rows: Vec<Row> = self.state.lock().unwrap().rows.iter().filter(|r| r.rom_id == rom_id).cloned().collect();
-        rows.sort_by_key(|r| r.updated_at);
-        rows
+    /// The next push from anyone is preceded by another device's, of `bytes` into `slot`.
+    pub fn race(&self, rom_id: i64, slot: &str, bytes: &[u8]) {
+        self.lock().racer = Some((rom_id, slot.into(), bytes.to_vec()));
     }
 
-    /// The newest version in a slot.
-    pub fn newest(&self, rom_id: i64, slot: &str) -> Option<Row> {
-        self.rows(rom_id).into_iter().filter(|r| r.slot.as_deref() == Some(slot)).max_by_key(|r| r.updated_at)
+    /// A RomM from before sync sessions: `/api/sync/` is not there.
+    pub fn without_sync_sessions(&self) {
+        self.lock().legacy = true;
     }
 
-    /// Whether RomM records `device` as holding `save_id`'s current version.
+    /// Answer `n` more negotiations, then fail every one after.
+    pub fn fail_negotiations_after(&self, n: usize) {
+        self.lock().negotiations_left = Some(n);
+    }
+
+    /// A game's versions, oldest first.
+    pub fn rows(&self, rom_id: i64) -> Vec<Version> {
+        let mut versions: Vec<Version> = self.lock().versions.iter().filter(|v| v.rom_id == rom_id).cloned().collect();
+        versions.sort_by_key(|v| v.updated_at);
+        versions
+    }
+
+    /// The version a slot is at now.
+    pub fn newest(&self, rom_id: i64, slot: &str) -> Option<Version> {
+        self.rows(rom_id).into_iter().rfind(|v| v.slot.as_deref() == Some(slot))
+    }
+
+    /// Whether the server has `device` holding `save_id` as it is now.
     pub fn holds(&self, device: &str, save_id: i64) -> bool {
-        let state = self.state.lock().unwrap();
-        let row = state.rows.iter().find(|r| r.id == save_id);
-        match (row, state.syncs.get(&(device.to_string(), save_id))) {
-            (Some(row), Some(synced)) => synced.at >= row.updated_at,
-            _ => false,
-        }
+        let server = self.lock();
+        let Some(version) = server.versions.iter().find(|v| v.id == save_id) else { return false };
+        server.holding(device, save_id).had.is_some_and(|had| had >= version.updated_at)
     }
 
-    /// The actions RomM's negotiations answered, in order.
+    /// The actions negotiations answered, in order.
     pub fn answered(&self) -> Vec<String> {
-        self.state.lock().unwrap().answered.iter().map(|(action, _)| action.clone()).collect()
+        self.lock().answered.clone()
     }
 
+    /// How many requests began with `prefix` — `POST /api/saves?`, say.
     pub fn requests(&self, prefix: &str) -> usize {
-        self.state.lock().unwrap().log.iter().filter(|l| l.starts_with(prefix)).count()
+        self.lock().log.iter().filter(|line| line.starts_with(prefix)).count()
+    }
+
+    /// Every request line, in order.
+    pub fn log(&self) -> Vec<String> {
+        self.lock().log.clone()
+    }
+
+    pub fn plays(&self) -> Vec<Play> {
+        self.lock().plays.clone()
+    }
+
+    /// How many sync sessions are still open.
+    pub fn open_sessions(&self) -> usize {
+        self.lock().sessions.values().filter(|s| s.open).count()
     }
 }
 
-/// RomM's datetime tag on a slotted upload: `Game [2026-07-01_10-00-00].srm`.
-fn tagged(name: &str, at: SystemTime) -> String {
-    let (stem, ext) = match name.rfind('.') {
-        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+/// `name` with the server's time in it, as a slotted save is stored: `Game [2026-07-01_10-00-00].srm`.
+fn stamped(name: &str, at: SystemTime) -> String {
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
         _ => (name, ""),
     };
-    let stamp = format_timestamp_precise(at);
-    let stamp = format!("{}_{}", &stamp[..10], stamp[11..19].replace(':', "-"));
-    format!("{stem} [{stamp}]{ext}")
+    let time = format_timestamp_precise(at);
+    let (date, clock) = (&time[..10], time[11..19].replace(':', "-"));
+    format!("{stem} [{date}_{clock}]{extension}")
 }
 
-fn row_json(row: &Row) -> Value {
-    json!({
-        "id": row.id,
-        "rom_id": row.rom_id,
-        "file_name": row.file_name,
-        "slot": row.slot,
-        "emulator": row.emulator,
-        "content_hash": row.content_hash,
-        "updated_at": iso(row.updated_at),
-        "file_size_bytes": row.bytes.len(),
-        "download_path": format!("/api/raw/assets/saves/{}", row.id),
-        "device_syncs": [],
-    })
+/// The server's way of writing a time: microseconds, and an offset rather than `Z`.
+fn written(at: SystemTime) -> String {
+    format_timestamp_precise(at).replace('Z', "+00:00")
 }
 
-/// RomM's own format: microseconds and an offset.
-fn iso(t: SystemTime) -> String {
-    format_timestamp_precise(t).replace('Z', "+00:00")
+fn not_found(what: &str) -> (u16, Value) {
+    (404, json!({ "detail": format!("{what} not found") }))
 }
 
-/// `handler/sync/comparison.py`'s `compare_save_state`, as 5.3.1 has it.
-fn compare(
-    client_hash: Option<&str>,
-    client_at: SystemTime,
-    server_hash: &str,
-    server_at: SystemTime,
-    synced: Option<SystemTime>,
-) -> (&'static str, &'static str) {
-    if client_hash == Some(server_hash) {
-        return ("no_op", "Content is identical");
+impl Server {
+    /// The clock moved on by a write.
+    fn tick(&mut self) -> SystemTime {
+        self.clock += Duration::from_secs(1);
+        self.clock
     }
-    if let Some(synced) = synced {
-        return match (client_at > synced, server_at > synced) {
-            (true, true) => ("conflict", "Both sides changed since last sync"),
-            (true, false) => ("upload", "Client save is newer than last sync"),
-            (false, true) => ("download", "Server save is newer than last sync"),
-            (false, false) => ("no_op", "No changes since last sync"),
-        };
-    }
-    if client_at > server_at {
-        ("upload", "Client save is newer (no sync history)")
-    } else if server_at > client_at {
-        ("download", "Server save is newer (no sync history)")
-    } else {
-        ("conflict", "Same timestamp but different content")
-    }
-}
 
-fn negotiate(state: &mut State, body: &Value) -> (u16, Value) {
-    if let Some(left) = &mut state.negotiations_before_failing {
-        match left.checked_sub(1) {
-            Some(fewer) => *left = fewer,
-            None => return (500, json!({ "detail": "Internal Server Error" })),
-        }
+    fn next_id(&mut self) -> i64 {
+        self.last_id += 1;
+        self.last_id
     }
-    let device = body["device_id"].as_str().unwrap_or_default().to_string();
-    match state.devices.get(&device) {
-        None => return (404, json!({ "detail": format!("Device with ID {device} not found") })),
-        Some(false) => return (400, json!({ "detail": "Sync is disabled for this device" })),
-        Some(true) => {}
-    }
-    for session in state.sessions.iter_mut().filter(|s| s.device_id == device && s.status == "in_progress") {
-        session.status = "cancelled";
-    }
-    let session_id = state.id();
-    state.sessions.push(SessionRecord { id: session_id, device_id: device.clone(), status: "in_progress", completed: 0, failed: 0 });
 
-    let saves = body["saves"].as_array().cloned().unwrap_or_default();
-    let scope: Option<HashSet<i64>> = body["rom_ids"].as_array().map(|ids| {
-        ids.iter().filter_map(Value::as_i64).chain(saves.iter().filter_map(|s| s["rom_id"].as_i64())).collect()
-    });
-    let current: HashMap<(i64, String), Row> =
-        state.current(scope.as_ref()).into_iter().map(|(k, v)| (k, v.clone())).collect();
-    let mut ops = Vec::new();
-    let mut matched = HashSet::new();
-    for save in &saves {
-        let rom_id = save["rom_id"].as_i64().unwrap_or_default();
-        let slot = save["slot"].as_str().map(str::to_string);
-        let found = slot.as_ref().and_then(|slot| current.get(&(rom_id, slot.clone())));
-        let Some(row) = found else {
-            ops.push(json!({ "action": "upload", "rom_id": rom_id, "save_id": null, "file_name": save["file_name"], "slot": slot,
-                             "emulator": save["emulator"], "reason": "Save exists on client but not on server" }));
-            continue;
-        };
-        matched.insert(row.id);
-        let synced = state.syncs.get(&(device.clone(), row.id)).copied();
-        if synced.is_some_and(|s| s.untracked) {
-            ops.push(op_json("no_op", row, "Save is untracked on this device"));
-            continue;
-        }
-        let client_at = save["updated_at"].as_str().and_then(parse_timestamp).unwrap_or(SystemTime::UNIX_EPOCH);
-        let (action, reason) = compare(save["content_hash"].as_str(), client_at, &row.content_hash, row.updated_at, synced.map(|s| s.at));
-        ops.push(op_json(action, row, reason));
+    fn holding(&self, device: &str, save_id: i64) -> Holding {
+        self.holdings.get(&(device.to_string(), save_id)).cloned().unwrap_or_default()
     }
-    for row in current.values().filter(|r| !matched.contains(&r.id)) {
-        match state.syncs.get(&(device.clone(), row.id)) {
-            Some(synced) if synced.untracked => {}
-            Some(synced) if row.updated_at <= synced.at => {}
-            Some(_) => ops.push(op_json("download", row, "Server save updated since last sync, not present on client")),
-            None => ops.push(op_json("download", row, "Save exists on server but not on client")),
-        }
-    }
-    for op in &ops {
-        state.answered.push((op["action"].as_str().unwrap_or_default().into(), op["reason"].as_str().unwrap_or_default().into()));
-    }
-    let count = |a: &str| ops.iter().filter(|o| o["action"] == a).count();
-    let body = json!({
-        "session_id": session_id,
-        "total_upload": count("upload"),
-        "total_download": count("download"),
-        "total_conflict": count("conflict"),
-        "total_no_op": count("no_op"),
-        "operations": ops,
-    });
-    (200, body)
-}
 
-fn op_json(action: &str, row: &Row, reason: &str) -> Value {
-    json!({
-        "action": action, "rom_id": row.rom_id, "save_id": row.id, "file_name": row.file_name, "slot": row.slot,
-        "emulator": row.emulator, "reason": reason, "server_updated_at": iso(row.updated_at),
-        "server_content_hash": row.content_hash,
-    })
-}
+    /// `device` now has `save_id` as it is.
+    fn had(&mut self, device: &str, save_id: i64) {
+        let Some(version) = self.versions.iter().find(|v| v.id == save_id) else { return };
+        let (at, hash) = (version.updated_at, version.content_hash.clone());
+        let holding = self.holdings.entry((device.to_string(), save_id)).or_default();
+        holding.had = Some(at);
+        holding.had_hash = Some(hash);
+    }
 
-/// `endpoints/saves.py`'s `add_save`, as 5.3.1 has it.
-fn upload(state: &mut State, query: &HashMap<String, String>, name: &str, bytes: Vec<u8>) -> (u16, Value) {
-    if let Some((rom_id, slot, race)) = state.race.take() {
-        let at = state.tick();
-        let id = state.id();
-        let content_hash = hash::of_upload(&race);
-        state.rows.push(Row { id, rom_id, file_name: tagged(name, at), slot: Some(slot), emulator: None, content_hash, updated_at: at, bytes: race, origin: Some("racer".into()) });
+    fn version_json(version: &Version) -> Value {
+        json!({
+            "id": version.id,
+            "rom_id": version.rom_id,
+            "file_name": version.file_name,
+            "slot": version.slot,
+            "emulator": version.emulator,
+            "content_hash": version.content_hash,
+            "updated_at": written(version.updated_at),
+            "file_size_bytes": version.bytes.len(),
+            "download_path": format!("/api/raw/assets/saves/{}", version.id),
+            "device_syncs": [],
+        })
     }
-    let rom_id: i64 = query.get("rom_id").and_then(|r| r.parse().ok()).unwrap_or_default();
-    let slot = query.get("slot").cloned();
-    let device = query.get("device_id").cloned();
-    let overwrite = query.get("overwrite").is_some_and(|v| v == "true");
-    if let Some(device) = &device
-        && !state.devices.contains_key(device)
-    {
-        return (404, json!({ "detail": format!("Device with ID {device} not found") }));
-    }
-    if let (Some(device), Some(slot), false) = (&device, &slot, overwrite) {
-        let latest = state.rows.iter().filter(|r| r.rom_id == rom_id && r.slot.as_ref() == Some(slot)).max_by_key(|r| r.updated_at);
-        if let Some(latest) = latest {
-            let synced = state.syncs.get(&(device.clone(), latest.id));
-            if synced.is_none_or(|s| s.at < latest.updated_at) {
-                return (409, json!({ "detail": "Slot has a newer save since your last sync" }));
+
+    /// The version each slot is at, for the games in `scope` (every game when there is none). Saves
+    /// with no slot are never in it: nothing is paired with them.
+    fn slots(&self, scope: Option<&HashSet<i64>>) -> BTreeMap<(i64, String), Version> {
+        let mut slots: BTreeMap<(i64, String), Version> = BTreeMap::new();
+        for version in &self.versions {
+            let Some(slot) = &version.slot else { continue };
+            if scope.is_some_and(|games| !games.contains(&version.rom_id)) {
+                continue;
+            }
+            let key = (version.rom_id, slot.clone());
+            if slots.get(&key).is_none_or(|at| version.updated_at > at.updated_at) {
+                slots.insert(key, version.clone());
             }
         }
+        slots
     }
-    let content_hash = hash::of_upload(&bytes);
-    let keep = query.get("autocleanup").filter(|v| *v == "true").map(|_| {
-        query.get("autocleanup_limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(10).max(1)
-    });
-    if let (Some(slot), false) = (&slot, overwrite)
-        && let Some(existing) = state.rows.iter().find(|r| r.rom_id == rom_id && r.slot.as_ref() == Some(slot) && r.content_hash == content_hash)
-    {
-        // Already there: that version comes back, nothing is stored, nobody is recorded as holding it.
-        let existing = existing.clone();
-        prune(state, rom_id, slot, keep);
-        return (200, row_json(&existing));
-    }
-    let at = state.tick();
-    let id = state.id();
-    let file_name = if slot.is_some() { tagged(name, at) } else { name.to_string() };
-    let row = Row {
-        id,
-        rom_id,
-        file_name,
-        slot: slot.clone(),
-        emulator: query.get("emulator").cloned(),
-        content_hash,
-        updated_at: at,
-        bytes,
-        origin: device.clone(),
-    };
-    state.rows.push(row.clone());
-    if let Some(device) = &device {
-        state.sync(device, id, at);
-    }
-    if let Some(session) = query.get("session_id").and_then(|s| s.parse::<i64>().ok())
-        && let Some(record) = state.sessions.iter_mut().find(|s| s.id == session)
-    {
-        record.completed += 1;
-    }
-    if let Some(slot) = &slot {
-        prune(state, rom_id, slot, keep);
-    }
-    (200, row_json(&row))
-}
 
-fn prune(state: &mut State, rom_id: i64, slot: &str, keep: Option<usize>) {
-    let Some(keep) = keep else { return };
-    let mut versions: Vec<(SystemTime, i64)> =
-        state.rows.iter().filter(|r| r.rom_id == rom_id && r.slot.as_deref() == Some(slot)).map(|r| (r.updated_at, r.id)).collect();
-    versions.sort_by(|a, b| b.cmp(a));
-    let gone: HashSet<i64> = versions.into_iter().skip(keep).map(|(_, id)| id).collect();
-    state.rows.retain(|r| !gone.contains(&r.id));
-}
-
-fn complete(state: &mut State, session_id: i64, body: &Value) -> (u16, Value) {
-    let Some(index) = state.sessions.iter().position(|s| s.id == session_id) else {
-        return (404, json!({ "detail": format!("Sync session with ID {session_id} not found") }));
-    };
-    if state.sessions[index].status != "in_progress" {
-        return (400, json!({ "detail": format!("Session is already {}", state.sessions[index].status) }));
-    }
-    let session = &mut state.sessions[index];
-    session.status = "completed";
-    session.completed = body["operations_completed"].as_i64().unwrap_or_default();
-    session.failed = body["operations_failed"].as_i64().unwrap_or_default();
-    let mut results = Vec::new();
-    for (i, play) in body["play_sessions"].as_array().cloned().unwrap_or_default().iter().enumerate() {
-        let key = (play["rom_id"].as_i64(), play["start_time"].as_str().unwrap_or_default().to_string());
-        let duplicate = state.plays.iter().any(|(rom, start, _)| (*rom, start.clone()) == key);
-        if !duplicate {
-            state.plays.push((key.0, key.1, Some(session_id)));
+    /// `POST /api/sync/negotiate`: what the device should do about each of its saves, and about each
+    /// slot it did not mention.
+    fn negotiate(&mut self, body: &Value) -> (u16, Value) {
+        if let Some(left) = self.negotiations_left.as_mut() {
+            if *left == 0 {
+                return (500, json!({ "detail": "the server failed" }));
+            }
+            *left -= 1;
         }
-        results.push(json!({ "index": i, "status": if duplicate { "duplicate" } else { "created" } }));
+        let device = body["device_id"].as_str().unwrap_or_default().to_string();
+        match self.devices.get(&device) {
+            None => return not_found(&format!("Device {device}")),
+            // Deckhand tells this refusal from others by the word "disabled", as RomM words it.
+            Some(false) => return (400, json!({ "detail": "this device has sync disabled" })),
+            Some(true) => {}
+        }
+        // Seen of RomM 5.4: a new negotiation leaves any session the device still has open alone.
+        let session_id = self.next_id();
+        self.sessions.insert(session_id, Session { device: device.clone(), open: true, completed: 0, failed: 0 });
+
+        let listed = body["saves"].as_array().cloned().unwrap_or_default();
+        let scope: Option<HashSet<i64>> = body["rom_ids"]
+            .as_array()
+            .map(|games| games.iter().chain(listed.iter().map(|save| &save["rom_id"])).filter_map(Value::as_i64).collect());
+        let slots = self.slots(scope.as_ref());
+        let mut operations = Vec::new();
+        let mut mentioned = HashSet::new();
+        for save in &listed {
+            let rom_id = save["rom_id"].as_i64().unwrap_or_default();
+            let slot = save["slot"].as_str();
+            let Some(version) = slot.and_then(|slot| slots.get(&(rom_id, slot.to_string()))) else {
+                operations.push(json!({
+                    "action": "upload", "rom_id": rom_id, "save_id": null, "file_name": save["file_name"],
+                    "slot": save["slot"], "emulator": save["emulator"], "reason": "on the device, not on the server",
+                }));
+                continue;
+            };
+            mentioned.insert(version.id);
+            let device_time = save["updated_at"].as_str().and_then(parse_timestamp).unwrap_or(SystemTime::UNIX_EPOCH);
+            let holding = self.holding(&device, version.id);
+            let device_hash = save["content_hash"].as_str();
+            // Seen of RomM 5.4: the same content on both sides is taken as the device having the
+            // version, from then on.
+            if !holding.untracked && device_hash == Some(version.content_hash.as_str()) {
+                self.had(&device, version.id);
+            }
+            let (action, reason) = decide(device_hash, device_time, version, &holding);
+            operations.push(operation(action, version, reason));
+        }
+        for version in slots.values().filter(|v| !mentioned.contains(&v.id)) {
+            let holding = self.holding(&device, version.id);
+            match holding.had {
+                _ if holding.untracked => {}
+                Some(had) if had >= version.updated_at => {}
+                Some(_) => operations.push(operation("download", version, "updated on the server since this device last had it")),
+                None => operations.push(operation("download", version, "on the server, not on the device")),
+            }
+        }
+        self.answered.extend(operations.iter().map(|op| op["action"].as_str().unwrap_or_default().to_string()));
+        let total = |action: &str| operations.iter().filter(|op| op["action"] == action).count();
+        let answer = json!({
+            "session_id": session_id,
+            "total_upload": total("upload"),
+            "total_download": total("download"),
+            "total_conflict": total("conflict"),
+            "total_no_op": total("no_op"),
+            "total_delete": total("delete"),
+            "operations": operations,
+        });
+        (200, answer)
     }
-    (200, json!({ "session": { "id": session_id }, "play_session_ingest": { "results": results } }))
+
+    /// `POST /api/saves`: a version stored, or refused.
+    fn store(&mut self, query: &HashMap<String, String>, name: &str, bytes: Vec<u8>) -> (u16, Value) {
+        if let Some((rom_id, slot, racing)) = self.racer.take() {
+            let at = self.tick();
+            let id = self.next_id();
+            let content_hash = hash::of_upload(&racing);
+            let file_name = stamped(name, at);
+            self.versions.push(Version { id, rom_id, file_name, slot: Some(slot), emulator: None, content_hash, updated_at: at, bytes: racing, origin: Some("another device".into()) });
+        }
+        let rom_id: i64 = query.get("rom_id").and_then(|id| id.parse().ok()).unwrap_or_default();
+        let slot = query.get("slot").cloned();
+        let device = query.get("device_id").cloned();
+        let overwrite = query.get("overwrite").is_some_and(|v| v == "true");
+        if let Some(device) = &device
+            && !self.devices.contains_key(device)
+        {
+            return not_found(&format!("Device {device}"));
+        }
+        let newest = slot.as_ref().and_then(|slot| self.slots(Some(&HashSet::from([rom_id]))).remove(&(rom_id, slot.clone())));
+        // Seen of RomM 5.4: a device that has not had the slot's newest version may not push over it
+        // unless it says to overwrite.
+        if let (Some(device), Some(newest), false) = (&device, &newest, overwrite)
+            && self.holding(device, newest.id).had.is_none_or(|had| had < newest.updated_at)
+        {
+            return (409, json!({ "detail": "this device has not had the version the slot is at" }));
+        }
+        let content_hash = hash::of_upload(&bytes);
+        // Seen of RomM 5.4: the same content into the same slot again is the version already there.
+        if !overwrite
+            && let Some(slot) = &slot
+            && let Some(same) = self.versions.iter().find(|v| v.rom_id == rom_id && v.slot.as_ref() == Some(slot) && v.content_hash == content_hash)
+        {
+            return (200, Self::version_json(same));
+        }
+        let at = self.tick();
+        let id = self.next_id();
+        let file_name = if slot.is_some() { stamped(name, at) } else { name.to_string() };
+        let version = Version { id, rom_id, file_name, slot: slot.clone(), emulator: query.get("emulator").cloned(), content_hash, updated_at: at, bytes, origin: device.clone() };
+        let mut answer = Self::version_json(&version);
+        // Answered before the database rounds the time off to the second it keeps.
+        answer["updated_at"] = json!(written(at + Duration::from_micros(516_854)));
+        self.versions.push(version);
+        if let Some(device) = &device {
+            self.had(device, id);
+        }
+        self.count_in(query);
+        if let (Some(slot), Some("true")) = (&slot, query.get("autocleanup").map(String::as_str)) {
+            let keep = query.get("autocleanup_limit").and_then(|n| n.parse().ok()).unwrap_or(10usize).max(1);
+            self.keep_newest(rom_id, slot, keep);
+        }
+        (200, answer)
+    }
+
+    /// The `keep` newest versions of a slot stay; the rest go.
+    fn keep_newest(&mut self, rom_id: i64, slot: &str, keep: usize) {
+        let mut times: Vec<SystemTime> = self.versions.iter().filter(|v| v.rom_id == rom_id && v.slot.as_deref() == Some(slot)).map(|v| v.updated_at).collect();
+        times.sort_unstable_by(|a, b| b.cmp(a));
+        if let Some(&oldest_kept) = times.get(keep - 1) {
+            self.versions.retain(|v| !(v.rom_id == rom_id && v.slot.as_deref() == Some(slot) && v.updated_at < oldest_kept));
+        }
+    }
+
+    /// `PUT /api/saves/{id}`: new bytes for a version where it is, at a new time.
+    fn replace(&mut self, save_id: i64, bytes: Vec<u8>) -> Option<Value> {
+        let at = self.tick();
+        let version = self.versions.iter_mut().find(|v| v.id == save_id)?;
+        version.content_hash = hash::of_upload(&bytes);
+        version.bytes = bytes;
+        version.updated_at = at;
+        Some(Self::version_json(version))
+    }
+
+    /// A transfer made as part of a sync session counts towards it.
+    fn count_in(&mut self, query: &HashMap<String, String>) {
+        if let Some(session) = query.get("session_id").and_then(|id| id.parse::<i64>().ok()).and_then(|id| self.sessions.get_mut(&id)) {
+            session.completed += 1;
+        }
+    }
+
+    /// `POST /api/sync/sessions/{id}/complete`, with the play sessions it brings.
+    fn complete(&mut self, session_id: i64, body: &Value) -> (u16, Value) {
+        let Some(session) = self.sessions.get_mut(&session_id) else { return not_found(&format!("Sync session {session_id}")) };
+        if !session.open {
+            return (400, json!({ "detail": "the session is already COMPLETED" }));
+        }
+        session.open = false;
+        session.completed = body["operations_completed"].as_i64().unwrap_or_default();
+        session.failed = body["operations_failed"].as_i64().unwrap_or_default();
+        let entries = body["play_sessions"].as_array().cloned().unwrap_or_default();
+        let results: Vec<Value> = entries.iter().enumerate().map(|(index, entry)| json!({ "index": index, "status": self.ingest(entry, Some(session_id)) })).collect();
+        let session = self.session_json(session_id);
+        (200, json!({ "session": session, "play_session_ingest": { "results": results } }))
+    }
+
+    /// One play session in, unless the same game's session from the same start is in already.
+    fn ingest(&mut self, entry: &Value, session: Option<i64>) -> &'static str {
+        let play = Play { rom_id: entry["rom_id"].as_i64(), start: entry["start_time"].as_str().unwrap_or_default().to_string(), session };
+        if self.plays.iter().any(|p| p.rom_id == play.rom_id && p.start == play.start) {
+            return "duplicate";
+        }
+        self.plays.push(play);
+        "created"
+    }
+
+    fn session_json(&self, id: i64) -> Value {
+        let session = &self.sessions[&id];
+        json!({
+            "id": id,
+            "device_id": session.device,
+            "status": if session.open { "IN_PROGRESS" } else { "COMPLETED" },
+            "operations_completed": session.completed,
+            "operations_failed": session.failed,
+        })
+    }
+
+    /// One request, answered: a status, and JSON or a file's bytes.
+    fn route(&mut self, method: &str, path: &str, query: &HashMap<String, String>, headers: &str, body: Vec<u8>) -> (u16, Value, Option<Vec<u8>>) {
+        let json_body = || serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+        let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+        if self.legacy && path.starts_with("/api/sync/") {
+            return (404, json!({ "detail": "Not Found" }), None);
+        }
+        let id = |text: &str| text.parse::<i64>().unwrap_or_default();
+        let (status, value) = match (method, parts.as_slice()) {
+            ("POST", ["api", "sync", "negotiate"]) => self.negotiate(&json_body()),
+            ("POST", ["api", "sync", "sessions", session, "complete"]) => self.complete(id(session), &json_body()),
+            ("GET", ["api", "sync", "sessions", session]) => match self.sessions.contains_key(&id(session)) {
+                true => (200, self.session_json(id(session))),
+                false => not_found(&format!("Sync session {session}")),
+            },
+            ("POST", ["api", "saves"]) => match save_file(headers, &body) {
+                Some((name, bytes)) => self.store(query, &name, bytes),
+                None => (422, json!({ "detail": "a saveFile part is needed" })),
+            },
+            ("PUT", ["api", "saves", save]) => match save_file(headers, &body).and_then(|(_, bytes)| self.replace(id(save), bytes)) {
+                Some(version) => (200, version),
+                None => not_found(&format!("Save {save}")),
+            },
+            ("GET", ["api", "saves"]) => {
+                let rom_id: Option<i64> = query.get("rom_id").and_then(|r| r.parse().ok());
+                let slot = query.get("slot");
+                let listed = self.versions.iter().filter(|v| rom_id.is_none_or(|r| v.rom_id == r) && slot.is_none_or(|s| v.slot.as_ref() == Some(s)));
+                (200, Value::Array(listed.map(Self::version_json).collect()))
+            }
+            ("GET", ["api", "saves", save, "content"]) => {
+                let Some(version) = self.versions.iter().find(|v| v.id == id(save)).cloned() else { return (404, json!({ "detail": "Not Found" }), None) };
+                // Unless asked not to, the server takes a download as had, without waiting to be told.
+                if let Some(device) = query.get("device_id")
+                    && query.get("optimistic").is_none_or(|v| v != "false")
+                {
+                    self.had(device, version.id);
+                }
+                self.count_in(query);
+                return (200, Value::Null, Some(version.bytes));
+            }
+            ("GET", ["api", "raw", "assets", "saves", save]) => match self.versions.iter().find(|v| v.id == id(save)) {
+                Some(version) => return (200, Value::Null, Some(version.bytes.clone())),
+                None => (404, json!({ "detail": "Not Found" })),
+            },
+            ("POST", ["api", "saves", save, "downloaded"]) => {
+                let device = json_body()["device_id"].as_str().unwrap_or_default().to_string();
+                match self.versions.iter().any(|v| v.id == id(save)) {
+                    true => {
+                        self.had(&device, id(save));
+                        (200, json!({ "id": id(save) }))
+                    }
+                    false => not_found(&format!("Save {save}")),
+                }
+            }
+            ("POST", ["api", "saves", save, "untrack"]) => {
+                let device = json_body()["device_id"].as_str().unwrap_or_default().to_string();
+                self.holdings.entry((device, id(save))).or_default().untracked = true;
+                (200, json!({ "id": id(save) }))
+            }
+            ("POST", ["api", "saves", "delete"]) => {
+                let ids: Vec<i64> = json_body()["saves"].as_array().map(|ids| ids.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
+                // Seen of RomM 5.4: one id it does not have refuses the whole request.
+                match ids.iter().find(|id| !self.versions.iter().any(|v| v.id == **id)) {
+                    Some(missing) => not_found(&format!("Save {missing}")),
+                    None => {
+                        self.versions.retain(|v| !ids.contains(&v.id));
+                        (200, json!(ids))
+                    }
+                }
+            }
+            ("GET", ["api", "states"]) => (200, json!([])),
+            ("GET", ["api", "devices"]) => (200, Value::Array(self.devices.keys().map(|id| json!({ "id": id })).collect())),
+            ("POST", ["api", "devices"]) => {
+                let id = format!("device-{}", self.next_id());
+                self.devices.insert(id.clone(), true);
+                (201, json!({ "device_id": id, "name": json_body()["name"], "created_at": written(self.clock) }))
+            }
+            ("PUT", ["api", "devices", device]) => match (self.devices.get_mut(*device), json_body()["sync_enabled"].as_bool()) {
+                (Some(on), Some(sync)) => {
+                    *on = sync;
+                    (200, json!({ "id": device, "sync_enabled": sync }))
+                }
+                (Some(on), None) => (200, json!({ "id": device, "sync_enabled": *on })),
+                (None, _) => not_found(&format!("Device {device}")),
+            },
+            ("DELETE", ["api", "devices", device]) => match self.devices.remove(*device) {
+                Some(_) => return (204, Value::Null, Some(Vec::new())),
+                None => not_found(&format!("Device {device}")),
+            },
+            ("POST", ["api", "play-sessions"]) => {
+                let entries = json_body()["sessions"].as_array().cloned().unwrap_or_default();
+                let results: Vec<Value> = entries.iter().enumerate().map(|(index, entry)| json!({ "index": index, "status": self.ingest(entry, None) })).collect();
+                (201, json!({ "results": results }))
+            }
+            _ => (404, json!({ "detail": "Not Found" })),
+        };
+        (status, value, None)
+    }
 }
 
-async fn serve(mut socket: TcpStream, state: Arc<Mutex<State>>) {
-    let Some((line, headers, body)) = read(&mut socket).await else { return };
-    let (status, content, bytes) = {
-        let mut state = state.lock().unwrap();
-        state.log.push(line.clone());
-        route(&mut state, &line, &headers, body)
+/// What a device's listed save and the version its slot is at call for, with why — the rules seen of
+/// RomM 5.4.
+///
+/// Content the same on both sides needs nothing. A device still listing what it last had of a version
+/// since replaced takes the replacement. Otherwise, when the device has had this version, each side
+/// counts as changed if its time is past the version's time when the device had it: one side changed
+/// moves that side's copy over, both changed is a conflict, neither is nothing. When the device never
+/// had this version, the later time wins, and the same time is a conflict.
+fn decide(device_hash: Option<&str>, device_time: SystemTime, version: &Version, holding: &Holding) -> (&'static str, &'static str) {
+    if holding.untracked {
+        return ("no_op", "untracked: this device asked to be left out of this save's syncs");
+    }
+    if device_hash == Some(version.content_hash.as_str()) {
+        return ("no_op", "the same content on both sides");
+    }
+    if device_hash.is_some() && device_hash == holding.had_hash.as_deref() && holding.had.is_some_and(|had| version.updated_at > had) {
+        return ("download", "the device holds a version the server has since replaced");
+    }
+    match holding.had {
+        Some(had) => match (device_time > had, version.updated_at > had) {
+            (true, true) => ("conflict", "changed on the device and on the server since they last agreed"),
+            (true, false) => ("upload", "changed on the device since it last had this version"),
+            (false, true) => ("download", "changed on the server since this device last had it"),
+            (false, false) => ("no_op", "unchanged on both sides since they last agreed"),
+        },
+        None if device_time > version.updated_at => ("upload", "no shared history, and the device's copy is newer"),
+        None if device_time < version.updated_at => ("download", "no shared history, and the server's copy is newer"),
+        None => ("conflict", "no shared history, the same time, and different content"),
+    }
+}
+
+fn operation(action: &str, version: &Version, reason: &str) -> Value {
+    json!({
+        "action": action, "rom_id": version.rom_id, "save_id": version.id, "file_name": version.file_name,
+        "slot": version.slot, "emulator": version.emulator, "reason": reason,
+        "server_updated_at": written(version.updated_at), "server_content_hash": version.content_hash,
+    })
+}
+
+/// Serve one connection: read its request, answer it, close.
+async fn answer(mut socket: TcpStream, server: Arc<Mutex<Server>>) {
+    let Some((line, headers, body)) = request(&mut socket).await else { return };
+    let (status, value, bytes) = {
+        let mut server = server.lock().unwrap();
+        server.log.push(line.clone());
+        let mut words = line.split_whitespace();
+        let (method, target) = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+        server.route(method, path, &query_pairs(query), &headers, body)
     };
     let (kind, payload) = match bytes {
         Some(bytes) => ("application/octet-stream", bytes),
-        None => ("application/json", content.to_string().into_bytes()),
+        None => ("application/json", value.to_string().into_bytes()),
     };
-    let head = format!("HTTP/1.1 {status} OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
+    let head = format!("HTTP/1.1 {status} Answer\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len());
     let _ = socket.write_all(head.as_bytes()).await;
     let _ = socket.write_all(&payload).await;
     let _ = socket.flush().await;
 }
 
-/// Status, JSON, or raw bytes for a download.
-fn route(state: &mut State, line: &str, headers: &str, body: Vec<u8>) -> (u16, Value, Option<Vec<u8>>) {
-    let mut words = line.split_whitespace();
-    let (method, target) = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let query: HashMap<String, String> = url::form_urlencoded_parse(query);
-    let json_body = || serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-
-    if path.starts_with("/api/sync/") && state.no_sessions {
-        return (404, json!({ "detail": "Not Found" }), None);
+/// Read a whole request off `socket`: its first line, the header lines after it, and the body its
+/// `Content-Length` says it has.
+async fn request(socket: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
+    let mut read = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let head_end = loop {
+        let n = socket.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        read.extend_from_slice(&chunk[..n]);
+        if let Some(end) = position(&read, b"\r\n\r\n") {
+            break end;
+        }
+    };
+    let head = String::from_utf8_lossy(&read[..head_end]).into_owned();
+    let length: usize = head
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse().ok())
+        .unwrap_or(0);
+    while read.len() < head_end + 4 + length {
+        let n = socket.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        read.extend_from_slice(&chunk[..n]);
     }
-    match (method, segments.as_slice()) {
-        ("POST", ["api", "sync", "negotiate"]) => {
-            let (status, value) = negotiate(state, &json_body());
-            (status, value, None)
-        }
-        ("POST", ["api", "sync", "sessions", id, "complete"]) => {
-            let (status, value) = complete(state, id.parse().unwrap_or_default(), &json_body());
-            (status, value, None)
-        }
-        ("POST", ["api", "saves"]) => match multipart(headers, &body) {
-            Some((name, bytes)) => {
-                let (status, value) = upload(state, &query, &name, bytes);
-                (status, value, None)
-            }
-            None => (422, json!({ "detail": "no saveFile" }), None),
-        },
-        ("GET", ["api", "saves"]) => {
-            let rom_id: Option<i64> = query.get("rom_id").and_then(|r| r.parse().ok());
-            let slot = query.get("slot");
-            let rows: Vec<Value> = state
-                .rows
-                .iter()
-                .filter(|r| rom_id.is_none_or(|id| r.rom_id == id) && slot.is_none_or(|s| r.slot.as_ref() == Some(s)))
-                .map(row_json)
-                .collect();
-            (200, Value::Array(rows), None)
-        }
-        ("GET", ["api", "saves", id, "content"]) => {
-            let id: i64 = id.parse().unwrap_or_default();
-            let Some(row) = state.rows.iter().find(|r| r.id == id).cloned() else {
-                return (404, json!({ "detail": format!("Save with ID {id} not found") }), None);
-            };
-            let optimistic = query.get("optimistic").is_none_or(|v| v != "false");
-            if let Some(device) = query.get("device_id")
-                && optimistic
-            {
-                state.sync(device, id, row.updated_at);
-            }
-            if let Some(session) = query.get("session_id").and_then(|s| s.parse::<i64>().ok())
-                && let Some(record) = state.sessions.iter_mut().find(|s| s.id == session)
-            {
-                record.completed += 1;
-            }
-            (200, Value::Null, Some(row.bytes))
-        }
-        ("GET", ["api", "raw", "assets", "saves", id]) => {
-            let id: i64 = id.parse().unwrap_or_default();
-            match state.rows.iter().find(|r| r.id == id) {
-                Some(row) => (200, Value::Null, Some(row.bytes.clone())),
-                None => (404, json!({ "detail": "Not Found" }), None),
-            }
-        }
-        ("POST", ["api", "saves", id, "downloaded"]) => {
-            let id: i64 = id.parse().unwrap_or_default();
-            let device = json_body()["device_id"].as_str().unwrap_or_default().to_string();
-            let Some(at) = state.rows.iter().find(|r| r.id == id).map(|r| r.updated_at) else {
-                return (404, json!({ "detail": format!("Save with ID {id} not found") }), None);
-            };
-            state.sync(&device, id, at);
-            (200, json!({ "id": id }), None)
-        }
-        ("GET", ["api", "states"]) => (200, json!([]), None),
-        ("GET", ["api", "devices"]) => {
-            let ids: Vec<Value> = state.devices.keys().map(|id| json!({ "id": id })).collect();
-            (200, Value::Array(ids), None)
-        }
-        ("POST", ["api", "play-sessions"]) => {
-            for play in json_body()["sessions"].as_array().cloned().unwrap_or_default() {
-                state.plays.push((play["rom_id"].as_i64(), play["start_time"].as_str().unwrap_or_default().to_string(), None));
-            }
-            (201, json!({ "results": [] }), None)
-        }
-        _ => (404, json!({ "detail": "Not Found" }), None),
-    }
+    let (line, headers) = head.split_once("\r\n").unwrap_or((&head, ""));
+    Some((line.to_string(), headers.to_string(), read[head_end + 4..].to_vec()))
 }
 
-/// The `saveFile` part of a multipart body: its file name and bytes.
-fn multipart(headers: &str, body: &[u8]) -> Option<(String, Vec<u8>)> {
-    let boundary = headers.lines().find_map(|l| {
-        let (name, value) = l.split_once(':')?;
-        (name.trim().eq_ignore_ascii_case("content-type")).then_some(value)?.split("boundary=").nth(1).map(|b| b.trim().trim_matches('"').to_string())
-    })?;
-    let delimiter = format!("--{boundary}").into_bytes();
-    let mut parts = Vec::new();
+/// The file sent as a multipart body's `saveFile` part: its name and bytes.
+fn save_file(headers: &str, body: &[u8]) -> Option<(String, Vec<u8>)> {
+    let content_type = headers.lines().filter_map(|l| l.split_once(':')).find(|(name, _)| name.trim().eq_ignore_ascii_case("content-type"))?.1;
+    let boundary = content_type.split(';').find_map(|p| p.trim().strip_prefix("boundary="))?.trim_matches('"');
+    let separator = format!("--{boundary}");
     let mut rest = body;
-    while let Some(at) = find(rest, &delimiter) {
-        rest = &rest[at + delimiter.len()..];
-        parts.push(rest);
-    }
-    for part in parts {
-        let head_end = find(part, b"\r\n\r\n")?;
-        let head = String::from_utf8_lossy(&part[..head_end]);
-        if !head.contains("name=\"saveFile\"") {
-            continue;
+    while let Some(at) = position(rest, separator.as_bytes()) {
+        rest = &rest[at + separator.len()..];
+        let Some(head_end) = position(rest, b"\r\n\r\n") else { break };
+        let head = String::from_utf8_lossy(&rest[..head_end]);
+        let content = &rest[head_end + 4..];
+        let end = position(content, separator.as_bytes()).map_or(content.len(), |e| e.saturating_sub(2));
+        if head.contains("name=\"saveFile\"") {
+            let name = head.split("filename=\"").nth(1)?.split('"').next()?.to_string();
+            return Some((name, content[..end].to_vec()));
         }
-        let name = head.split("filename=\"").nth(1)?.split('"').next()?.to_string();
-        let content = &part[head_end + 4..];
-        let end = find(content, &delimiter).map_or(content.len(), |e| e.saturating_sub(2));
-        return Some((name, content[..end].to_vec()));
     }
     None
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|window| window == needle)
 }
 
-/// One whole request: its line, its headers, its body.
-async fn read(socket: &mut TcpStream) -> Option<(String, String, Vec<u8>)> {
-    let mut request = Vec::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = socket.read(&mut buf).await.ok()?;
-        if n == 0 {
-            break;
-        }
-        request.extend_from_slice(&buf[..n]);
-        let Some(end) = find(&request, b"\r\n\r\n") else { continue };
-        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
-        let length = head
-            .lines()
-            .find_map(|l| l.strip_prefix("content-length:"))
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        if request.len() >= end + 4 + length {
-            break;
-        }
-    }
-    let end = find(&request, b"\r\n\r\n")?;
-    let head = String::from_utf8_lossy(&request[..end]).into_owned();
-    let line = head.lines().next().unwrap_or_default().to_string();
-    let headers = head.lines().skip(1).collect::<Vec<_>>().join("\n");
-    Some((line, headers, request[end + 4..].to_vec()))
-}
-
-mod url {
-    use std::collections::HashMap;
-
-    /// `a=1&b=x%20y` into a map, percent-decoded.
-    pub fn form_urlencoded_parse(query: &str) -> HashMap<String, String> {
-        query
-            .split('&')
-            .filter(|p| !p.is_empty())
-            .filter_map(|p| p.split_once('=').or(Some((p, ""))))
-            .map(|(k, v)| (decode(k), decode(v)))
-            .collect()
-    }
-
-    fn decode(s: &str) -> String {
-        let bytes = s.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
+/// `a=1&b=x%20y` as pairs, with `%XX` and `+` turned back into what they stand for.
+fn query_pairs(query: &str) -> HashMap<String, String> {
+    fn unescape(text: &str) -> String {
+        let mut out = Vec::with_capacity(text.len());
+        let mut bytes = text.bytes();
+        while let Some(byte) = bytes.next() {
+            match byte {
                 b'+' => out.push(b' '),
-                b'%' if i + 2 < bytes.len() => {
-                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
-                    match hex {
-                        Some(b) => {
-                            out.push(b);
-                            i += 2;
+                b'%' => {
+                    let pair = [bytes.next(), bytes.next()];
+                    let hex = pair.iter().flatten().map(|&b| b as char).collect::<String>();
+                    match u8::from_str_radix(&hex, 16) {
+                        Ok(decoded) if hex.len() == 2 => out.push(decoded),
+                        _ => {
+                            out.push(b'%');
+                            out.extend(hex.bytes());
                         }
-                        None => out.push(b'%'),
                     }
                 }
-                b => out.push(b),
+                other => out.push(other),
             }
-            i += 1;
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+    query.split('&').filter(|pair| !pair.is_empty()).map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        (unescape(key), unescape(value))
+    }).collect()
+}
+
+/// The observations this server is built on, replayed: one conversation of throwaway devices with a
+/// save in a slot of its own, whose every answer is checked against what a real RomM 5.4 gave.
+///
+/// It runs against this server on every test run. Against a real RomM it runs only when asked —
+///
+/// ```text
+/// DECKHAND_LIVE_ROMM=1 DECKHAND_LIVE_ROMM_ROM=<a game's id> cargo test -- --ignored a_real_romm
+/// ```
+///
+/// — using the pairing in Deckhand's own settings, so the server's address is in no file here. It
+/// registers its own devices and keeps to a slot no client uses, so nothing it does meets a real save,
+/// and it removes its saves and devices when it is done. The sync sessions it opened stay in RomM's
+/// history, as any client's do.
+mod contract {
+    use super::*;
+
+    const SLOT: &str = "deckhand-contract-check";
+
+    /// A RomM to talk to, plain HTTP: what this checks is the server, not Deckhand's client.
+    struct Api {
+        http: reqwest::Client,
+        host: String,
+        token: String,
+        rom: i64,
+        /// A real server's times are its own; a pause keeps two writes from landing in one second.
+        live: bool,
+        devices: Mutex<Vec<String>>,
+    }
+
+    impl Api {
+        async fn call(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+            let mut request = self.http.request(method, format!("{}{path}", self.host)).bearer_auth(&self.token);
+            if let Some(body) = body {
+                request = request.json(&body);
+            }
+            let response = request.send().await.expect("the server to answer");
+            let status = response.status().as_u16();
+            (status, response.json().await.unwrap_or(Value::Null))
+        }
+
+        async fn device(&self, name: &str) -> String {
+            let body = json!({ "name": name, "client": SLOT, "allow_existing": false, "allow_duplicate": true });
+            let (_, answer) = self.call(reqwest::Method::POST, "/api/devices", Some(body)).await;
+            let id = answer["device_id"].as_str().expect("a new device's id").to_string();
+            self.devices.lock().unwrap().push(id.clone());
+            id
+        }
+
+        async fn push(&self, device: &str, bytes: &[u8], more: &str) -> (u16, Value) {
+            let part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name("probe.srm");
+            let form = reqwest::multipart::Form::new().part("saveFile", part);
+            let url = format!("{}/api/saves?rom_id={}&slot={SLOT}&emulator=probe&device_id={device}{more}", self.host, self.rom);
+            let response = self.http.post(url).bearer_auth(&self.token).multipart(form).send().await.expect("the server to answer");
+            (response.status().as_u16(), response.json().await.unwrap_or(Value::Null))
+        }
+
+        async fn replace(&self, save_id: i64, bytes: &[u8]) -> u16 {
+            let part = reqwest::multipart::Part::bytes(bytes.to_vec()).file_name("probe.srm");
+            let form = reqwest::multipart::Form::new().part("saveFile", part);
+            let url = format!("{}/api/saves/{save_id}", self.host);
+            self.http.put(url).bearer_auth(&self.token).multipart(form).send().await.expect("the server to answer").status().as_u16()
+        }
+
+        /// Negotiate `listed` for `device`, close the session, and answer the actions about this slot
+        /// and about saves with no slot, with the version each names.
+        async fn negotiate(&self, device: &str, listed: Vec<Value>, names: &HashMap<i64, &str>) -> String {
+            let body = json!({ "device_id": device, "rom_ids": [self.rom], "saves": listed });
+            let (status, answer) = self.call(reqwest::Method::POST, "/api/sync/negotiate", Some(body)).await;
+            if status != 200 {
+                let disabled = answer["detail"].as_str().is_some_and(|d| d.contains("disabled"));
+                return format!("{status}{}", if disabled { " (disabled)" } else { "" });
+            }
+            let session = answer["session_id"].as_i64().unwrap_or_default();
+            self.call(reqwest::Method::POST, &format!("/api/sync/sessions/{session}/complete"), Some(json!({}))).await;
+            let ops = answer["operations"].as_array().cloned().unwrap_or_default();
+            let ours = ops.iter().filter(|op| op["rom_id"].as_i64() == Some(self.rom) && (op["slot"] == SLOT || op["slot"].is_null()));
+            let said: Vec<String> = ours
+                .map(|op| {
+                    let action = op["action"].as_str().unwrap_or_default();
+                    let version = op["save_id"].as_i64().and_then(|id| names.get(&id)).map_or(String::new(), |name| format!(" {name}"));
+                    let untracked = if op["reason"].as_str().unwrap_or_default().to_lowercase().contains("untracked") { " (untracked)" } else { "" };
+                    format!("{action}{version}{untracked}")
+                })
+                .collect();
+            said.join(", ")
+        }
+
+        async fn pause(&self) {
+            if self.live {
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+            }
+        }
+
+        /// Remove what the conversation made, a save at a time: one the server no longer has would
+        /// refuse a batch.
+        async fn tidy(&self) {
+            let (_, saves) = self.call(reqwest::Method::GET, &format!("/api/saves?rom_id={}&slot={SLOT}", self.rom), None).await;
+            for id in saves.as_array().into_iter().flatten().filter_map(|s| s["id"].as_i64()) {
+                self.call(reqwest::Method::POST, "/api/saves/delete", Some(json!({ "saves": [id] }))).await;
+            }
+            let devices = std::mem::take(&mut *self.devices.lock().unwrap());
+            for device in devices {
+                self.call(reqwest::Method::DELETE, &format!("/api/devices/{device}"), None).await;
+            }
+        }
+    }
+
+    fn at(text: &str) -> SystemTime {
+        parse_timestamp(text).expect("a time the server wrote")
+    }
+
+    /// A device's save as a negotiation lists it.
+    fn listed(bytes: &[u8], time: SystemTime, rom: i64, slot: Option<&str>) -> Value {
+        json!({
+            "rom_id": rom, "file_name": "probe.srm", "slot": slot, "emulator": "probe",
+            "content_hash": hash::of_upload(bytes), "updated_at": format_timestamp_precise(time),
+            "file_size_bytes": bytes.len(),
+        })
+    }
+
+    /// What a real RomM 5.4 answered at each step of [`conversation`].
+    const SEEN: &[&str] = &[
+        "A pushes v1: 200, its name stamped",
+        "A, the same content: no_op v1",
+        "A, changed since it had v1: upload v1",
+        "A, changed but dated before it had v1: no_op v1",
+        "B, holding nothing: download v1",
+        "B fetches v1: 200",
+        "B pushes v2: 200, a new version",
+        "A, unchanged: download v2",
+        "A, changed but before v2: download v2",
+        "A pushes without having had v2: 409",
+        "A, a save with no slot: upload, download v2",
+        "C untracks v2: 200",
+        "C, changed: no_op v2 (untracked)",
+        "D, never had it, older: download v2",
+        "D, never had it, newer: upload v2",
+        "D, never had it, the same content: no_op v2",
+        "D, having agreed on v2's content, a different save dated just before v2: no_op v2",
+        "E, never had it, exactly v2's stored time: conflict v2",
+        "F, never had it, v2's time as its push answered: upload v2",
+        "B pushes v2's content again: 200, v2",
+        "v2 replaced where it is: 200",
+        "B, unchanged since it had v2: download v2",
+        "B, changed after it had v2: conflict v2",
+        "D's sync turned off: 200",
+        "D, its sync off: 400 (disabled)",
+        "an unknown device: 404",
+        "a session completed: 200 COMPLETED",
+        "completed again: 400",
+        "a session left open by a newer negotiation completes: 200",
+        "A overwrites without having had v2: 200, a new version",
+        "A pushes in a session, keeping one: 200, 1 done, 1 left",
+    ];
+
+    /// The conversation, as said: each step and what the server answered.
+    async fn conversation(api: &Api) -> Vec<String> {
+        use reqwest::Method;
+        let rom = api.rom;
+        let mut said = Vec::new();
+        let mut names: HashMap<i64, &str> = HashMap::new();
+        let (a, b, c, d) = (api.device("probe-a").await, api.device("probe-b").await, api.device("probe-c").await, api.device("probe-d").await);
+        let (e, f) = (api.device("probe-e").await, api.device("probe-f").await);
+        let secs = Duration::from_secs;
+
+        let (status, v1) = api.push(&a, b"v1", "").await;
+        let stamped = v1["file_name"].as_str().is_some_and(|n| n.starts_with("probe [") && n.ends_with("].srm") && n.len() == "probe [2026-10-19_09-20-18].srm".len());
+        said.push(format!("A pushes v1: {status}{}", if stamped { ", its name stamped" } else { "" }));
+        let v1_id = v1["id"].as_i64().unwrap_or_default();
+        names.insert(v1_id, "v1");
+        let v1_at = at(v1["updated_at"].as_str().unwrap_or_default());
+        let mine = |bytes: &[u8], time| vec![listed(bytes, time, rom, Some(SLOT))];
+        said.push(format!("A, the same content: {}", api.negotiate(&a, mine(b"v1", v1_at), &names).await));
+        said.push(format!("A, changed since it had v1: {}", api.negotiate(&a, mine(b"v1 changed", v1_at + secs(30)), &names).await));
+        said.push(format!("A, changed but dated before it had v1: {}", api.negotiate(&a, mine(b"v1 changed", v1_at - secs(30)), &names).await));
+        said.push(format!("B, holding nothing: {}", api.negotiate(&b, Vec::new(), &names).await));
+        let (status, _) = api.call(Method::GET, &format!("/api/saves/{v1_id}/content?device_id={b}"), None).await;
+        said.push(format!("B fetches v1: {status}"));
+
+        api.pause().await;
+        let (status, v2) = api.push(&b, b"v2 from B", "").await;
+        let v2_id = v2["id"].as_i64().unwrap_or_default();
+        said.push(format!("B pushes v2: {status}{}", if v2_id != v1_id { ", a new version" } else { "" }));
+        names.insert(v2_id, "v2");
+        let v2_text = v2["updated_at"].as_str().unwrap_or_default().to_string();
+        let v2_at = at(&v2_text);
+        said.push(format!("A, unchanged: {}", api.negotiate(&a, mine(b"v1", v1_at), &names).await));
+        said.push(format!("A, changed but before v2: {}", api.negotiate(&a, mine(b"v1 by A", v1_at - Duration::from_millis(500)), &names).await));
+        let (status, _) = api.push(&a, b"v3 from A", "").await;
+        said.push(format!("A pushes without having had v2: {status}"));
+        said.push(format!("A, a save with no slot: {}", api.negotiate(&a, vec![listed(b"loose", v2_at, rom, None)], &names).await));
+
+        let (status, _) = api.call(Method::POST, &format!("/api/saves/{v2_id}/untrack"), Some(json!({ "device_id": c }))).await;
+        said.push(format!("C untracks v2: {status}"));
+        said.push(format!("C, changed: {}", api.negotiate(&c, mine(b"c", v2_at + secs(60)), &names).await));
+
+        said.push(format!("D, never had it, older: {}", api.negotiate(&d, mine(b"d older", v2_at - secs(60)), &names).await));
+        said.push(format!("D, never had it, newer: {}", api.negotiate(&d, mine(b"d newer", v2_at + secs(60)), &names).await));
+        said.push(format!("D, never had it, the same content: {}", api.negotiate(&d, mine(b"v2 from B", v2_at - secs(600)), &names).await));
+        let (_, versions) = api.call(Method::GET, &format!("/api/saves?rom_id={rom}&slot={SLOT}"), None).await;
+        let stored = versions.as_array().into_iter().flatten().find(|v| v["id"].as_i64() == Some(v2_id)).and_then(|v| v["updated_at"].as_str()).unwrap_or_default().to_string();
+        let just_before = at(&stored) - Duration::from_millis(500);
+        said.push(format!("D, having agreed on v2's content, a different save dated just before v2: {}", api.negotiate(&d, mine(b"d differs", just_before), &names).await));
+        let mut same_time = listed(b"e same time", v2_at, rom, Some(SLOT));
+        same_time["updated_at"] = json!(stored);
+        said.push(format!("E, never had it, exactly v2's stored time: {}", api.negotiate(&e, vec![same_time], &names).await));
+        let mut reported = listed(b"f same time", v2_at, rom, Some(SLOT));
+        reported["updated_at"] = json!(v2_text);
+        said.push(format!("F, never had it, v2's time as its push answered: {}", api.negotiate(&f, vec![reported], &names).await));
+
+        let (status, again) = api.push(&b, b"v2 from B", "").await;
+        said.push(format!("B pushes v2's content again: {status}{}", if again["id"].as_i64() == Some(v2_id) { ", v2" } else { ", a new version" }));
+        api.pause().await;
+        said.push(format!("v2 replaced where it is: {}", api.replace(v2_id, b"v2 replaced in place").await));
+        said.push(format!("B, unchanged since it had v2: {}", api.negotiate(&b, mine(b"v2 from B", v2_at), &names).await));
+        said.push(format!("B, changed after it had v2: {}", api.negotiate(&b, mine(b"v2 by B", v2_at + Duration::from_millis(500)), &names).await));
+
+        let (status, _) = api.call(Method::PUT, &format!("/api/devices/{d}"), Some(json!({ "sync_enabled": false }))).await;
+        said.push(format!("D's sync turned off: {status}"));
+        said.push(format!("D, its sync off: {}", api.negotiate(&d, Vec::new(), &names).await));
+        said.push(format!("an unknown device: {}", api.negotiate("no-such-device-here", Vec::new(), &names).await));
+
+        let open = |device: String| async move {
+            let body = json!({ "device_id": device, "rom_ids": [rom], "saves": [] });
+            api.call(Method::POST, "/api/sync/negotiate", Some(body)).await.1["session_id"].as_i64().unwrap_or_default()
+        };
+        let session = open(a.clone()).await;
+        let close = |session: i64| async move { api.call(Method::POST, &format!("/api/sync/sessions/{session}/complete"), Some(json!({}))).await };
+        let (status, closed) = close(session).await;
+        said.push(format!("a session completed: {status} {}", closed["session"]["status"].as_str().unwrap_or_default()));
+        said.push(format!("completed again: {}", close(session).await.0));
+        let (older, newer) = (open(a.clone()).await, open(a.clone()).await);
+        said.push(format!("a session left open by a newer negotiation completes: {}", close(older).await.0));
+        close(newer).await;
+
+        let (status, v3) = api.push(&a, b"v3 from A", "&overwrite=true").await;
+        said.push(format!("A overwrites without having had v2: {status}{}", if v3["id"].as_i64().is_some_and(|id| id != v2_id) { ", a new version" } else { "" }));
+        let session = open(a.clone()).await;
+        api.pause().await;
+        let (status, _) = api.push(&a, b"v4 from A", &format!("&session_id={session}&autocleanup=true&autocleanup_limit=1")).await;
+        let (_, record) = api.call(Method::GET, &format!("/api/sync/sessions/{session}"), None).await;
+        let (_, left) = api.call(Method::GET, &format!("/api/saves?rom_id={rom}&slot={SLOT}"), None).await;
+        said.push(format!(
+            "A pushes in a session, keeping one: {status}, {} done, {} left",
+            record["operations_completed"].as_i64().unwrap_or_default(),
+            left.as_array().map_or(0, Vec::len)
+        ));
+        close(session).await;
+        said
+    }
+
+    /// Run the conversation, tidy up whatever happens, and compare.
+    async fn check(api: Api) {
+        let said = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(conversation(&api))).await;
+        api.tidy().await;
+        let said = said.unwrap_or_else(|_| vec!["the conversation broke off".into()]);
+        for (step, (heard, seen)) in said.iter().zip(SEEN).enumerate() {
+            assert_eq!(heard, seen, "step {}", step + 1);
+        }
+        assert_eq!(said.len(), SEEN.len(), "{said:#?}");
+    }
+
+    #[tokio::test]
+    async fn this_server_answers_as_romm_was_seen_to() {
+        let server = FakeRomm::start().await;
+        let api = Api { http: reqwest::Client::new(), host: server.host.clone(), token: "t".into(), rom: 1, live: false, devices: Mutex::default() };
+        check(api).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to a real RomM — see the module's header"]
+    async fn a_real_romm_still_answers_as_it_was_seen_to() {
+        let (Ok(_), Ok(rom)) = (std::env::var("DECKHAND_LIVE_ROMM"), std::env::var("DECKHAND_LIVE_ROMM_ROM")) else {
+            eprintln!("DECKHAND_LIVE_ROMM and DECKHAND_LIVE_ROMM_ROM are not set; nothing to check");
+            return;
+        };
+        // The pairing as the app keeps it. A test build's own settings live in a scratch folder (see
+        // `crate::config::test_root`), so the file is read where the app itself would read it.
+        let file = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
+            .expect("a config folder")
+            .join("deckhand-rust/settings.json");
+        let settings: Value = serde_json::from_str(&std::fs::read_to_string(file).expect("Deckhand's settings")).expect("settings as JSON");
+        let connection = &settings["connection"];
+        let insecure = connection["insecure"].as_bool().unwrap_or(false);
+        let http = reqwest::Client::builder().danger_accept_invalid_certs(insecure).build().unwrap();
+        let api = Api {
+            http,
+            host: connection["host"].as_str().expect("Deckhand paired with a RomM").trim_end_matches('/').to_string(),
+            token: connection["token"].as_str().expect("a pairing token").to_string(),
+            rom: rom.parse().expect("DECKHAND_LIVE_ROMM_ROM to be a game's id"),
+            live: true,
+            devices: Mutex::default(),
+        };
+        check(api).await;
     }
 }

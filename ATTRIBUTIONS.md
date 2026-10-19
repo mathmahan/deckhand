@@ -8,9 +8,9 @@ Save sync reads and writes emulator saves through argosy-sigil, RomM's save libr
 the binary from the `third_party/argosy-sigil` submodule, unmodified.
 
 - Source: **rommapp/argosy-sigil** — <https://github.com/rommapp/argosy-sigil>
-- License: **Mozilla Public License 2.0 (MPL-2.0)** — `third_party/argosy-sigil/LICENSE`. Its source
-  files carry no *Incompatible With Secondary Licenses* notice, so a GPL-3.0 build may include them;
-  the MPL still covers those files, and their source stays available at the link above.
+- License: **Mozilla Public License 2.0 (MPL-2.0)** — `third_party/argosy-sigil/LICENSE`. The MPL
+  applies file by file, so an MIT-licensed build may include them: the MPL still covers those files,
+  and their source stays available at the link above.
 - Its Sega CD backup RAM reader takes a table from **superctr/buram** (MIT) —
   `third_party/argosy-sigil/licenses/buram-MIT.txt`.
 
