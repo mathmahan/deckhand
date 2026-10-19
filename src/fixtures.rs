@@ -87,7 +87,7 @@ pub fn library(count: usize) -> Library {
                 size_bytes: Some(4_194_304 * (1 + i as i64 % 12)),
                 screenshots: Vec::new(),
                 genres: vec!["Action".into(), "Adventure".into()],
-                companies: vec!["Orimligt Interactive".into()],
+                companies: vec!["Fixture Interactive".into()],
                 players: Some(if i % 2 == 0 { "1".into() } else { "1-2".into() }),
                 year: Some(1990 + (i % 20) as i32),
                 fingerprint: None,

@@ -1,5 +1,5 @@
 //! The save sync end to end: devices playing and syncing against [`crate::fake_romm`], a RomM that
-//! keeps state and decides the way RomM 5.3.1 decides.
+//! keeps state and decides the way RomM 5.4 was seen to.
 //!
 //! Each test is a story told in launches — a Deck and a PC, progress made on one and taken up on the
 //! other, offline play on both, a clock that is wrong, a save deleted on the server — with what must
@@ -126,7 +126,7 @@ async fn a_save_goes_up_once_and_then_nothing_moves() {
     assert_eq!((report.in_sync, report.pushed.len(), report.pulled.len()), (1, 0, 0), "{report:?}");
     assert_eq!(server.requests("POST /api/saves?"), 1, "the second sync sends nothing");
     assert_eq!(server.requests("POST /api/saves/"), 0, "and acknowledges nothing it had already");
-    assert!(server.state.lock().unwrap().sessions.iter().all(|s| s.status == "completed"), "every session is closed");
+    assert_eq!(server.open_sessions(), 0, "every session is closed");
 }
 
 #[tokio::test]
@@ -262,7 +262,7 @@ async fn a_save_untracked_on_this_device_is_left_alone() {
 async fn a_device_whose_sync_romm_turned_off_moves_nothing() {
     let server = FakeRomm::start().await;
     let deck = Device::new("disabled", &server);
-    server.state.lock().unwrap().devices.insert(deck.id().into(), false);
+    server.sync_off(deck.id());
     deck.play("chapter 1", server.now());
     let report = deck.launch().await;
     assert!(report.pushed.is_empty() && report.failed.is_empty(), "{report:?}");
@@ -292,7 +292,7 @@ async fn a_download_that_is_not_what_romm_described_is_not_written() {
     deck.play("chapter 1", server.now());
     deck.launch().await;
     // The bytes on RomM's disk no longer match the hash it recorded.
-    server.state.lock().unwrap().rows[0].bytes = b"garbled".to_vec();
+    server.garble(server.rows(ROM_ID)[0].id, b"garbled");
 
     let report = pc.launch().await;
     assert_eq!(report.failed.len(), 1, "{report:?}");
@@ -311,7 +311,7 @@ async fn a_push_racing_another_device_s_is_settled_not_forced() {
     server.advance(Duration::from_secs(60));
     deck.play("deck: chapter 2", server.now());
     // Between the Deck's negotiation and its push, another device's lands.
-    server.state.lock().unwrap().race = Some((ROM_ID, AUTOSAVE.into(), b"racer: chapter 3".to_vec()));
+    server.race(ROM_ID, AUTOSAVE, b"racer: chapter 3");
     let (resolver, asked) = chooser(Choice::Remote);
     let report = with_resolver(resolver, deck.launch()).await;
     assert_eq!(asked.lock().unwrap().len(), 1, "the refusal became a question: {report:?}");
@@ -322,7 +322,7 @@ async fn a_push_racing_another_device_s_is_settled_not_forced() {
 #[tokio::test]
 async fn a_romm_without_sync_sessions_still_syncs_the_way_before() {
     let server = FakeRomm::start().await;
-    server.state.lock().unwrap().no_sessions = true;
+    server.without_sync_sessions();
     let deck = Device::new("legacy", &server);
     deck.play("chapter 1", server.now());
     let report = deck.launch().await;
@@ -339,14 +339,14 @@ async fn the_play_session_goes_with_the_sync_session_after_the_game() {
     let play = crate::launch::play_session(ROM_ID, start, server.now()).unwrap();
     let report = deck.launch_with(vec![play.clone()]).await;
     assert_eq!(report.plays_recorded, 1, "{report:?}");
-    let plays = server.state.lock().unwrap().plays.clone();
+    let plays = server.plays();
     assert_eq!(plays.len(), 1);
-    assert!(plays[0].2.is_some(), "taken as part of the sync session");
+    assert!(plays[0].session.is_some(), "taken as part of the sync session");
 
     // Sent again — a retry — it is the same session, not a second one.
     let report = deck.launch_with(vec![play]).await;
     assert_eq!(report.plays_recorded, 1);
-    assert_eq!(server.state.lock().unwrap().plays.len(), 1);
+    assert_eq!(server.plays().len(), 1);
 }
 
 #[tokio::test]
@@ -416,8 +416,7 @@ async fn a_library_bigger_than_one_negotiation_is_scoped_in_turns() {
         .unwrap();
     assert!(matches!(outcome, Outcome::Done(_)));
     assert_eq!(server.requests("POST /api/sync/negotiate"), 3, "500 games at a time");
-    let sessions = server.state.lock().unwrap().sessions.clone();
-    assert!(sessions.iter().all(|s| s.status == "completed"), "each closed before the next opened: {sessions:?}");
+    assert_eq!(server.open_sessions(), 0, "each closed before the next opened");
 }
 
 #[tokio::test]
@@ -426,7 +425,7 @@ async fn a_sweep_romm_stops_answering_part_way_still_says_what_it_moved() {
     let deck = Device::new("chunks-cut-short", &server);
     deck.play("chapter 1", server.now());
     // The game's save goes up in the first negotiation; RomM then goes away for the rest.
-    server.state.lock().unwrap().negotiations_before_failing = Some(1);
+    server.fail_negotiations_after(1);
     let scope: Vec<i64> = (1..=1_200).collect();
     let threads = vec![Thread {
         rom_id: ROM_ID,
@@ -523,7 +522,7 @@ async fn an_agreement_from_before_sync_sessions_carries_over() {
 async fn a_device_romm_forgot_registers_again_rather_than_syncing_blind() {
     let server = FakeRomm::start().await;
     let deck = Device::new("forgotten", &server);
-    server.state.lock().unwrap().devices.clear();
+    server.forget_devices();
     deck.play("chapter 1", server.now());
     let install = retroarch::read(&deck.root.join("ra/retroarch.cfg")).unwrap();
     let rom = deck.root.join("roms/snes").join(format!("{GAME}.sfc"));
@@ -707,7 +706,7 @@ async fn several_save_folders_in_one_slot_each_keep_their_own_history() {
     let report = sync_folders(&deck, &[a, b]).await;
     assert_eq!((report.pulled.len(), report.conflicts.len()), (1, 0), "{report:?}");
     assert_eq!((read_folder(&deck, a).as_deref(), read_folder(&deck, b).as_deref()), (Some("a2"), Some("b2")));
-    assert!(server.state.lock().unwrap().log.iter().filter(|l| l.starts_with("POST /api/saves?")).all(|l| !l.contains("autocleanup")),
+    assert!(server.log().iter().filter(|l| l.starts_with("POST /api/saves?")).all(|l| !l.contains("autocleanup")),
         "a slot several saves share is never trimmed");
 }
 

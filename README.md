@@ -129,6 +129,7 @@ packaging/build-windows.sh     # Windows .exe, cross-compiled in Docker
 
 ## License
 
-GPL-3.0, like the app it ports. DM Sans and Space Grotesk are under the SIL OFL 1.1
+MIT — see [LICENSE](LICENSE). Releases up to and including 0.9.4 were published under GPL-3.0, and
+stay under it. DM Sans and Space Grotesk are under the SIL OFL 1.1
 ([DM Sans](fonts/OFL.txt), [Space Grotesk](fonts/OFL-SpaceGrotesk.txt)) and the Lucide icons under
 ISC. Bundled game data is credited in [ATTRIBUTIONS.md](ATTRIBUTIONS.md).
