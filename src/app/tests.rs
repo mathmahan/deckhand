@@ -2753,3 +2753,133 @@ fn a_failed_collections_refresh_keeps_the_ones_on_screen() {
     let _ = fresh.update(Message::CollectionsLoaded(Err("timed out".into())));
     assert!(matches!(fresh.collection_sources, Some(Err(_))));
 }
+
+/// Where a page stays scrolled to as the window changes around it — what a person sees between two
+/// frames, and so what only a window kept from one frame to the next can show. iced keeps each
+/// scrollable's offset in the widget tree, by the scrollable's place in it, and a view that moves
+/// the page to another place starts it over at the top.
+mod page_place {
+    use super::*;
+    use iced::widget::scrollable::AbsoluteOffset;
+    use iced_test::core::widget::{operation, Id, Operation};
+    use iced_test::core::{Rectangle, Size, Vector};
+    use iced_test::runtime::user_interface::{Cache, UserInterface};
+
+    /// The window as iced keeps it between frames: each view built over the state the last one
+    /// left, the way the running app's is.
+    struct Window {
+        renderer: iced::Renderer,
+        cache: Cache,
+    }
+
+    impl Window {
+        fn new() -> Self {
+            use iced_test::core::renderer::Headless;
+            let renderer = iced_test::futures::futures::executor::block_on(<iced::Renderer as Headless>::new(
+                crate::theme::REGULAR,
+                iced::Pixels(16.0),
+                None,
+            ))
+            .expect("a headless renderer");
+            Self { renderer, cache: Cache::default() }
+        }
+
+        /// Draw `app` as the next frame, and run `operation` on it.
+        fn frame(&mut self, app: &App, operation: &mut dyn Operation) {
+            let size = Size::new(1280.0, 800.0);
+            let mut ui = UserInterface::build(app.view(), size, std::mem::take(&mut self.cache), &mut self.renderer);
+            ui.operate(&self.renderer, operation);
+            self.cache = ui.into_cache();
+        }
+
+        /// Scroll the scrollable `id` to `y`, as a wheel or the cursor would.
+        fn scroll(&mut self, app: &App, id: Id, y: f32) {
+            self.frame(app, &mut operation::scrollable::scroll_to(id, AbsoluteOffset { x: None, y: Some(y) }));
+        }
+
+        /// How far down the scrollable `id` is, drawing `app` as the next frame.
+        fn offset(&mut self, app: &App, id: Id) -> f32 {
+            struct Offset {
+                id: Id,
+                y: Option<f32>,
+            }
+            impl Operation for Offset {
+                fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                    operate(self);
+                }
+                fn scrollable(&mut self, id: Option<&Id>, _: Rectangle, _: Rectangle, at: Vector, _: &mut dyn operation::Scrollable) {
+                    if id == Some(&self.id) {
+                        self.y = Some(at.y);
+                    }
+                }
+            }
+            let mut offset = Offset { id, y: None };
+            self.frame(app, &mut offset);
+            offset.y.expect("the page is on screen")
+        }
+    }
+
+    #[test]
+    fn a_banner_coming_or_going_leaves_the_page_where_it_was() {
+        let mut app = paired_fixtures(40);
+        app.banner = None;
+        let _ = app.update(Message::TabSelected(Tab::Settings));
+        let settings = crate::ui::settings::settings_id();
+        let mut window = Window::new();
+        window.scroll(&app, settings.clone(), 600.0);
+
+        // Each a step a person sees: an update found and its banner timing out, a second one.
+        app.say("Deckhand 9.9.9 is out".into());
+        assert_eq!(window.offset(&app, settings.clone()), 600.0, "as the banner comes");
+        app.banner = None;
+        assert_eq!(window.offset(&app, settings.clone()), 600.0, "as it goes");
+        app.say("Deckhand 9.9.9 is in place".into());
+        assert_eq!(window.offset(&app, settings), 600.0, "and as another comes");
+    }
+
+    #[test]
+    fn removing_the_last_game_on_downloads_leaves_the_list_at_its_end() {
+        let mut app = paired_fixtures(40);
+        app.banner = None;
+        let games: Vec<Game> = app.library.all_games()[..30].to_vec();
+        for (i, game) in games.iter().enumerate() {
+            app.downloads.finish(game.rom_id, Ok(installed(game.rom_id, &game.title, (100 - i as u64) << 20)));
+        }
+        let _ = app.update(Message::TabSelected(Tab::Downloads));
+        for _ in 1..games.len() {
+            let _ = app.update(Message::Nav(Direction::Down));
+        }
+        let list = crate::ui::downloads::downloads_id();
+        let mut window = Window::new();
+        window.scroll(&app, list.clone(), 10_000.0);
+        let end = window.offset(&app, list.clone());
+        assert!(end > 0.0, "thirty games run past the window");
+
+        let _ = app.update(Message::RemoveFocusedDownload);
+        let _ = app.update(Message::DownloadRemoved(games[29].title.clone(), Ok(1)));
+        let shorter = window.offset(&app, list.clone());
+        assert!(shorter > end - 100.0, "a row shorter, still at the end, not at the top: {shorter}");
+        app.banner = None;
+        // The list has the banner's height back, so its end is that much further up.
+        let after = window.offset(&app, list);
+        assert!(after > shorter - 100.0, "still at the end once the banner goes, not at the top: {after}");
+    }
+
+    #[test]
+    fn closing_a_picker_leaves_the_page_where_it_was() {
+        let mut app = paired_fixtures(40);
+        let _ = app.update(Message::TabSelected(Tab::Settings));
+        let settings = crate::ui::settings::settings_id();
+        let mut window = Window::new();
+        window.scroll(&app, settings.clone(), 600.0);
+
+        app.pick = Some(PendingPick {
+            picker: crate::ui::picker::Picker { title: "Emulator".into(), note: String::new(), rows: Vec::new(), cursor: 0 },
+            then: Then::Remove { builds: Vec::new() },
+        });
+        window.frame(&app, &mut operation::scrollable::scroll_by(Id::new("nothing"), AbsoluteOffset::default()));
+        let _ = app.update(Message::Dismiss);
+        assert!(app.pick.is_none());
+        assert_eq!(window.offset(&app, settings), 600.0);
+    }
+}
