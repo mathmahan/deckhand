@@ -1,5 +1,5 @@
 > [!IMPORTANT]
-> **This entire project was vibe-coded with AI assistance.** The code was built iteratively through prompting, testing, debugging and refinement rather than through a traditional from-scratch coding workflow. Please backup your saves before using this app.
+> **This entire project is vibe-coded with AI assistance.** The code is built iteratively through prompting, testing, debugging and refinement rather than through a traditional from-scratch coding workflow. Please backup your saves before using this app.
 
 
 <p align="center"><img src="packaging/deckhand.png" width="128" alt="Deckhand logo"></p>
@@ -7,7 +7,7 @@
 # Deckhand
 
 A gamepad-first companion for the [RomM](https://romm.app) ROM manager, built for the Steam Deck.
-Browse your library from the couch, download games onto the device, play them through RetroDECK,
+Browse your library from the couch, download games onto the device, play them through [RetroDECK](https://retrodeck.net),
 and keep saves and save states in sync with your server.
 
 ![Home](screenshots/home.jpg)
@@ -16,9 +16,9 @@ and keep saves and save states in sync with your server.
 
 - **Pairing without a keyboard.** Scan a QR code with your phone and approve Deckhand in RomM, or
   type a pairing code.
-- **Home.** A spotlight on the game the cursor is on, over its own screenshot, with A to play it and
-  X for its saves. Below it are shelves for *Continue playing*, *On this device*, your RomM *Now
-  playing*, *Backlog* and *Finished* lists, and RomM's collections.
+- **Home.** A spotlight on the last played game, press A to play and
+  X to check the games saves. Below it are sections for *Continue playing*, *On this device*, your RomM *Now
+  playing*.
 - **Library and Collections.** Every system or collection as a cover grid, with filters, sorting and
   an A–Z jump. Your favourites and your own collections are a chip each, and RomM's genres,
   franchises and series are browsable across systems.
@@ -30,7 +30,7 @@ and keep saves and save states in sync with your server.
   games and fetches the BIOS. Games can go to any drive (an SD card, for instance), with an optional
   space budget. Games already in the folder are found and count as downloaded. With RomM 5.4 and a
   QR pairing, a game can be sent to the Deck from RomM's web app with *Install on device*.
-- **Playing.** Games start through RetroDECK, a command of your own, or an emulator picked per
+- **Playing.** Games start through [RetroDECK](https://retrodeck.net), a command of your own, or an emulator picked per
   system, such as a PCSX2 you installed yourself. They can resume from their newest save state.
   RomM 5.4's web app shows the game as being played on the Deck.
 - **Save sync.** Saves and save states sync both ways through RomM: around every launch, and while
@@ -89,15 +89,15 @@ yours runs:
 curl -s https://romm.example.com/api/heartbeat | jq -r .SYSTEM.VERSION
 ```
 
-Games play through RetroDECK. Install it from Flathub, then open it once to set it up:
+Games play through [RetroDECK](https://retrodeck.net). Install it from Flathub, then open it once to set it up:
 
 ```sh
 flatpak install flathub net.retrodeck.retrodeck
 ```
 
-To give one system its own emulator, such as a PCSX2 you installed yourself, use Settings ▸ Playing ▸
+To assign a system its own emulator, such as a PCSX2 you installed yourself, use Settings ▸ Playing ▸
 *Emulator for each system*. Choose the emulator (a program, an AppImage, or a Flatpak) and
-Deckhand fills in the usual options for it, for you to check:
+Deckhand fills in the usual options for it:
 
 ```sh
 # PlayStation 2, with the PCSX2 AppImage
@@ -110,7 +110,7 @@ Deckhand fills in the usual options for it, for you to check:
 /home/deck/Applications/Eden-Linux-v0.2.0-amd64.AppImage -f -g {rom}
 ```
 
-Saves sync for RetroArch, and on Linux for PCSX2, DuckStation, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar,
+Saves sync for RetroArch, and standalone emulators: PCSX2, DuckStation, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar,
 Cemu, Ryubing and Eden — see [Save sync](#save-sync).
 
 ## Building
