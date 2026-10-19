@@ -699,12 +699,18 @@ impl App {
         // Trimming the prepared-art cache is disk work with no deadline, so it goes to a blocking
         // thread and its result is thrown away — nothing on screen waits for it.
         let real = fixtures.is_none();
+        let (client, connection) = (app.client.clone(), app.settings.connection.clone());
         let prune = Task::future(async move {
             let _ = off_thread(covers::prune_caches).await;
             // ES-DE's hooks run a copy of this binary; an update leaves them on the old one until
             // this. Never in fixture mode, which is what the tests run in.
             if real && let Ok(Some(note)) = off_thread(crate::hooks::refresh_if_installed).await {
                 eprintln!("deckhand: {note}");
+            }
+            // The playtime of a game that ended along with the Deckhand that ran it — see
+            // `crate::playing`. Not in fixture mode either.
+            if real && let Some(connection) = &connection {
+                crate::playing::settle_left(&client, connection, &Settings::config_dir()).await;
             }
         })
         .discard();
