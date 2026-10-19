@@ -1,0 +1,26 @@
+# Licences of what Deckhand bundles
+
+Deckhand itself is under the MIT licence (`LICENSE`, beside this file). Built into it is the work of
+others, each under its own licence, whose terms ask that its notice travel with every copy. Here they
+all are: first the Rust crates compiled into the binary, each licence text as the crate itself ships
+it and with every crate that uses that exact text named above it; then what cargo does not see — the
+C libraries built in with argosy-sigil, the fonts and the icons.
+
+A crate offered under a choice of licences is listed under the one Deckhand takes.
+
+## Rust crates
+
+{{#each overview}}
+- {{{name}}}: {{count}}
+{{/each}}
+
+{{#each licenses}}
+### {{{name}}}
+
+Used by {{#each used_by}}{{{crate.name}}} {{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}.
+
+```text
+{{{text}}}
+```
+
+{{/each}}

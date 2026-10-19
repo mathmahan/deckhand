@@ -132,4 +132,6 @@ packaging/build-windows.sh     # Windows .exe, cross-compiled in Docker
 MIT — see [LICENSE](LICENSE). Releases up to and including 0.9.4 were published under GPL-3.0, and
 stay under it. DM Sans and Space Grotesk are under the SIL OFL 1.1
 ([DM Sans](fonts/OFL.txt), [Space Grotesk](fonts/OFL-SpaceGrotesk.txt)) and the Lucide icons under
-ISC. Bundled game data is credited in [ATTRIBUTIONS.md](ATTRIBUTIONS.md).
+ISC. Bundled game data is credited in [ATTRIBUTIONS.md](ATTRIBUTIONS.md). The AppImage carries the
+notices of everything built into it in `usr/share/doc/deckhand/THIRD-PARTY-LICENSES.md`, which
+[packaging/licences.sh](packaging/licences.sh) writes from `Cargo.lock` and the files above.

@@ -2,6 +2,11 @@
 
 Code and data bundled into Deckhand that come from elsewhere. Each notice below must be preserved.
 
+The Rust crates Deckhand is built from are not listed here: [packaging/licences.sh](packaging/licences.sh)
+collects their notices from `Cargo.lock`, adds the licence files of everything below, and the release
+build puts the result in the AppImage as `usr/share/doc/deckhand/THIRD-PARTY-LICENSES.md`. Something
+added here is added to that script too.
+
 ## argosy-sigil
 
 Save sync reads and writes emulator saves through argosy-sigil, RomM's save library, compiled into
@@ -22,3 +27,12 @@ It brings these, compiled in with it:
 - **Zstandard** 1.5.6 — BSD, `libchdr/deps/zstd-1.5.6/LICENSE`.
 - **LZMA SDK** 24.05 — public domain.
 - **tiny-AES-c** — <https://github.com/kokke/tiny-AES-c> — The Unlicense (public domain).
+
+## Fonts and icons
+
+Built into the binary, and drawn on every screen:
+
+- **DM Sans** — SIL Open Font License 1.1, `fonts/OFL.txt`.
+- **Space Grotesk** — SIL Open Font License 1.1, `fonts/OFL-SpaceGrotesk.txt`.
+- **Lucide** icons, through the `iced_fonts` crate — ISC, with the icons Lucide takes from Feather
+  under MIT: `fonts/ISC-Lucide.txt`, from <https://github.com/lucide-icons/lucide>.
