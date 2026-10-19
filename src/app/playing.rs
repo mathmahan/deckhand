@@ -22,6 +22,9 @@ impl App {
         self.handover = Some(Handover::new(rom_id, false));
         let ctx = self.launch_context();
         let settings = self.settings.clone();
+        // What the window being asked to close asks of the game — see `crate::launch::Stop`.
+        let stop = crate::launch::Stop::default();
+        self.stop = Some(stop.clone());
         Task::run(
             iced::stream::channel(2, move |mut output: Sender<crate::launch::Event>| async move {
                 let mut stages = output.clone();
@@ -40,7 +43,7 @@ impl App {
                         answer.await.unwrap_or(newer)
                     })
                 });
-                let play = crate::launch::play(ctx, settings, installed, move |stage| {
+                let play = crate::launch::play(ctx, settings, installed, stop, move |stage| {
                     let _ = stages.try_send(match stage {
                         crate::launch::Stage::Running => crate::launch::Event::Running(rom_id),
                         crate::launch::Stage::Saving => crate::launch::Event::Saving(rom_id),
@@ -56,6 +59,21 @@ impl App {
             }),
             Message::LaunchEvent,
         )
+    }
+
+    /// Asked to close by a signal. With no game running, the window goes. With one, the game is asked
+    /// to close first, the way its own Quit would, and the window goes once its saves have gone up —
+    /// or been left in its marker for the next start (see `crate::playing`). Asked again meanwhile,
+    /// it goes at once: the marker has it.
+    pub(super) fn stop_asked(&mut self) -> Task<Message> {
+        match &self.stop {
+            Some(stop) if !self.closing => {
+                stop.ask();
+                self.closing = true;
+                Task::none()
+            }
+            _ => iced::exit(),
+        }
     }
 
     /// Step aside while a game runs, and come back with what happened when it ends.
@@ -88,6 +106,12 @@ impl App {
                 self.watcher.rebase();
                 self.playing = None;
                 self.handover = None;
+                self.stop = None;
+                // Asked to close while the game ran: it has, and what its closing owed is done or left
+                // in its marker, so the window goes too.
+                if self.closing {
+                    return iced::exit();
+                }
                 // The sync around the game has moved its saves; the counts and the page follow.
                 let refresh = match &self.screen {
                     Screen::Browsing(Route::Detail { rom_id: open, .. } | Route::Saves { rom_id: open, .. }) if *open == rom_id => {

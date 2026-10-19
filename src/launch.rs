@@ -24,6 +24,12 @@
 //! Steps 1, 2 and 4 are best-effort. None of them is worth not playing over, so each one that fails
 //! becomes a line in the banner afterwards and the launch goes on.
 //!
+//! A launch can be cut short. Steam's *Exit game* — a signal to `deckhand play`, or to the window — is
+//! a [`Stop`]: the game is asked to close where it runs, the way its own Quit would, and step 4
+//! follows once it has. Whatever ends Deckhand before step 4 is done — a second signal, a crash, a
+//! dead battery — leaves the game's marker, and the next Deckhand to start does step 4 for it
+//! ([`finish_left`]; see [`crate::playing`]).
+//!
 //! Step 2 alone is also what a download ends with ([`ready`]): a game's existing progress is laid out
 //! before its first launch, which is what makes "download it here, carry on from where I was" work
 //! without a launch in between.
@@ -31,6 +37,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::config::{Connection, Settings};
@@ -156,7 +164,7 @@ pub fn join_command(words: &[String]) -> String {
 }
 
 /// What will run a game, as far as its saves are concerned.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Emulator {
     /// RetroArch, running this libretro core (`snes9x`, `swanstation`).
     Core(String),
@@ -514,6 +522,17 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// What syncing its saves needs, as a marker keeps it — see [`crate::playing::Game`].
+    pub fn game(&self) -> crate::playing::Game {
+        crate::playing::Game {
+            title: self.title.clone(),
+            rom: self.rom.clone(),
+            system: self.system.clone(),
+            emulator: self.emulator.clone(),
+            stamp: self.stamp.clone(),
+        }
+    }
+
     /// Reads ES-DE's tables, so off the UI thread.
     pub fn new(settings: &Settings, installed: &Installed) -> Self {
         let rom = target(installed);
@@ -571,49 +590,91 @@ pub async fn ready(ctx: &Context, plan: &Plan) -> Vec<String> {
         notes.push(BIOS_SYNCED.into());
     }
 
-    notes.extend(sync_any(ctx, conn, plan, true, Vec::new()).await.0);
+    notes.extend(sync_any(ctx, conn, plan.rom_id, &plan.game(), true, Vec::new()).await.notes);
     said(notes)
 }
 
-/// Step 4: the save the session wrote, up to RomM, with the play session it ends. Answers what is
-/// worth saying, and whether RomM took the play session with the sync.
-pub async fn settle(ctx: &Context, plan: &Plan, play: Option<PlaySession>) -> (Vec<String>, bool) {
+/// Step 4: the save the session wrote, up to RomM, with the play session it ends.
+pub async fn settle(ctx: &Context, plan: &Plan, play: Option<PlaySession>) -> Synced {
     match &ctx.connection {
-        Some(conn) => {
-            let (notes, recorded) = sync_any(ctx, conn, plan, false, play.into_iter().collect()).await;
-            (notes, recorded > 0)
-        }
-        None => (Vec::new(), false),
+        Some(conn) => sync_any(ctx, conn, plan.rom_id, &plan.game(), false, play.into_iter().collect()).await,
+        None => Synced { notes: Vec::new(), recorded: 0, whole: true },
     }
+}
+
+/// What a sync of one game's saves did.
+pub struct Synced {
+    /// What is worth saying.
+    pub notes: Vec<String>,
+    /// How many of the play sessions handed to it RomM took with the sync.
+    pub recorded: usize,
+    /// Whether every save that could move did — nothing failed, and RomM was there to ask. A game
+    /// whose saves this build does not sync has nothing to fail.
+    pub whole: bool,
 }
 
 /// The game's saves, whichever emulator keeps them: RetroArch's battery saves and states, or a
 /// standalone emulator's own. `before` says so once, before play, for one this build cannot sync.
-/// Answers the notes, and how many of `plays` RomM took with the sync.
-async fn sync_any(ctx: &Context, conn: &Connection, plan: &Plan, before: bool, plays: Vec<PlaySession>) -> (Vec<String>, usize) {
-    if let Some(core) = plan.emulator.syncs() {
-        return sync_save(ctx, conn, plan, core, plays).await;
+async fn sync_any(ctx: &Context, conn: &Connection, rom_id: i64, game: &crate::playing::Game, before: bool, plays: Vec<PlaySession>) -> Synced {
+    if let Some(core) = game.emulator.syncs() {
+        return sync_save(ctx, conn, rom_id, game, core, plays).await;
     }
-    let Emulator::Other(name) = &plan.emulator else { return (Vec::new(), 0) };
-    let Some(emulator) = sync::standalone::Emulator::for_launch(&plan.system, name) else {
+    let Emulator::Other(name) = &game.emulator else { return Synced { notes: Vec::new(), recorded: 0, whole: true } };
+    let Some(emulator) = sync::standalone::Emulator::for_launch(&game.system, name) else {
         let notes = if before { vec![format!("it runs on {name}, whose saves this build doesn't sync")] } else { Vec::new() };
-        return (notes, 0);
+        return Synced { notes, recorded: 0, whole: true };
     };
-    match sync::standalone::sync(&ctx.client, conn, &ctx.store, emulator, &plan.rom, &plan.title, plan.rom_id, plan.stamp.as_ref(), plays).await {
-        Ok(report) => (save_notes(&report), report.plays_recorded),
-        Err(why) => (vec![format!("{name} saves not synced: {why}")], 0),
+    let result = sync::standalone::sync(&ctx.client, conn, &ctx.store, emulator, &game.rom, &game.title, rom_id, game.stamp.as_ref(), plays).await;
+    reported(result, &format!("{name} saves not synced"))
+}
+
+async fn sync_save(ctx: &Context, conn: &Connection, rom_id: i64, game: &crate::playing::Game, core: Option<&str>, plays: Vec<PlaySession>) -> Synced {
+    let install = match sync::retroarch::locate(ctx.retroarch_config.as_deref()) {
+        Ok(install) => install,
+        Err(why) => return Synced { notes: vec![format!("saves not synced: {why}")], recorded: 0, whole: false },
+    };
+    let result = sync::sync_rom(&ctx.client, conn, &install, &ctx.store, &game.rom, &game.system, core, rom_id, game.stamp.as_ref(), plays).await;
+    reported(result, "saves not synced")
+}
+
+/// A sync's result as [`Synced`], `failed` heading the reason it gave up.
+fn reported(result: Result<Report, String>, failed: &str) -> Synced {
+    match result {
+        Ok(report) => Synced { notes: save_notes(&report), recorded: report.plays_recorded, whole: report.failed.is_empty() },
+        Err(why) => Synced { notes: vec![format!("{failed}: {why}")], recorded: 0, whole: false },
     }
 }
 
-async fn sync_save(ctx: &Context, conn: &Connection, plan: &Plan, core: Option<&str>, plays: Vec<PlaySession>) -> (Vec<String>, usize) {
-    let install = match sync::retroarch::locate(ctx.retroarch_config.as_deref()) {
-        Ok(install) => install,
-        Err(why) => return (vec![format!("saves not synced: {why}")], 0),
-    };
-    match sync::sync_rom(&ctx.client, conn, &install, &ctx.store, &plan.rom, &plan.system, core, plan.rom_id, plan.stamp.as_ref(), plays).await {
-        Ok(report) => (save_notes(&report), report.plays_recorded),
-        Err(why) => (vec![format!("saves not synced: {why}")], 0),
+/// Finish every game whose closing was never seen through — Deckhand ended along with it, or RomM
+/// was out of reach as it closed (see [`crate::playing`]): its saves synced, and its time played sent
+/// with them. One RomM still cannot take stays for the next time. Answers how many were finished.
+pub async fn finish_left(ctx: &Context) -> usize {
+    let Some(conn) = &ctx.connection else { return 0 };
+    let mut finished = 0;
+    for left in crate::playing::left(&ctx.store) {
+        let Some(rom_id) = left.rom_id() else {
+            left.done();
+            continue;
+        };
+        let play = left.session();
+        let synced = match left.game() {
+            Some(game) => sync_any(ctx, conn, rom_id, game, false, play.clone().into_iter().collect()).await,
+            None => Synced { notes: Vec::new(), recorded: 0, whole: true },
+        };
+        let taken = synced.recorded > 0 || match &play {
+            Some(play) => ctx.client.post_play_session(conn, play).await.is_ok(),
+            None => true,
+        };
+        match (synced.whole, taken) {
+            (true, true) => {
+                left.done();
+                finished += 1;
+            }
+            (false, true) => left.sent(),
+            _ => {}
+        }
     }
+    finished
 }
 
 /// What a note says of a BIOS fetched, whichever files it was.
@@ -719,7 +780,7 @@ pub enum Stage {
 ///
 /// An error is a game that never started: no launcher, files gone, a command that would not run.
 /// Anything that goes wrong around a game that did start is a note instead.
-pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut tell: impl FnMut(Stage)) -> Result<Session, String> {
+pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: Stop, mut tell: impl FnMut(Stage)) -> Result<Session, String> {
     let resume = settings.resume_state;
     let plan = tokio::task::spawn_blocking(move || Plan::new(&settings, &installed))
         .await
@@ -743,11 +804,9 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut te
         },
         None => ctx,
     };
-    // A session an earlier launch never got to send — Deckhand ended along with its game, or RomM out
-    // of reach as it closed. Before this one's marker can take the place of the game's own.
-    if let Some(conn) = &ctx.connection {
-        crate::playing::settle_left(&ctx.client, conn, &ctx.store).await;
-    }
+    // A game an earlier launch never saw close — Deckhand ended along with it, or RomM out of reach
+    // as it closed. Before this one's marker can take the place of the game's own.
+    finish_left(&ctx).await;
     notes.extend(ready(&ctx, &plan).await);
     // Into the newest state, when asked to and there is one here — the save sync just laid it into
     // slot 0. Only when the file is there: RetroArch refuses to start at all over a missing one.
@@ -756,20 +815,40 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut te
         notes.push("resumed from the newest save state".into());
     }
     let command = resumed.unwrap_or_else(|| launcher.command(&plan.system, &plan.rom));
+    // Asked to stop before the game is up — Steam closing the shortcut while its save came down — so
+    // it is not started only to be closed again.
+    if stop.asked() {
+        return Err("asked to stop before it started".into());
+    }
     tell(Stage::Running);
-    // On disk for as long as the game runs, so its time played outlives this process — see
+    // On disk for as long as the game runs, so what its closing owes outlives this process — see
     // `crate::playing`.
-    let held = crate::playing::hold(&ctx.store, &plan.rom, plan.rom_id);
+    let held = crate::playing::hold(&ctx.store, plan.rom_id, plan.game());
     let start = held.as_ref().map_or_else(SystemTime::now, crate::playing::Held::start);
-    let game = tokio::task::spawn_blocking(move || run(&command));
-    let exit = match while_playing(&ctx, plan.rom_id, held.as_ref(), game).await.map_err(|e| e.to_string()).and_then(|run| run) {
-        Ok(exit) => exit,
-        Err(why) => {
-            // It never started, so there is no session to keep.
-            if let Some(held) = held {
-                held.end();
+    let pid = Arc::new(AtomicU32::new(0));
+    let game = tokio::task::spawn_blocking({
+        let pid = pid.clone();
+        move || run(&command, &pid)
+    });
+    let exit = match while_playing(&ctx, plan.rom_id, held.as_ref(), unless_stopped(&stop, &pid, GRACE, game)).await {
+        Some(ran) => match ran.map_err(|e| e.to_string()).and_then(|ran| ran) {
+            Ok(exit) => exit,
+            Err(why) => {
+                // It never started, so there is nothing its closing owes.
+                if let Some(held) = held {
+                    held.end();
+                }
+                return Err(why);
             }
-            return Err(why);
+        },
+        None => {
+            // Asked to stop, and the game did not close in time. Its saves and time played wait in its
+            // marker for the next Deckhand to start.
+            if let Some(held) = &held {
+                held.touch();
+            }
+            let exit = Exit { success: false, code: None, last_line: None };
+            return Ok(Session { exit, played_at: None, notes: vec![NOT_CLOSED.into()] });
         }
     };
     // When it closed, for a sync this process does not live to finish.
@@ -780,14 +859,103 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut te
     if ctx.connection.is_some() {
         tell(Stage::Saving);
     }
-    let (more, recorded) = settle(&ctx, &plan, play.clone()).await;
-    notes.extend(more);
-    let (played_at, owed) = record_session(&ctx, play, recorded, &mut notes).await;
-    // A session RomM could not take keeps its marker, unheld, for the next Deckhand to send.
-    if let Some(held) = held.filter(|_| !owed) {
-        held.end();
+    let synced = settle(&ctx, &plan, play.clone()).await;
+    notes.extend(synced.notes);
+    let (played_at, owed) = record_session(&ctx, play, synced.recorded > 0, &mut notes).await;
+    // Saves that did not all go, or a session RomM could not take, keep the marker, unheld, for the
+    // next Deckhand to finish — saying so when it is only the saves, so the session never goes twice.
+    match held {
+        Some(held) if synced.whole && !owed => held.end(),
+        Some(held) if !owed => held.sent(),
+        _ => {}
     }
     Ok(Session { exit, played_at, notes: said(notes) })
+}
+
+/// What a launch says of a game asked to stop that did not close within [`GRACE`].
+const NOT_CLOSED: &str = "asked to stop, it had not closed in time — its saves and playtime go to RomM the next time Deckhand starts";
+
+/// A request for a running game to close, from whatever started it: a signal to `deckhand play`
+/// (Steam's *Exit game*), or the window being asked to close. A clone is the same request.
+#[derive(Debug, Clone)]
+pub struct Stop(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for Stop {
+    fn default() -> Self {
+        Stop(Arc::new(tokio::sync::watch::channel(false).0))
+    }
+}
+
+impl Stop {
+    pub fn ask(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub fn asked(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    async fn wait(&self) {
+        let _ = self.0.subscribe().wait_for(|asked| *asked).await;
+    }
+}
+
+/// Every SIGTERM, SIGHUP and SIGINT this process gets from the first poll on: how Steam's *Exit game*,
+/// the session ending or a terminal's Ctrl+C asks it to stop. Listening replaces dying on the spot,
+/// so whoever listens decides what stopping means.
+pub fn stop_signals() -> impl futures::Stream<Item = ()> {
+    use futures::StreamExt;
+    // Set up on the first poll, which is inside the runtime the listeners need.
+    futures::stream::once(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let kinds = [SignalKind::terminate(), SignalKind::hangup(), SignalKind::interrupt()];
+            let each = kinds
+                .into_iter()
+                .filter_map(|kind| signal(kind).ok())
+                .map(|mut listener| futures::stream::poll_fn(move |cx| listener.poll_recv(cx)).boxed());
+            futures::stream::select_all(each).boxed()
+        }
+        #[cfg(not(unix))]
+        futures::stream::pending::<()>().boxed()
+    })
+    .flatten()
+}
+
+/// How long a game asked to stop is given to close: an emulator writing its saves as it quits takes
+/// a moment, and whoever asked will not wait for ever. Past it, its closing is left to its marker.
+const GRACE: Duration = Duration::from_secs(10);
+
+/// How often a running game's processes are looked over, so a request to stop can still find them
+/// once the process Deckhand started has gone — see [`crate::processes`].
+const LOOK_OVER: Duration = Duration::from_secs(2);
+
+/// `game` to its end — unless `stop` is asked while it runs. Then every process of the game is asked
+/// to close (`pid`, the one Deckhand started, and what is under it) and given `grace` — [`GRACE`] —
+/// to: the game has closed once all of them have, those its launcher left behind included. None when
+/// they did not in time.
+async fn unless_stopped<T>(stop: &Stop, pid: &AtomicU32, grace: Duration, game: impl Future<Output = T>) -> Option<T> {
+    let mut game = std::pin::pin!(game);
+    let mut tree = crate::processes::Tree::default();
+    let mut looks = tokio::time::interval(LOOK_OVER);
+    loop {
+        tokio::select! {
+            out = &mut game => return Some(out),
+            _ = looks.tick() => tree.look(pid.load(Ordering::Relaxed)),
+            () = stop.wait() => break,
+        }
+    }
+    tree.look(pid.load(Ordering::Relaxed));
+    tree.ask_to_close();
+    let closed = async {
+        let out = game.await;
+        while !tree.gone() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        out
+    };
+    tokio::time::timeout(grace, closed).await.ok()
 }
 
 /// How often RomM hears that a game is still running: a third of [`HEARTBEAT_LASTS`], so one lost on
@@ -902,7 +1070,7 @@ pub struct Exit {
 /// Both outputs are drained as they come, because a child whose pipe fills stops, and only the last
 /// line of each is kept: an emulator can print every frame for hours. Stderr's wins, since that is
 /// where a launcher says why it gave up.
-pub fn run(command: &[String]) -> Result<Exit, String> {
+pub fn run(command: &[String], pid: &AtomicU32) -> Result<Exit, String> {
     let (program, args) = command.split_first().ok_or("the launch command is empty")?;
     let mut child = Command::new(program)
         .args(args)
@@ -911,6 +1079,7 @@ pub fn run(command: &[String]) -> Result<Exit, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("could not start {program}: {e}"))?;
+    pid.store(child.id(), Ordering::Relaxed);
     let stdout = child.stdout.take().map(last_line);
     let stderr = child.stderr.take().map(last_line);
     let status = child.wait().map_err(|e| format!("lost track of {program}: {e}"))?;
@@ -1270,7 +1439,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&save).unwrap(), "from the other device");
 
         let mut stages = Vec::new();
-        let session = play(ctx.clone(), settings.clone(), game.clone(), |stage| stages.push(stage)).await.unwrap();
+        let session = play(ctx.clone(), settings.clone(), game.clone(), Stop::default(), |stage| stages.push(stage)).await.unwrap();
         assert!(session.exit.success, "{session:?}");
         assert_eq!(stages, [Stage::Running, Stage::Saving]);
         assert_eq!(session.notes, ["saves synced"], "nothing new to pull before, the new save after");
@@ -1281,13 +1450,13 @@ mod tests {
         // Asked to resume, it does only once there is a state in slot 0 to boot into: RetroArch will
         // not start at all over a missing one.
         let resuming = Settings { resume_state: true, ..settings.clone() };
-        let session = play(ctx.clone(), resuming.clone(), game.clone(), |_| {}).await.unwrap();
+        let session = play(ctx.clone(), resuming.clone(), game.clone(), Stop::default(), |_| {}).await.unwrap();
         assert!(!session.notes.iter().any(|n| n.contains("resumed")), "{:?}", session.notes);
         let plan = Plan::new(&resuming, &game);
         let states = sync::retroarch::locate(resuming.retroarch_config.as_deref()).unwrap().game_states_dir(&plan.rom, Some("snes9x")).unwrap();
         fs::create_dir_all(&states).unwrap();
         fs::write(states.join(format!("{CHRONO}.state")), "state").unwrap();
-        let session = play(ctx, resuming, game, |_| {}).await.unwrap();
+        let session = play(ctx, resuming, game, Stop::default(), |_| {}).await.unwrap();
         assert!(session.notes.iter().any(|n| n.contains("resumed from the newest save state")), "{:?}", session.notes);
         assert!(requests.lock().unwrap().iter().any(|r| r.starts_with("POST /api/saves?rom_id=1")));
         let _ = fs::remove_dir_all(&root);
@@ -1375,11 +1544,11 @@ mod tests {
 
     #[test]
     fn a_process_is_waited_on_and_its_last_word_kept() {
-        let ok = run(&["sh".into(), "-c".into(), "echo starting; echo done".into()]).unwrap();
+        let ok = run(&["sh".into(), "-c".into(), "echo starting; echo done".into()], &AtomicU32::new(0)).unwrap();
         assert!(ok.success);
-        let failed = run(&["sh".into(), "-c".into(), "echo out; echo 'no such game' >&2; exit 3".into()]).unwrap();
+        let failed = run(&["sh".into(), "-c".into(), "echo out; echo 'no such game' >&2; exit 3".into()], &AtomicU32::new(0)).unwrap();
         assert_eq!((failed.success, failed.code, failed.last_line.as_deref()), (false, Some(3), Some("no such game")));
-        assert!(run(&["/nonexistent/launcher".into()]).unwrap_err().contains("could not start"));
+        assert!(run(&["/nonexistent/launcher".into()], &AtomicU32::new(0)).unwrap_err().contains("could not start"));
     }
 
     /// RomM rebuilt under the device, and Steam starts a game by the id it had: the game plays, and
@@ -1415,7 +1584,7 @@ mod tests {
         game.stamp = Some(Stamp { stem: MANA.into(), born: Some("2026-08-01T22:26:48+00:00".into()) });
 
         let mut stages = Vec::new();
-        let session = play(ctx, settings, game, |stage| stages.push(stage)).await.unwrap();
+        let session = play(ctx, settings, game, Stop::default(), |stage| stages.push(stage)).await.unwrap();
 
         assert!(session.exit.success && fs::read_to_string(&save).unwrap() == "played", "the game ran");
         assert_eq!(stages, [Stage::Running], "with no save going up, nothing waits on one after");
@@ -1423,6 +1592,116 @@ mod tests {
         assert!(session.notes[0].contains("\"Zipang (Japan)\""), "and says why its save stayed: {:?}", session.notes);
         let asked = requests.lock().unwrap().clone();
         assert!(asked.iter().all(|r| r.starts_with("GET /api/roms/1/simple")), "RomM was asked, and told nothing: {asked:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+    /// A game asked to stop while it runs — Steam's *Exit game* — hears it where it runs, writes its
+    /// save as it closes, and the launch sees its closing through.
+    #[tokio::test]
+    async fn a_game_asked_to_stop_closes_the_way_its_own_quit_does() {
+        let root = std::env::temp_dir().join(format!("deckhand-launch-stop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("games/snes")).unwrap();
+        fs::write(root.join("games/snes/Some Game (USA).sfc"), "rom").unwrap();
+        let save = root.join("save");
+        let settings = Settings {
+            launch_command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("trap 'printf saved > {}; exit 0' TERM; while :; do sleep 0.1; done", save.display()),
+            ]),
+            ..Settings::default()
+        };
+        let ctx = Context { client: RommClient::new().unwrap(), connection: None, retroarch_config: None, store: root.join("store") };
+        let mut game = installed(&["Some Game (USA).sfc"]);
+        game.system_id = "snes".into();
+        game.dir = root.join("games/snes");
+
+        let stop = Stop::default();
+        let asking = {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                stop.ask();
+            })
+        };
+        let session = play(ctx.clone(), settings.clone(), game.clone(), stop, |_| {}).await.unwrap();
+        asking.await.unwrap();
+        assert!(session.exit.success, "{session:?}");
+        assert_eq!(fs::read_to_string(&save).unwrap(), "saved");
+        assert_eq!(fs::read_dir(root.join("store/playing")).unwrap().count(), 0, "its closing seen through");
+
+        let stopped = Stop::default();
+        stopped.ask();
+        assert!(play(ctx, settings, game, stopped, |_| {}).await.unwrap_err().contains("before it started"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_game_that_does_not_close_in_time_is_left_to_its_marker() {
+        let mut child = Command::new("sh").args(["-c", "trap '' TERM; while :; do sleep 0.1; done"]).spawn().unwrap();
+        let pid = AtomicU32::new(child.id());
+        let stop = Stop::default();
+        stop.ask();
+        let game = std::future::pending::<()>();
+        assert_eq!(unless_stopped(&stop, &pid, Duration::from_millis(300), game).await, None);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// Deckhand ended with its game, which wrote a new save first: whichever Deckhand starts next
+    /// sends the save and the time played, and lets the marker go — or keeps it while RomM cannot
+    /// take them.
+    #[tokio::test]
+    async fn a_game_an_earlier_launch_never_saw_close_is_finished_by_the_next() {
+        const GAME: &str = "Some Game (USA)";
+        let root = std::env::temp_dir().join(format!("deckhand-launch-left-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ra")).unwrap();
+        fs::create_dir_all(root.join("games/snes")).unwrap();
+        fs::create_dir_all(root.join("saves")).unwrap();
+        fs::write(root.join(format!("games/snes/{GAME}.sfc")), "rom").unwrap();
+        fs::write(root.join("ra/retroarch.cfg"), format!("savefile_directory = \"{}/saves\"\n", root.display())).unwrap();
+        fs::write(root.join(format!("saves/{GAME}.srm")), "played here").unwrap();
+        let pushed = serde_json::json!({
+            "id": 12, "rom_id": 1, "file_name": format!("{GAME} [2026-07-02_10-00-00].srm"),
+            "emulator": "snes9x", "updated_at": "2026-07-02T10:00:00Z",
+        });
+        let game = crate::playing::Game {
+            title: GAME.into(),
+            rom: root.join(format!("games/snes/{GAME}.sfc")),
+            system: "snes".into(),
+            emulator: Emulator::Core("snes9x".into()),
+            stamp: None,
+        };
+        let context = |host: String| Context {
+            client: RommClient::new().unwrap(),
+            connection: Some(Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None }),
+            retroarch_config: Some(root.join("ra/retroarch.cfg")),
+            store: root.join("store"),
+        };
+        // Ten minutes in, and Deckhand ended with the game: last touched as it went.
+        let held = crate::playing::hold(&root.join("store"), 1, game).unwrap();
+        let end = held.start() + Duration::from_secs(600);
+        drop(held);
+        let marker = fs::read_dir(root.join("store/playing")).unwrap().next().unwrap().unwrap().path();
+        fs::OpenOptions::new().write(true).open(&marker).unwrap().set_modified(end).unwrap();
+
+        let offline = crate::stub_server::start(vec![]).await;
+        assert_eq!(finish_left(&context(offline)).await, 0);
+        assert!(marker.is_file(), "kept while RomM cannot take it");
+
+        let (host, requests) = crate::stub_server::start_recording(vec![
+            ("GET /api/saves", 200, "[]".into()),
+            ("POST /api/saves", 201, pushed.to_string()),
+            ("GET /api/states", 200, "[]".into()),
+            ("POST /api/play-sessions", 200, "{}".into()),
+        ])
+        .await;
+        assert_eq!(finish_left(&context(host)).await, 1);
+        assert!(!marker.exists());
+        let asked = requests.lock().unwrap().clone();
+        assert!(asked.iter().any(|r| r.starts_with("POST /api/saves?rom_id=1")), "the save it wrote went up: {asked:?}");
+        assert!(asked.iter().any(|r| r.starts_with("POST /api/play-sessions")), "and the ten minutes: {asked:?}");
         let _ = fs::remove_dir_all(&root);
     }
 }

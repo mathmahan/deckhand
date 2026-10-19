@@ -1,10 +1,11 @@
-//! A game being played, on disk, so its time played outlives the process that timed it.
+//! A game being played, on disk, so what is owed when it closes outlives the process that would
+//! have done it: its saves synced, and its time played sent to RomM.
 //!
 //! Every way a game starts writes a marker for it in `<store>/playing/` as it starts, and takes it
-//! once the game has closed and RomM has the session: the window's Play and a game's own Steam
-//! shortcut (both [`crate::launch::play`]), and ES-DE's hooks (`deckhand pre` and `post`). What the
-//! marker is for is the session that never gets that far. Steam's *Exit game* ends Deckhand and the
-//! emulator together, and so does a crash, a dead battery or a power cut.
+//! once the game has closed, its saves are synced and RomM has the session: the window's Play and a
+//! game's own Steam shortcut (both [`crate::launch::play`]), and ES-DE's hooks (`deckhand pre` and
+//! `post`). What the marker is for is the session that never gets that far. Steam's *Exit game*
+//! ends Deckhand and the emulator together, and so does a crash, a dead battery or a power cut.
 //!
 //! Three things make a marker worth trusting once whatever wrote it is gone:
 //!
@@ -18,9 +19,11 @@
 //!   options, with nothing alive between it and its `post` — cannot be told from a game still
 //!   running, so only that `post` takes it, as it always has.
 //!
-//! A kept marker that nobody holds is a session RomM has not had: [`settle_left`] sends it from
-//! whichever Deckhand starts next. A session RomM could not take as its game closed — no network,
-//! say — is left the same way, on purpose.
+//! A kept marker that nobody holds is a game whose closing was never seen through: [`left`] hands it
+//! to whichever Deckhand starts next, which syncs the game's saves and sends the session
+//! ([`crate::launch::finish_left`]). A game whose saves or session RomM could not take as it closed —
+//! no network, say — is left the same way, on purpose. The marker carries what that needs ([`Game`]),
+//! so it can be done from anywhere, without the window's library or ES-DE's arguments.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, Write};
@@ -29,8 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Connection;
-use crate::romm::RommClient;
+use crate::library::Stamp;
 use crate::romm::models::PlaySession;
 
 /// How often a held marker is touched.
@@ -47,6 +49,20 @@ const LONGEST: Duration = Duration::from_secs(24 * 3600);
 /// to start another.
 const LOOK: Duration = Duration::from_secs(1);
 
+/// What syncing a game's saves needs, as a launch worked it out: kept in its marker, so the sync can
+/// be finished by a Deckhand that never saw the launch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Game {
+    pub title: String,
+    /// The file the emulator was handed.
+    pub rom: PathBuf,
+    /// ES-DE's system: `psx`, `gc`.
+    pub system: String,
+    pub emulator: crate::launch::Emulator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<Stamp>,
+}
+
 /// What a marker says. A build before these markers wrote the start alone, as seconds; that still
 /// reads, as a marker never kept.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +74,12 @@ struct Note {
     /// Whether anything has ever held it — see the module's header.
     #[serde(default)]
     kept: bool,
+    /// What finishing the game's saves needs. Missing, only its time played is owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    game: Option<Game>,
+    /// RomM has its time played already, and only its saves are owed — so it is never sent twice.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sent: bool,
 }
 
 impl Note {
@@ -65,7 +87,7 @@ impl Note {
         let text = text.trim();
         serde_json::from_str(text)
             .ok()
-            .or_else(|| text.parse().ok().map(|start| Note { start, rom_id: None, kept: false }))
+            .or_else(|| text.parse().ok().map(|start| Note { start, rom_id: None, kept: false, game: None, sent: false }))
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -117,11 +139,11 @@ pub struct Held {
     start: SystemTime,
 }
 
-/// Note that `rom` starts now, held by this process until [`Held::end`]. Dropped without that, the
-/// marker stays for [`settle_left`]. None when it cannot be written: the game still plays, its time
-/// just has nothing behind it.
-pub fn hold(store: &Path, rom: &Path, rom_id: i64) -> Option<Held> {
-    let path = path(store, rom);
+/// Note that `game` starts now, held by this process until [`Held::end`]. Dropped without that, the
+/// marker stays for [`left`]. None when it cannot be written: the game still plays, its closing just
+/// has nothing behind it.
+pub fn hold(store: &Path, rom_id: i64, game: Game) -> Option<Held> {
+    let path = path(store, &game.rom);
     let dir = path.parent()?;
     fs::create_dir_all(dir).ok()?;
     // Locked before it has a name, so no other Deckhand ever sees it unheld.
@@ -132,7 +154,7 @@ pub fn hold(store: &Path, rom: &Path, rom_id: i64) -> Option<Held> {
         Err(fs::TryLockError::WouldBlock) => return None,
     }
     let start = SystemTime::now();
-    let written = file.write_all(&Note { start: secs(start), rom_id: Some(rom_id), kept: true }.bytes());
+    let written = file.write_all(&Note { start: secs(start), rom_id: Some(rom_id), kept: true, game: Some(game), sent: false }.bytes());
     if written.and_then(|()| fs::rename(&staging, &path)).is_err() {
         let _ = fs::remove_file(&staging);
         return None;
@@ -150,19 +172,38 @@ impl Held {
         let _ = self.file.set_modified(SystemTime::now());
     }
 
-    /// The session is done with — RomM has it, or there was none to have. The marker goes, unless a
-    /// later start of the game has put its own in its place.
+    /// The game's closing is seen through — its saves synced, RomM has the session or there was
+    /// none. The marker goes, unless a later start of the game has put its own in its place.
     pub fn end(self) {
         if names(&self.file, &self.path) {
             let _ = fs::remove_file(&self.path);
         }
     }
+
+    /// RomM has the session, but not all of the game's saves: the marker stays for those alone.
+    pub fn sent(self) {
+        mark_sent(&self.file, &self.path);
+    }
+}
+
+/// Say in the marker `file` holds that its time played has gone, through the held file so the lock
+/// stays on what the path names. Its last touch stays the end it was.
+fn mark_sent(file: &File, path: &Path) {
+    let Some(mut note) = fs::read_to_string(path).ok().and_then(|text| Note::read(&text)) else { return };
+    let touched = file.metadata().and_then(|m| m.modified());
+    note.sent = true;
+    let mut writer = file;
+    if names(file, path) && writer.set_len(0).and_then(|()| writer.rewind()).and_then(|()| writer.write_all(&note.bytes())).is_ok()
+        && let Ok(touched) = touched
+    {
+        let _ = file.set_modified(touched);
+    }
 }
 
 /// Note that `rom` starts now with nothing to hold the marker: a `pre`, whose `post` takes it. ES-DE's
 /// hook then starts [`keep`] to hold it.
-pub fn start(store: &Path, rom: &Path, rom_id: Option<i64>) {
-    let note = Note { start: secs(SystemTime::now()), rom_id, kept: false };
+pub fn start(store: &Path, rom: &Path, rom_id: Option<i64>, game: Option<Game>) {
+    let note = Note { start: secs(SystemTime::now()), rom_id, kept: false, game, sent: false };
     let _ = crate::sync::write_atomic(&path(store, rom), &note.bytes());
 }
 
@@ -172,6 +213,7 @@ pub struct Taken {
     pub rom_id: Option<i64>,
     pub start: SystemTime,
     pub end: SystemTime,
+    pub game: Option<Game>,
 }
 
 impl Taken {
@@ -195,18 +237,19 @@ pub fn take(store: &Path, rom: &Path) -> Option<Taken> {
         Some(touched) if note.kept && now.duration_since(touched).is_ok_and(|quiet| quiet > QUIET) => touched,
         _ => now,
     };
-    Some(Taken { rom_id: note.rom_id, start: at(note.start), end })
+    Some(Taken { rom_id: note.rom_id, start: at(note.start), end, game: note.game })
 }
 
-/// Put a taken session back, for [`settle_left`] to send: RomM could not have it when its game closed.
-/// A start of the game since has its own marker there, and wins.
-pub fn owe(store: &Path, rom: &Path, taken: &Taken, rom_id: Option<i64>) {
+/// Put a taken session back, for [`left`] to finish: its `post` could not sync its saves, or RomM
+/// could not take its time played — `sent` when it did. A start of the game since has its own marker
+/// there, and wins.
+pub fn owe(store: &Path, rom: &Path, taken: &Taken, rom_id: Option<i64>, game: Option<Game>, sent: bool) {
     let path = path(store, rom);
     let Some(rom_id) = taken.rom_id.or(rom_id) else { return };
     if path.exists() {
         return;
     }
-    let note = Note { start: secs(taken.start), rom_id: Some(rom_id), kept: true };
+    let note = Note { start: secs(taken.start), rom_id: Some(rom_id), kept: true, game: taken.game.clone().or(game), sent };
     if crate::sync::write_atomic(&path, &note.bytes()).is_ok()
         && let Ok(file) = OpenOptions::new().write(true).open(&path)
     {
@@ -245,12 +288,52 @@ pub fn keep(store: &Path, rom: &Path) {
     }
 }
 
-/// Send RomM every session whose marker was kept and that nobody holds any more, and let those
-/// markers go. A marker RomM does not take stays for the next time; one that is not a session — too
-/// short to be play, or too long to be anything but left behind — just goes. Answers how many went.
-pub async fn settle_left(client: &RommClient, conn: &Connection, store: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(store.join("playing")) else { return 0 };
-    let mut sent = 0;
+/// A game whose closing was never seen through, held by this process while it is finished — so no
+/// other Deckhand finishes it too. Dropped without [`Left::done`], it stays for the next time.
+#[derive(Debug)]
+pub struct Left {
+    file: File,
+    path: PathBuf,
+    note: Note,
+    end: SystemTime,
+}
+
+impl Left {
+    pub fn rom_id(&self) -> Option<i64> {
+        self.note.rom_id
+    }
+
+    /// What syncing its saves needs; None when only its time played is owed.
+    pub fn game(&self) -> Option<&Game> {
+        self.note.game.as_ref()
+    }
+
+    /// The play session it was — from its start to its last touch, if that was play — unless RomM
+    /// has it already.
+    pub fn session(&self) -> Option<PlaySession> {
+        if self.note.sent {
+            return None;
+        }
+        session(self.note.rom_id?, at(self.note.start), self.end)
+    }
+
+    /// Finished: the marker goes.
+    pub fn done(self) {
+        if names(&self.file, &self.path) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    /// Its time played went, its saves did not: the marker stays for those alone.
+    pub fn sent(self) {
+        mark_sent(&self.file, &self.path);
+    }
+}
+
+/// Every marker that was kept and that nobody holds any more, each now held by this process.
+pub fn left(store: &Path) -> Vec<Left> {
+    let Ok(entries) = fs::read_dir(store.join("playing")) else { return Vec::new() };
+    let mut found = Vec::new();
     for path in entries.flatten().map(|e| e.path()) {
         if path.extension().is_none_or(|e| e != "start") || path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
             continue;
@@ -265,19 +348,9 @@ pub async fn settle_left(client: &RommClient, conn: &Connection, store: &Path) -
             continue;
         }
         let Ok(end) = file.metadata().and_then(|m| m.modified()) else { continue };
-        let play = note.rom_id.and_then(|rom_id| session(rom_id, at(note.start), end));
-        if let Some(play) = &play {
-            if client.post_play_session(conn, play).await.is_err() {
-                continue;
-            }
-            sent += 1;
-        }
-        // Still holding it, so no other Deckhand sends it too.
-        if names(&file, &path) {
-            let _ = fs::remove_file(&path);
-        }
+        found.push(Left { file, path, note, end });
     }
-    sent
+    found
 }
 
 #[cfg(test)]
@@ -301,7 +374,7 @@ mod tests {
         /// A marker as one left by a session that started `ago` and was last touched `quiet` ago.
         fn left(&self, kept: bool, ago: u64, quiet: u64) {
             let now = SystemTime::now();
-            let note = Note { start: secs(now - Duration::from_secs(ago)), rom_id: Some(7), kept };
+            let note = Note { start: secs(now - Duration::from_secs(ago)), rom_id: Some(7), kept, game: Some(game()), sent: false };
             crate::sync::write_atomic(&self.marker(), &note.bytes()).unwrap();
             OpenOptions::new().write(true).open(self.marker()).unwrap().set_modified(now - Duration::from_secs(quiet)).unwrap();
         }
@@ -315,62 +388,54 @@ mod tests {
 
     const ROM: &str = "/games/snes/Some Game (USA).sfc";
 
-    fn connection(host: String) -> Connection {
-        Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None }
+    fn game() -> Game {
+        Game {
+            title: "Some Game (USA)".into(),
+            rom: ROM.into(),
+            system: "snes".into(),
+            emulator: crate::launch::Emulator::Core("snes9x".into()),
+            stamp: Some(Stamp { stem: "Some Game (USA)".into(), born: None }),
+        }
     }
 
-    fn sessions(requests: &crate::stub_server::Requests) -> usize {
-        requests.lock().unwrap().iter().filter(|r| r.starts_with("POST /api/play-sessions")).count()
-    }
-
-    #[tokio::test]
-    async fn a_held_marker_is_a_game_still_running_and_is_sent_once_its_holder_is_gone() {
+    #[test]
+    fn a_held_marker_is_a_game_still_running_and_is_left_once_its_holder_is_gone() {
         let store = Store::new("held");
-        let (host, requests) = crate::stub_server::start_recording(vec![("POST /api/play-sessions", 200, "{}".into())]).await;
-        let (client, conn) = (RommClient::new().unwrap(), connection(host));
-
-        let held = hold(&store.0, Path::new(ROM), 7).unwrap();
-        assert!(fs::read_dir(store.0.join("playing")).unwrap().count() == 1, "nothing staged is left beside it");
-        assert_eq!(settle_left(&client, &conn, &store.0).await, 0);
-        assert!(store.marker().is_file(), "a game still running keeps its marker");
+        let held = hold(&store.0, 7, game()).unwrap();
+        assert_eq!(fs::read_dir(store.0.join("playing")).unwrap().count(), 1, "nothing staged is left beside it");
+        assert!(left(&store.0).is_empty(), "a game still running is not left");
 
         // Played ten minutes, then ended with Deckhand: last touched as it went.
         held.file.set_modified(held.start + Duration::from_secs(600)).unwrap();
         drop(held);
-        assert_eq!(settle_left(&client, &conn, &store.0).await, 1);
+        let found = left(&store.0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].game(), Some(&game()), "with what syncing its saves needs");
+        assert_eq!(found[0].session().map(|p| p.duration_ms / 1000), Some(600));
+        assert!(left(&store.0).is_empty(), "held while it is finished, so nothing else finishes it too");
+
+        drop(found);
+        let found = left(&store.0);
+        assert_eq!(found.len(), 1, "not done, so it stays for the next time");
+        found.into_iter().for_each(Left::done);
         assert!(!store.marker().exists());
-        assert_eq!(sessions(&requests), 1);
-        assert_eq!(settle_left(&client, &conn, &store.0).await, 0, "sent once");
     }
 
-    #[tokio::test]
-    async fn a_session_romm_cannot_take_waits_for_the_next_time_and_one_that_is_not_play_just_goes() {
-        let store = Store::new("refused");
-        let refusing = crate::stub_server::start(vec![("POST /api/play-sessions", 500, "{}".into())]).await;
-        let client = RommClient::new().unwrap();
-
-        store.left(true, 900, 300);
-        assert_eq!(settle_left(&client, &connection(refusing), &store.0).await, 0);
-        assert!(store.marker().is_file(), "kept for when RomM can take it");
-
-        let (host, requests) = crate::stub_server::start_recording(vec![("POST /api/play-sessions", 200, "{}".into())]).await;
-        store.left(true, 30, 25);
-        assert_eq!(settle_left(&client, &connection(host.clone()), &store.0).await, 0);
-        assert!(!store.marker().exists(), "five seconds is a game that never got going");
-        store.left(true, 3 * 24 * 3600, 24 * 3600);
-        assert_eq!(settle_left(&client, &connection(host), &store.0).await, 0);
-        assert!(!store.marker().exists(), "a day long is a marker left behind");
-        assert_eq!(sessions(&requests), 0);
-    }
-
-    #[tokio::test]
-    async fn a_marker_nothing_ever_held_is_left_for_its_own_post() {
+    #[test]
+    fn a_marker_nothing_ever_held_is_left_for_its_own_post() {
         let store = Store::new("plain");
-        let (host, requests) = crate::stub_server::start_recording(vec![("POST /api/play-sessions", 200, "{}".into())]).await;
         store.left(false, 900, 900);
-        assert_eq!(settle_left(&RommClient::new().unwrap(), &connection(host), &store.0).await, 0);
-        assert!(store.marker().is_file(), "it may be a game launched through Steam's launch options, still running");
-        assert_eq!(sessions(&requests), 0);
+        assert!(left(&store.0).is_empty(), "it may be a game launched through Steam's launch options, still running");
+        assert!(store.marker().is_file());
+    }
+
+    #[test]
+    fn a_left_session_too_short_or_too_long_is_none() {
+        let store = Store::new("lengths");
+        store.left(true, 30, 25);
+        assert_eq!(left(&store.0)[0].session(), None, "five seconds is a game that never got going");
+        store.left(true, 3 * 24 * 3600, 24 * 3600);
+        assert_eq!(left(&store.0)[0].session(), None, "two days is a marker left behind");
     }
 
     #[test]
@@ -378,10 +443,10 @@ mod tests {
         let store = Store::new("take");
         let rom = Path::new(ROM);
 
-        start(&store.0, rom, Some(7));
+        start(&store.0, rom, Some(7), Some(game()));
         let taken = take(&store.0, rom).unwrap();
         assert!(SystemTime::now().duration_since(taken.end).unwrap() < Duration::from_secs(5));
-        assert_eq!(taken.rom_id, Some(7));
+        assert_eq!((taken.rom_id, &taken.game), (Some(7), &Some(game())));
         assert_eq!(take(&store.0, rom), None, "taken, so a second post finds none");
 
         // ES-DE ended mid-game an hour after it began; this post is for a later start.
@@ -401,7 +466,7 @@ mod tests {
         let store = Store::new("legacy");
         crate::sync::write_atomic(&store.marker(), b"1782900000").unwrap();
         let taken = take(&store.0, Path::new(ROM)).unwrap();
-        assert_eq!((taken.start, taken.rom_id), (at(1_782_900_000), None));
+        assert_eq!((taken.start, taken.rom_id, &taken.game), (at(1_782_900_000), None, &None));
         assert!(taken.session(Some(7)).is_none(), "and, ended a day later, is no session");
     }
 
@@ -409,11 +474,11 @@ mod tests {
     fn ending_a_session_leaves_a_later_start_of_the_game_alone() {
         let store = Store::new("end");
         let rom = Path::new(ROM);
-        hold(&store.0, rom, 7).unwrap().end();
+        hold(&store.0, 7, game()).unwrap().end();
         assert!(!store.marker().exists());
 
-        let first = hold(&store.0, rom, 7).unwrap();
-        start(&store.0, rom, Some(7));
+        let first = hold(&store.0, 7, game()).unwrap();
+        start(&store.0, rom, Some(7), None);
         first.end();
         assert!(store.marker().is_file());
     }
@@ -423,24 +488,44 @@ mod tests {
         let store = Store::new("owe");
         let rom = Path::new(ROM);
         let now = SystemTime::now();
-        let taken = Taken { rom_id: None, start: now - Duration::from_secs(900), end: now - Duration::from_secs(60) };
+        let taken = Taken { rom_id: None, start: now - Duration::from_secs(900), end: now - Duration::from_secs(60), game: None };
 
-        owe(&store.0, rom, &taken, Some(7));
-        let note = Note::read(&fs::read_to_string(store.marker()).unwrap()).unwrap();
-        assert_eq!((note.rom_id, note.kept), (Some(7), true));
-        let touched = fs::metadata(store.marker()).unwrap().modified().unwrap();
-        assert_eq!(secs(touched), secs(taken.end), "it ended when the game closed, not when it was put back");
+        owe(&store.0, rom, &taken, Some(7), Some(game()), false);
+        let found = left(&store.0);
+        assert_eq!((found[0].rom_id(), found[0].game()), (Some(7), Some(&game())));
+        assert_eq!(found[0].session().map(|p| p.duration_ms / 1000), Some(840), "it ended when the game closed, not when it was put back");
+        drop(found);
 
-        start(&store.0, rom, Some(7));
-        owe(&store.0, rom, &taken, Some(7));
-        assert!(!Note::read(&fs::read_to_string(store.marker()).unwrap()).unwrap().kept);
+        start(&store.0, rom, Some(7), None);
+        owe(&store.0, rom, &taken, Some(7), None, false);
+        assert!(left(&store.0).is_empty(), "the new start's marker stays as it was");
+    }
+
+    #[test]
+    fn a_session_romm_has_is_never_sent_again_while_its_saves_are_still_owed() {
+        let store = Store::new("sent");
+        let held = hold(&store.0, 7, game()).unwrap();
+        held.file.set_modified(held.start + Duration::from_secs(600)).unwrap();
+        held.sent();
+        let found = left(&store.0);
+        assert_eq!(found.len(), 1, "still owed, for its saves");
+        assert_eq!((found[0].session(), found[0].game()), (None, Some(&game())));
+        let touched = found[0].file.metadata().unwrap().modified().unwrap();
+        assert_eq!(touched.duration_since(found[0].end).unwrap_or_default(), Duration::ZERO, "its end is what it was");
+        drop(found);
+
+        // A post that sent the session but not every save puts it back the same way.
+        let rom = Path::new(ROM);
+        let taken = take(&store.0, rom).unwrap();
+        owe(&store.0, rom, &taken, None, None, true);
+        assert_eq!(left(&store.0)[0].session(), None);
     }
 
     #[test]
     fn a_keeper_holds_the_marker_until_its_post_takes_it() {
         let store = Store::new("keep");
         let rom = Path::new(ROM);
-        start(&store.0, rom, Some(7));
+        start(&store.0, rom, Some(7), Some(game()));
         let keeper = {
             let store = store.0.clone();
             std::thread::spawn(move || keep(&store, Path::new(ROM)))
@@ -451,7 +536,8 @@ mod tests {
             assert!(Instant::now() < deadline, "the keeper never took hold");
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(Note::read(&fs::read_to_string(store.marker()).unwrap()).unwrap().kept);
+        let note = Note::read(&fs::read_to_string(store.marker()).unwrap()).unwrap();
+        assert!(note.kept && note.game == Some(game()), "kept now, and still says what its saves need");
 
         // A second keeper finds it held, and leaves.
         keep(&store.0, rom);

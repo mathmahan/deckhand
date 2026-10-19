@@ -18,7 +18,7 @@ iced = { version = "0.14", features = ["image", "tokio", "advanced"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "multipart", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "signal"] }
 futures = "0.3"
 
 # Cover pipeline: decode + downscale to display size, and the hero backdrop's blur. `ico` for the

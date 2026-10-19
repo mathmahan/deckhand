@@ -289,11 +289,17 @@ async fn game(rom: PathBuf, core: Option<String>, system: Option<String>, stage:
         sync::still_holds(&ctx.client, &ctx.connection, rom_id, &|now| stamp.same_rom(now)).await?;
     }
     ctx.register().await;
-    // A session an earlier launch never got to send — before `pre` writes this one's marker over the
-    // game's own.
-    let left = crate::playing::settle_left(&ctx.client, &ctx.connection, &ctx.store).await;
-    if left > 0 {
-        eprintln!("deckhand: sent RomM the playtime of {left} earlier session(s)");
+    // A game an earlier launch never saw close — before `pre` writes this one's marker over the game's
+    // own.
+    let launch = crate::launch::Context {
+        client: ctx.client.clone(),
+        connection: Some(ctx.connection.clone()),
+        retroarch_config: Settings::load().retroarch_config,
+        store: ctx.store.clone(),
+    };
+    let finished = crate::launch::finish_left(&launch).await;
+    if finished > 0 {
+        eprintln!("deckhand: synced the saves and playtime of {finished} game(s) an earlier launch never saw close");
     }
     // It goes to RomM with the sync that follows the game.
     let plays: Vec<PlaySession> = taken.as_ref().and_then(|t| t.session(rom_id)).into_iter().collect();
@@ -303,12 +309,31 @@ async fn game(rom: PathBuf, core: Option<String>, system: Option<String>, stage:
         (None, Some(system), Some(rd)) => rd.emulator(system, &rom),
         _ => Emulator::RetroArch,
     };
+    // What finishing this game's saves needs, for its marker: the same as this run works out.
+    let game = rom_id.map(|rom_id| crate::playing::Game {
+        title: rom.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        rom: rom.clone(),
+        system: system.clone().unwrap_or_else(|| {
+            let slug = ctx.builds.iter().find(|b| b.rom_id == rom_id).map(|b| b.system_id.as_str()).unwrap_or_default();
+            crate::launch::es_system(slug)
+        }),
+        emulator: match (&emulator, &core) {
+            (Emulator::RetroArch, Some(core)) => Emulator::Core(core.clone()),
+            (emulator, _) => emulator.clone(),
+        },
+        stamp: sync::stamp_of(&ctx.builds, rom_id),
+    });
     let (client, connection, install, builds, store) = (&ctx.client, &ctx.connection, &ctx.install, &ctx.builds, &ctx.store);
+    // An emulator whose saves this build does not sync has none to owe.
+    let mut syncable = true;
     let result = match emulator {
         Emulator::Core(id) => sync::sync_game(client, connection, install, builds, store, &rom, Some(&id), plays.clone()).await,
         Emulator::RetroArch => sync::sync_game(client, connection, install, builds, store, &rom, core.as_deref(), plays.clone()).await,
         Emulator::Other(label) => match sync::standalone::Emulator::for_launch(&system.unwrap_or_default(), &label) {
-            None => Err(format!("it runs on {label}, whose saves this build doesn't sync")),
+            None => {
+                syncable = false;
+                Err(format!("it runs on {label}, whose saves this build doesn't sync"))
+            }
             Some(standalone) => match sync::find_rom(builds, &rom) {
                 Ok(rom_id) => {
                     let title = rom.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -319,19 +344,27 @@ async fn game(rom: PathBuf, core: Option<String>, system: Option<String>, stage:
             },
         },
     };
-    // A play session no sync session took — a RomM without them, a sync that failed — goes on its own,
-    // and one RomM cannot take now waits in its marker for the next time.
+    let saves_owed = syncable && result.as_ref().map_or(true, |r| !r.failed.is_empty());
+    // A play session no sync session took — a RomM without them, a sync that failed — goes on its own.
+    let mut sent = result.as_ref().is_ok_and(|r| r.plays_recorded > 0);
     if let Some(play) = plays.first()
-        && result.as_ref().is_ok_and(|r| r.plays_recorded == 0) | result.is_err()
-        && let Err(e) = client.post_play_session(connection, play).await
+        && !sent
     {
-        eprintln!("deckhand post: playtime not recorded on RomM yet: {e}");
-        if let Some(taken) = &taken {
-            crate::playing::owe(store, &rom, taken, rom_id);
+        match client.post_play_session(connection, play).await {
+            Ok(()) => sent = true,
+            Err(e) => eprintln!("deckhand post: playtime not recorded on RomM yet: {e}"),
         }
     }
+    // Saves that did not all go up, or a session RomM could not take: back in the marker, for the next
+    // Deckhand to finish.
+    let session_owed = !plays.is_empty() && !sent;
+    if (saves_owed || session_owed)
+        && let Some(taken) = &taken
+    {
+        crate::playing::owe(store, &rom, taken, rom_id, game.clone(), !session_owed);
+    }
     if stage == Stage::Pre {
-        crate::playing::start(store, &rom, rom_id);
+        crate::playing::start(store, &rom, rom_id, game);
     }
     result
 }
@@ -396,7 +429,25 @@ fn play(args: &[String]) -> i32 {
         crate::launch::Stage::Running => eprintln!("deckhand play: starting {title}"),
         crate::launch::Stage::Saving => eprintln!("deckhand play: {title} closed, syncing its saves"),
     };
-    match runtime.block_on(crate::launch::play(ctx, settings, installed, told)) {
+    // Steam's *Exit game* is a signal to this process: the first asks the game to close, and this to
+    // see its closing through — see `crate::launch::Stop`. A second ends it at once; the game's
+    // marker keeps what is still owed.
+    let stop = crate::launch::Stop::default();
+    runtime.spawn({
+        let stop = stop.clone();
+        async move {
+            use futures::StreamExt;
+            let mut signals = std::pin::pin!(crate::launch::stop_signals());
+            if signals.next().await.is_some() {
+                eprintln!("deckhand play: asked to stop — closing the game first");
+                stop.ask();
+            }
+            if signals.next().await.is_some() {
+                std::process::exit(1);
+            }
+        }
+    });
+    match runtime.block_on(crate::launch::play(ctx, settings, installed, stop, told)) {
         Ok(session) => {
             for note in &session.notes {
                 eprintln!("deckhand play:   {note}");

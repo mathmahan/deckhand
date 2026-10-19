@@ -289,6 +289,9 @@ pub enum Message {
     // Playing
     /// News from a running launch: the game has started, or it is over — see [`crate::launch`].
     LaunchEvent(crate::launch::Event),
+    /// The window is asked to close by a signal: Steam's *Exit game* on Deckhand's own shortcut, or
+    /// the session ending — see [`App::stop_asked`].
+    StopAsked,
     /// A finished download's BIOS and save pull came back, with whatever is worth saying about it.
     Readied(i64, Vec<String>),
 }
@@ -564,6 +567,10 @@ pub struct App {
     /// The game being played, from the press until its save has gone back up. One at a time: two
     /// emulators would fight over the screen and the pad, and two syncs over one save.
     playing: Option<i64>,
+    /// How to ask the game being played to close, while there is one.
+    stop: Option<crate::launch::Stop>,
+    /// Asked to close while a game ran: the window goes once the game's closing is seen to.
+    closing: bool,
     /// The game being handed to its emulator, or back, while its saves move — see [`Handover`].
     handover: Option<Handover>,
     settings_focus: crate::ui::settings::SettingsFocus,
@@ -658,6 +665,8 @@ impl App {
             },
             downloads_focus: Default::default(),
             playing: None,
+            stop: None,
+            closing: false,
             handover: None,
             game_saves: HashMap::new(),
             achievements: HashMap::new(),
@@ -699,7 +708,7 @@ impl App {
         // Trimming the prepared-art cache is disk work with no deadline, so it goes to a blocking
         // thread and its result is thrown away — nothing on screen waits for it.
         let real = fixtures.is_none();
-        let (client, connection) = (app.client.clone(), app.settings.connection.clone());
+        let launch = app.launch_context();
         let prune = Task::future(async move {
             let _ = off_thread(covers::prune_caches).await;
             // ES-DE's hooks run a copy of this binary; an update leaves them on the old one until
@@ -707,10 +716,10 @@ impl App {
             if real && let Ok(Some(note)) = off_thread(crate::hooks::refresh_if_installed).await {
                 eprintln!("deckhand: {note}");
             }
-            // The playtime of a game that ended along with the Deckhand that ran it — see
+            // The saves and playtime of a game that ended along with the Deckhand that ran it — see
             // `crate::playing`. Not in fixture mode either.
-            if real && let Some(connection) = &connection {
-                crate::playing::settle_left(&client, connection, &Settings::config_dir()).await;
+            if real {
+                crate::launch::finish_left(&launch).await;
             }
         })
         .discard();
@@ -883,6 +892,13 @@ impl App {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        // Heard on every screen, from the first: listening is what stops a signal ending the window
+        // on the spot, mid-sync — see `App::stop_asked`.
+        let stops = Subscription::run(crate::launch::stop_signals).map(|()| Message::StopAsked);
+        Subscription::batch([stops, self.screen_subscription()])
+    }
+
+    fn screen_subscription(&self) -> Subscription<Message> {
         // The login screen's text inputs need the keys for themselves — grabbing arrows there would
         // break moving the caret inside the URL field — so it hears only the pad, and the keys only
         // while the on-screen keyboard or a QR code is up.

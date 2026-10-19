@@ -897,6 +897,7 @@ impl App {
                 Task::none()
             }
             Message::LaunchEvent(event) => self.on_launch_event(event),
+            Message::StopAsked => self.stop_asked(),
             // Answered in `update`, before dispatch; one arriving with nothing waiting is stale.
             Message::ConflictChosen(_) => Task::none(),
             Message::Readied(rom_id, notes) => {
