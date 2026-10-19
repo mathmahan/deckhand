@@ -330,6 +330,25 @@ impl App {
                 // The page reads RomM again: the restored version is a new record, the newest.
                 self.load_saves(tile)
             }
+            Message::StatePut(tile, result) => {
+                match &result {
+                    Ok((_, report)) => self.watcher.wrote(&report.written),
+                    Err(_) => self.watcher.rebase(),
+                }
+                self.say(match &result {
+                    Ok((slot, report)) => {
+                        let slot = slot.in_words();
+                        let kept = if report.notes.iter().any(|n| n.contains("save-backups")) { " What was in it is in save-backups." } else { "" };
+                        match report.failed.first() {
+                            Some(why) => format!("It's in {slot} here, but didn't reach RomM ({why}). The next sync sends it.{kept}"),
+                            None => format!("It's in {slot} now, here and on RomM: load it from RetroArch's Quick Menu.{kept}"),
+                        }
+                    }
+                    Err(why) => format!("Couldn't put it into a slot: {why}"),
+                });
+                // The page reads RomM again: the slot's own state is new, or changed.
+                self.load_saves(tile)
+            }
             Message::OpenSearch => {
                 let from = match &self.screen {
                     Screen::Browsing(Route::Search { .. }) => return Task::none(),

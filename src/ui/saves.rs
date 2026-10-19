@@ -8,7 +8,8 @@
 //! Nothing here is invented: no playtime, no in-game location, since RomM's records carry neither.
 //!
 //! Each row says whether this device holds that version ("on this device") and, for a RetroArch
-//! state, which slot it lands in — the slot the sync lays it into, which is the one to load.
+//! state, which of RetroArch's slots it is here — the one to load it from. One in no slot can be put
+//! into one.
 
 use iced::widget::text::Wrapping;
 use iced::widget::{self as widget, button, column, container, image, row, scrollable, text, Space};
@@ -109,7 +110,10 @@ pub fn saves_view<'a>(ctx: &SavesContext<'a>) -> Element<'a, Message> {
         }
     };
 
-    let hint = text("Up / Down to look through  ·  Enter or A restores an in-game save  ·  Left / Right for the other tab  ·  Esc goes back")
+    let hint = text(match ctx.focus.tab {
+        Tab::States => "Up / Down to look through  ·  Enter or A puts a state into a slot  ·  Left / Right for the other tab  ·  Esc goes back",
+        Tab::Saves => "Up / Down to look through  ·  Enter or A restores an in-game save  ·  Left / Right for the other tab  ·  Esc goes back",
+    })
         .size(theme::text_size::LABEL_MEDIUM)
         .color(theme::TEXT_MUTED);
 
@@ -149,13 +153,11 @@ fn tab_button<'a>(tab: Tab, label: &str, count: Option<usize>, active: bool) -> 
     .into()
 }
 
-/// What a record is called on the page: a RetroArch state by the slot it lands in, anything else by
+/// What a record is called on the page: a RetroArch state by the slot it is here, anything else by
 /// its own name with RomM's history stamp taken off.
 fn title(record: &SaveAsset, saves: &GameSaves) -> String {
     match saves.slots.get(&record.id) {
-        Some(0) => "Slot 0 · latest".to_string(),
-        Some(slot) if *slot < crate::sync::states::FIRST_HISTORY => format!("Slot {slot} · your slot"),
-        Some(slot) => format!("Slot {slot} · older"),
+        Some(slot) => slot.label(),
         None => crate::sync::canonical(&record.file_name),
     }
 }
@@ -279,9 +281,9 @@ fn preview<'a>(record: &SaveAsset, saves: &GameSaves, ctx: &SavesContext<'a>) ->
         ("SIZE", record.file_size_bytes.map(|b| human_bytes(b.max(0) as u64)).unwrap_or_else(|| "—".into())),
     ];
     if let Some(slot) = saves.slots.get(&record.id) {
-        cells.push(("RETROARCH SLOT", slot.to_string()));
+        cells.push(("RETROARCH SLOT", slot.number()));
     }
-    // Another core's state is never laid into a slot here: say why it has none.
+    // Another core's state is never in a slot here: say why it has none.
     if saves.other_core.contains(&record.id) {
         let core = saves.core.clone().unwrap_or_else(|| "this device's core".into());
         cells.push(("LOADS HERE", format!("no — {core} runs it here")));

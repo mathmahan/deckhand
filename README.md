@@ -35,7 +35,7 @@ and keep saves and save states in sync with your server.
   RomM 5.4's web app shows the game as being played on the Deck.
 - **Save sync.** Saves and save states sync both ways through RomM: around every launch, and while
   the window is open, as soon as a save changes. An older save can be restored from a game's Saves
-  page. See [Save sync](#save-sync) for what each system syncs.
+  page, and a save state there put into a slot. See [Save sync](#save-sync) for what each system syncs.
 - **Steam and ES-DE.** Downloaded games can be added to Steam with their art, and still sync when
   started there. Games started from ES-DE sync too, through hooks Deckhand installs. Add Deckhand
   itself to Steam as a non-Steam game and it gives itself a cover, banner, logo and backdrop.
@@ -49,6 +49,14 @@ it reads each game's id off its disc and finds that game's saves in the emulator
 memory card every game shares. A game's saves travel as one file in its `autosave` slot, in the same
 shape RomM's Android app syncs. Saves put on RomM by earlier versions of Deckhand are read and moved
 over on each game's first sync.
+
+Save states are RetroArch's slots, one to one: slot 0, every numbered slot however many there are,
+and the auto slot are each one state on RomM, under a name that says the slot and the core. Saving
+into a slot again replaces its state on RomM, so a slot is the same on every device that runs the
+game under that core. Deckhand never deletes a save state on RomM; that is yours to do, on RomM's
+own pages, and a state deleted on either side is not brought back by the other. A state on RomM that
+is in no slot here, such as one saved in RomM's web player, can be put into one from the game's Saves
+page.
 
 | Platform | Emulator | What syncs |
 |---|---|---|

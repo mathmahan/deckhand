@@ -127,6 +127,15 @@ impl App {
                 0 => self.restore_save(tile, *version),
                 _ => Task::none(),
             },
+            Then::PutState { tile, state } => {
+                use crate::sync::states::Target;
+                match chosen {
+                    0 => self.put_state(tile, *state, Target::Next),
+                    1 => self.put_state(tile, *state, Target::Zero),
+                    2 => self.put_state(tile, *state, Target::Auto),
+                    _ => Task::none(),
+                }
+            }
             Then::Launcher => match chosen {
                 0 => {
                     self.settings.launch_command = None;

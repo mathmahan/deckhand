@@ -407,10 +407,10 @@ mod render {
         let mut app = paired_fixtures(30);
         let game = app.library.all_games()[3].clone();
         let states = vec![
-            record(21, &format!("{}.slot2.deckhand.state", game.title), "2026-09-30T21:14:00Z", true, "snes9x", 1_210_000),
-            record(20, &format!("{} [2026-09-30 20-02-11-123].deckhand.state", game.title), "2026-09-30T20:02:11Z", true, "snes9x", 1_208_000),
-            record(19, &format!("{} [2026-09-28 18-40-02-020].deckhand.state", game.title), "2026-09-28T18:40:02Z", true, "snes9x", 1_207_000),
-            record(18, &format!("{} [2026-09-21 09-12-45-500].deckhand.state", game.title), "2026-09-21T09:12:45Z", false, "snes9x", 1_201_000),
+            record(21, &format!("{}.slot2.retroarch.deckhand.state", game.title), "2026-09-30T21:14:00Z", true, "retroarch", 1_210_000),
+            record(20, &format!("{}.auto.retroarch.deckhand.state", game.title), "2026-09-30T20:02:11Z", true, "retroarch", 1_208_000),
+            record(19, &format!("{}.slot0.retroarch.deckhand.state", game.title), "2026-09-28T18:40:02Z", true, "retroarch", 1_207_000),
+            record(18, &format!("{}.state", game.title), "2026-09-21T09:12:45Z", false, "snes9x", 1_201_000),
         ];
         let saves = vec![
             record(31, &format!("{} [2026-09-30_21-20-00].srm", game.title), "2026-09-30T21:20:00Z", false, "snes9x", 8_192),
@@ -423,7 +423,7 @@ mod render {
                 app.covers.insert(url, covers::Cover::Ready(picture(hue), meta));
             }
         }
-        let slots = crate::game_saves::slots(&states, &crate::sync::states::Core::default());
+        let slots = crate::sync::states::layout(&states, &crate::sync::states::Core::default());
         let elsewhere = [(31, vec!["Living room PC".to_string()])].into_iter().collect();
         let data = GameSaves { states, saves, on_device: [20, 31].into_iter().collect(), elsewhere, slots, ..Default::default() };
         app.game_saves.insert(game.rom_id, Ok(Arc::new(data)));

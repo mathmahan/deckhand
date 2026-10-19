@@ -375,6 +375,12 @@ impl Install {
         GameSaves { existing, target }
     }
 
+    /// Whether RetroArch loads a game's auto slot state by itself when the game starts —
+    /// `savestate_auto_load`, which naming a slot to start in overrides.
+    pub fn loads_auto_state(&self) -> bool {
+        self.settings.get("savestate_auto_load").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    }
+
     /// The folder RetroArch keeps `rom`'s save states in, run by `core` (an id) if known.
     ///
     /// Err says why there is none: states kept beside the games, or filed by a core nobody named —

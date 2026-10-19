@@ -545,6 +545,27 @@ pub async fn restore(
     session::restore(client, connection, store, thread, version).await
 }
 
+/// Put RomM's `state` into one of `game`'s RetroArch state slots on this device and send it up as
+/// that slot's own — the Saves page's "put into a slot". See [`states::Target`].
+pub async fn put_state(
+    client: &RommClient,
+    connection: &Connection,
+    install: Result<&Install, &str>,
+    store: &Path,
+    game: &crate::launch::Plan,
+    state: &SaveAsset,
+    target: states::Target,
+) -> Result<(states::Slot, Report), String> {
+    let install = install.map_err(str::to_string)?;
+    let core = game.emulator.syncs().ok_or_else(|| "only RetroArch keeps states in slots".to_string())?;
+    let install = install.for_game(&game.rom, core);
+    let dir = install.game_states_dir(&game.rom, core)?;
+    let stem = game.rom.file_stem().and_then(|s| s.to_str()).ok_or("the game has no file name to name its states by")?;
+    let mut run = Run::with_index(client, connection, store, dir.clone(), "state-index.json").stamped(game.stamp.clone());
+    let slot = run.put(&dir, stem, game.rom_id, &states::Core::of(core, &install), state, target).await?;
+    Ok((slot, run.finish().await))
+}
+
 /// A RetroArch battery save as a thread of its game's `autosave` slot — the engine before sigil.
 fn retroarch_thread(rom_id: i64, stamp: Option<Stamp>, save: &LocalSave) -> Thread {
     Thread {

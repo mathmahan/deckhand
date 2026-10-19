@@ -437,20 +437,14 @@ impl App {
     }
 
     /// A or Enter on a row of the Saves page. An in-game save that is not the version on this device
-    /// offers to be put back; a state says where it is.
+    /// offers to be put back. A state in a slot says which; one in none offers to go into one.
     pub(super) fn press_save(&mut self, tile: i64) -> Task<Message> {
         use crate::game_saves::Tab;
         let Some(Ok(saves)) = self.game_saves.get(&tile) else { return Task::none() };
         let list = saves.list(self.saves_focus.tab);
         let Some(record) = list.get(self.saves_focus.row(list.len())).cloned() else { return Task::none() };
         if self.saves_focus.tab == Tab::States {
-            self.say(match saves.slots.get(&record.id) {
-                Some(slot) if saves.on_device.contains(&record.id) => {
-                    format!("This state is in RetroArch's slot {slot}: load it from the Quick Menu while the game runs.")
-                }
-                _ => "Save states come down with a sync, into the slots RetroArch loads them from.".into(),
-            });
-            return Task::none();
+            return self.press_state(tile, record);
         }
         if saves.on_device.contains(&record.id) {
             self.say("This version is the one on this device already.".into());
@@ -488,6 +482,87 @@ impl App {
             then: Then::Restore { tile, version: Box::new(record) },
         });
         Task::none()
+    }
+
+    /// A or Enter on a state of the Saves page: where it is, when it is in a slot here, and otherwise
+    /// the offer to put it into one — when this device can load it.
+    fn press_state(&mut self, tile: i64, record: crate::romm::models::SaveAsset) -> Task<Message> {
+        let Some(Ok(saves)) = self.game_saves.get(&tile) else { return Task::none() };
+        if let Some(slot) = saves.slots.get(&record.id) {
+            let slot = slot.in_words();
+            self.say(if saves.on_device.contains(&record.id) {
+                format!("This state is in {slot}: load it from RetroArch's Quick Menu while the game runs.")
+            } else {
+                format!("This is {slot}'s state on RomM. It comes down into that slot with the next sync.")
+            });
+            return Task::none();
+        }
+        if !record.file_name.to_lowercase().ends_with(".state") {
+            self.say("This emulator's states come down with a sync, under their own names, where it reads them.".into());
+            return Task::none();
+        }
+        if saves.other_core.contains(&record.id) {
+            let core = saves.core.clone().unwrap_or_else(|| "the core this device runs it under".into());
+            self.say(format!("Another core made this state, and {core} can't load it."));
+            return Task::none();
+        }
+        let build = record.rom_id.unwrap_or(tile);
+        if self.downloads.installed(build).is_none() {
+            self.say(format!(
+                "\"{}\" isn't on this device. A state goes into a slot beside the game, so download it first.",
+                self.title_of(build)
+            ));
+            return Task::none();
+        }
+        let when = record
+            .updated_at
+            .as_deref()
+            .map(|t| t.replace('T', " ").chars().take(16).collect::<String>())
+            .unwrap_or_else(|| "an unknown time".into());
+        let row = |label: &str, detail: &str| crate::ui::picker::Row { label: label.into(), detail: detail.into(), aside: String::new(), mark: None };
+        self.pick = Some(PendingPick {
+            picker: crate::ui::picker::Picker {
+                title: "Put this state into a slot?".into(),
+                note: format!(
+                    "{}, from {when}. It goes into one of RetroArch's slots for this game, and up to RomM as that slot, \
+                     so your other devices take it too. Whatever the slot holds here goes to save-backups first.",
+                    record.file_name
+                ),
+                rows: vec![
+                    row("The next free slot", "Past every slot here and on RomM: nothing is replaced"),
+                    row("Slot 0", "Takes the place of what's in it"),
+                    row("The auto slot", "What RetroArch loads by itself on start, with that turned on"),
+                    row("Leave it", "Change nothing"),
+                ],
+                // The one that replaces nothing.
+                cursor: 0,
+            },
+            then: Then::PutState { tile, state: Box::new(record) },
+        });
+        Task::none()
+    }
+
+    /// Put a state from RomM into one of a game's slots here — see [`crate::sync::put_state`].
+    pub(super) fn put_state(&mut self, tile: i64, state: crate::romm::models::SaveAsset, target: crate::sync::states::Target) -> Task<Message> {
+        let Some(connection) = self.settings.connection.clone() else {
+            self.say("Not paired with a RomM server.".into());
+            return Task::none();
+        };
+        let build = state.rom_id.unwrap_or(tile);
+        let Some(installed) = self.downloads.installed(build).cloned() else { return Task::none() };
+        let (client, settings, store) = (self.client.clone(), self.settings.clone(), Settings::config_dir());
+        self.say("Putting the state into a slot…".into());
+        Task::perform(
+            async move {
+                // Both read config files and ES-DE's tables: off the UI thread.
+                let (install, plan) = off_thread(move || {
+                    (crate::sync::retroarch::locate(settings.retroarch_config.as_deref()), crate::launch::Plan::new(&settings, &installed))
+                })
+                .await?;
+                crate::sync::put_state(&client, &connection, install.as_ref().map_err(String::as_str), &store, &plan, &state, target).await
+            },
+            move |result| Message::StatePut(tile, result),
+        )
     }
 
     /// Put an older version of one of a game's saves back — see [`crate::sync::restore`].

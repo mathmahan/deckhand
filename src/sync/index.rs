@@ -28,7 +28,9 @@ pub struct Entry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot: Option<String>,
     /// When that save was made, by RomM's clock — the moment RomM records this device as having
-    /// synced it, and so what its negotiation weighs this device's timestamps against.
+    /// synced it, and so what its negotiation weighs this device's timestamps against. For a save
+    /// state, its time on RomM when the two agreed: a state sent up again keeps its id, so this is
+    /// what says it has changed since.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synced_at: Option<String>,
     /// RomM's hash of its copy, `save_id`, when that differs from `hash` — a set a zip from another
