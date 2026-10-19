@@ -17,7 +17,7 @@
 //! starting, and a sync is never worth that.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::config::Settings;
 use crate::romm::RommClient;
@@ -53,6 +53,13 @@ pub fn run(args: &[String]) -> Option<i32> {
             Some(if ok { 0 } else { 1 })
         }
         "play" => Some(play(rest)),
+        // Left running by ES-DE's game-start hook, holding the game's marker until `post` takes it.
+        "keep" => {
+            if let Some(rom) = Launch::parse(rest).rom {
+                crate::playing::keep(&Settings::config_dir(), &rom);
+            }
+            Some(0)
+        }
         "hooks" => {
             let (ok, lines) = match rest.first().map(String::as_str) {
                 Some("install") => match crate::hooks::install() {
@@ -94,6 +101,9 @@ Usage:
   deckhand play <rom id>     a downloaded game, played the way Deckhand's Play button plays it:
                              BIOS, the save down, the game, the save up, the play session.
                              What a game added to Steam from Deckhand runs
+  deckhand keep --rom <file>  what ES-DE's game-start hook leaves running while the game plays:
+                             holds its play-time marker until post takes it, so a session
+                             ES-DE never sees the end of is still timed
   deckhand hooks [install|remove|status]
                              ES-DE's game-start and game-end hooks, so a game launched from
                              ES-DE syncs like one launched from Deckhand
@@ -263,20 +273,30 @@ enum Stage {
 async fn game(rom: PathBuf, core: Option<String>, system: Option<String>, stage: Stage) -> Result<Report, String> {
     use crate::launch::Emulator;
     let mut ctx = Context::load()?;
+    let rom_id = sync::find_rom(&ctx.builds, &rom).ok();
+    // `post` ends the play session `pre` started. Taken before anything that can hang, since taking it
+    // is also what lets ES-DE's `keep` go — see `crate::playing`.
+    let taken = match stage {
+        Stage::Post => crate::playing::take(&ctx.store, &rom),
+        Stage::Pre => None,
+    };
     // The game as the library the window last read has it, which may be days old — held to RomM
     // before anything goes there under its id. A RomM rebuilt since keeps another game there, and
     // this one's save and playtime would land on it.
-    if let Ok(rom_id) = sync::find_rom(&ctx.builds, &rom)
+    if let Some(rom_id) = rom_id
         && let Some(stamp) = sync::stamp_of(&ctx.builds, rom_id)
     {
         sync::still_holds(&ctx.client, &ctx.connection, rom_id, &|now| stamp.same_rom(now)).await?;
     }
     ctx.register().await;
-    // `post` ends the play session `pre` started: it goes to RomM with the sync that follows the game.
-    let plays: Vec<PlaySession> = match stage {
-        Stage::Post => ended(&ctx, &rom).into_iter().collect(),
-        Stage::Pre => Vec::new(),
-    };
+    // A session an earlier launch never got to send — before `pre` writes this one's marker over the
+    // game's own.
+    let left = crate::playing::settle_left(&ctx.client, &ctx.connection, &ctx.store).await;
+    if left > 0 {
+        eprintln!("deckhand: sent RomM the playtime of {left} earlier session(s)");
+    }
+    // It goes to RomM with the sync that follows the game.
+    let plays: Vec<PlaySession> = taken.as_ref().and_then(|t| t.session(rom_id)).into_iter().collect();
     // Told the system, ES-DE's own configuration says what runs the game — a core RetroArch files
     // saves by, or a standalone emulator with saves of its own. A core named outright wins.
     let emulator = match (&core, &system, crate::launch::RetroDeck::detect()) {
@@ -299,43 +319,21 @@ async fn game(rom: PathBuf, core: Option<String>, system: Option<String>, stage:
             },
         },
     };
-    // A play session no sync session took — a RomM without them, a sync that failed — goes on its own.
+    // A play session no sync session took — a RomM without them, a sync that failed — goes on its own,
+    // and one RomM cannot take now waits in its marker for the next time.
     if let Some(play) = plays.first()
         && result.as_ref().is_ok_and(|r| r.plays_recorded == 0) | result.is_err()
         && let Err(e) = client.post_play_session(connection, play).await
     {
-        eprintln!("deckhand post: playtime not recorded on RomM: {e}");
+        eprintln!("deckhand post: playtime not recorded on RomM yet: {e}");
+        if let Some(taken) = &taken {
+            crate::playing::owe(store, &rom, taken, rom_id);
+        }
     }
     if stage == Stage::Pre {
-        started(store, &rom);
+        crate::playing::start(store, &rom, rom_id);
     }
     result
-}
-
-/// Where `pre` notes when it let a game start, for `post` to make a play session of — one file per
-/// game, named by its path.
-fn marker(store: &Path, rom: &Path) -> PathBuf {
-    store.join("playing").join(format!("{}.start", sync::hash::file(rom.to_string_lossy().as_bytes())))
-}
-
-/// Note that the game is starting now.
-fn started(store: &Path, rom: &Path) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let _ = sync::write_atomic(&marker(store, rom), now.to_string().as_bytes());
-}
-
-/// The play session `pre` started for this game, ended now — taken, so a second `post` finds none.
-/// A start more than a day old is a `post` that never ran, not a session.
-fn ended(ctx: &Context, rom: &Path) -> Option<PlaySession> {
-    let file = marker(&ctx.store, rom);
-    let secs: u64 = std::fs::read_to_string(&file).ok()?.trim().parse().ok()?;
-    let _ = std::fs::remove_file(&file);
-    let (start, end) = (UNIX_EPOCH + Duration::from_secs(secs), SystemTime::now());
-    if end.duration_since(start).ok()? > Duration::from_secs(24 * 3600) {
-        return None;
-    }
-    let rom_id = sync::find_rom(&ctx.builds, rom).ok()?;
-    crate::launch::play_session(rom_id, start, end)
 }
 
 async fn sweep() -> Result<Report, String> {

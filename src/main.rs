@@ -25,6 +25,7 @@ mod hooks;
 mod launch;
 mod library;
 mod memory;
+mod playing;
 mod qr_pairing;
 mod release;
 mod search;

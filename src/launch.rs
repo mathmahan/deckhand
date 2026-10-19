@@ -743,6 +743,11 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut te
         },
         None => ctx,
     };
+    // A session an earlier launch never got to send — Deckhand ended along with its game, or RomM out
+    // of reach as it closed. Before this one's marker can take the place of the game's own.
+    if let Some(conn) = &ctx.connection {
+        crate::playing::settle_left(&ctx.client, conn, &ctx.store).await;
+    }
     notes.extend(ready(&ctx, &plan).await);
     // Into the newest state, when asked to and there is one here — the save sync just laid it into
     // slot 0. Only when the file is there: RetroArch refuses to start at all over a missing one.
@@ -752,16 +757,36 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut te
     }
     let command = resumed.unwrap_or_else(|| launcher.command(&plan.system, &plan.rom));
     tell(Stage::Running);
-    let start = SystemTime::now();
+    // On disk for as long as the game runs, so its time played outlives this process — see
+    // `crate::playing`.
+    let held = crate::playing::hold(&ctx.store, &plan.rom, plan.rom_id);
+    let start = held.as_ref().map_or_else(SystemTime::now, crate::playing::Held::start);
     let game = tokio::task::spawn_blocking(move || run(&command));
-    let exit = while_playing(&ctx, plan.rom_id, game).await.map_err(|e| e.to_string())??;
+    let exit = match while_playing(&ctx, plan.rom_id, held.as_ref(), game).await.map_err(|e| e.to_string()).and_then(|run| run) {
+        Ok(exit) => exit,
+        Err(why) => {
+            // It never started, so there is no session to keep.
+            if let Some(held) = held {
+                held.end();
+            }
+            return Err(why);
+        }
+    };
+    // When it closed, for a sync this process does not live to finish.
+    if let Some(held) = &held {
+        held.touch();
+    }
     let play = play_session(plan.rom_id, start, SystemTime::now());
     if ctx.connection.is_some() {
         tell(Stage::Saving);
     }
     let (more, recorded) = settle(&ctx, &plan, play.clone()).await;
     notes.extend(more);
-    let played_at = record_session(&ctx, play, recorded, &mut notes).await;
+    let (played_at, owed) = record_session(&ctx, play, recorded, &mut notes).await;
+    // A session RomM could not take keeps its marker, unheld, for the next Deckhand to send.
+    if let Some(held) = held.filter(|_| !owed) {
+        held.end();
+    }
     Ok(Session { exit, played_at, notes: said(notes) })
 }
 
@@ -770,14 +795,25 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, mut te
 const HEARTBEAT: Duration = Duration::from_secs(HEARTBEAT_LASTS.as_secs() / 3);
 
 /// Await `game` while telling RomM, every [`HEARTBEAT`], that this device is playing `rom_id`, so its
-/// web app shows the game as being played here — and, once it ends, that it has stopped.
+/// web app shows the game as being played here — and, once it ends, that it has stopped. `held`, the
+/// game's marker, is touched every [`crate::playing::TICK`] meanwhile, RomM or not.
 ///
 /// Best effort, like every step around a game. A RomM that has no such thing (before 5.4), does not
 /// know this device or does not let it say so is not asked again this session; any other failure is
 /// one heartbeat missed, and the next goes as usual.
-async fn while_playing<T>(ctx: &Context, rom_id: i64, game: impl Future<Output = T>) -> T {
+async fn while_playing<T>(ctx: &Context, rom_id: i64, held: Option<&crate::playing::Held>, game: impl Future<Output = T>) -> T {
+    let ticks = async {
+        let Some(held) = held else { return std::future::pending::<std::convert::Infallible>().await };
+        loop {
+            tokio::time::sleep(crate::playing::TICK).await;
+            held.touch();
+        }
+    };
     let Some((conn, device)) = ctx.connection.as_ref().and_then(|c| Some((c, c.device_id.as_deref()?))) else {
-        return game.await;
+        return tokio::select! {
+            out = game => out,
+            never = ticks => match never {},
+        };
     };
     let beats = async {
         loop {
@@ -792,6 +828,7 @@ async fn while_playing<T>(ctx: &Context, rom_id: i64, game: impl Future<Output =
     let out = tokio::select! {
         out = game => out,
         never = beats => match never {},
+        never = ticks => match never {},
     };
     let _ = ctx.client.clear_heartbeat(conn, device).await;
     out
@@ -822,21 +859,24 @@ pub fn play_session(rom_id: i64, start: SystemTime, end: SystemTime) -> Option<P
     })
 }
 
-/// Make sure RomM has the session, answering when it ended if it counted as play.
+/// Make sure RomM has the session, answering when it ended if it counted as play, and whether it is
+/// still owed to RomM — which could not be reached, so the session waits in its marker for next time.
 ///
 /// It goes with the sync session that follows the game where RomM holds those (`recorded`), on its
 /// own otherwise. RomM is what keeps `last_played`, which orders *Continue playing* on every device,
 /// and the playtime. Whether or not RomM took it, the answer is still the end time: the game was
 /// played here, and Home should say so now rather than after the next library sync.
-async fn record_session(ctx: &Context, play: Option<PlaySession>, recorded: bool, notes: &mut Vec<String>) -> Option<String> {
-    let play = play?;
+async fn record_session(ctx: &Context, play: Option<PlaySession>, recorded: bool, notes: &mut Vec<String>) -> (Option<String>, bool) {
+    let Some(play) = play else { return (None, false) };
+    let mut owed = false;
     if !recorded
         && let Some(conn) = &ctx.connection
         && let Err(e) = ctx.client.post_play_session(conn, &play).await
     {
-        notes.push(format!("playtime not recorded on RomM: {e}"));
+        notes.push(format!("playtime not recorded on RomM yet: {e}"));
+        owed = true;
     }
-    Some(play.end_time)
+    (Some(play.end_time), owed)
 }
 
 /// Steps 1 and 2 for a game that has just finished downloading, so its first launch — here or from
@@ -1202,7 +1242,12 @@ mod tests {
             launch_command: Some(vec![
                 "sh".into(),
                 "-c".into(),
-                format!("printf 'played here' > '{}'", save.display()),
+                format!(
+                    "printf 'played here' > '{}'; ls '{}' > '{}'",
+                    save.display(),
+                    root.join("store/playing").display(),
+                    root.join("seen").display()
+                ),
                 "-L".into(),
                 "/cores/snes9x_libretro.so".into(),
             ]),
@@ -1229,6 +1274,9 @@ mod tests {
         assert!(session.exit.success, "{session:?}");
         assert_eq!(stages, [Stage::Running, Stage::Saving]);
         assert_eq!(session.notes, ["saves synced"], "nothing new to pull before, the new save after");
+        let seen = fs::read_to_string(root.join("seen")).unwrap();
+        assert!(seen.trim().ends_with(".start") && seen.lines().count() == 1, "its marker, while it ran: {seen:?}");
+        assert_eq!(fs::read_dir(root.join("store/playing")).unwrap().count(), 0, "and gone once it closed");
 
         // Asked to resume, it does only once there is a state in slot 0 to boot into: RetroArch will
         // not start at all over a missing one.
@@ -1258,19 +1306,27 @@ mod tests {
         let mut notes = Vec::new();
         let short = play_session(1, start, start + Duration::from_secs(5));
         assert_eq!(short, None, "a crash on boot is not play");
-        assert_eq!(record_session(&ctx, short, false, &mut notes).await, None);
+        assert_eq!(record_session(&ctx, short, false, &mut notes).await, (None, false));
         assert!(requests.lock().unwrap().is_empty());
 
         let long = play_session(1, start, start + Duration::from_secs(600));
         assert_eq!(long.as_ref().map(|p| (p.duration_ms, p.save_slot.as_deref())), Some((600_000, Some("autosave"))));
         // Taken with the sync session already: not posted again.
-        assert_eq!(record_session(&ctx, long.clone(), true, &mut notes).await.as_deref(), Some("2026-07-01T10:10:00Z"));
+        assert_eq!(record_session(&ctx, long.clone(), true, &mut notes).await.0.as_deref(), Some("2026-07-01T10:10:00Z"));
         assert!(requests.lock().unwrap().is_empty());
 
-        let ended = record_session(&ctx, long, false, &mut notes).await;
+        let (ended, owed) = record_session(&ctx, long.clone(), false, &mut notes).await;
         assert_eq!(ended.as_deref(), Some("2026-07-01T10:10:00Z"));
+        assert!(!owed);
         assert!(notes.is_empty(), "{notes:?}");
         assert_eq!(requests.lock().unwrap().len(), 1);
+
+        // RomM out of reach as the game closes: still owed, so its marker stays for the next time.
+        let refusing = crate::stub_server::start(vec![("POST /api/play-sessions", 503, "{}".into())]).await;
+        let ctx = Context { connection: ctx.connection.map(|c| Connection { host: refusing, ..c }), ..ctx };
+        let (ended, owed) = record_session(&ctx, long, false, &mut notes).await;
+        assert!(ended.is_some() && owed);
+        assert!(notes.iter().any(|n| n.starts_with("playtime not recorded on RomM yet")), "{notes:?}");
     }
 
     #[tokio::test]
@@ -1287,7 +1343,7 @@ mod tests {
             store: PathBuf::new(),
         };
         let game = tokio::time::sleep(Duration::from_millis(300));
-        while_playing(&device(Some("deck-1")), 42, game).await;
+        while_playing(&device(Some("deck-1")), 42, None, game).await;
         let lines = requests.lock().unwrap().clone();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].starts_with("POST /api/activity/heartbeat"));
@@ -1295,7 +1351,7 @@ mod tests {
 
         // Not yet a device RomM knows: nobody to say it of.
         requests.lock().unwrap().clear();
-        assert_eq!(while_playing(&device(None), 42, async { 7 }).await, 7);
+        assert_eq!(while_playing(&device(None), 42, None, async { 7 }).await, 7);
         assert!(requests.lock().unwrap().is_empty());
     }
 
@@ -1308,7 +1364,7 @@ mod tests {
             retroarch_config: None,
             store: PathBuf::new(),
         };
-        let finished = while_playing(&ctx, 42, async {
+        let finished = while_playing(&ctx, 42, None, async {
             tokio::time::sleep(Duration::from_millis(300)).await;
             "exit"
         });
