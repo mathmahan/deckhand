@@ -1,4 +1,5 @@
-# Every pull request, and every push to main: the tests, then clippy. A feature branch is tested
+# Every pull request, and every push to main: the tests, clippy, then the licences of every crate
+# Deckhand is built from (packaging/licences.sh). A feature branch is tested
 # through its pull request alone; testing its pushes too ran every commit twice.
 #
 # The job runs in Debian bookworm, as the release builds do. Its image is a Node one because it
@@ -40,3 +41,8 @@ jobs:
       - run: cargo test --locked
 
       - run: cargo clippy --locked --all-targets -- -D warnings
+
+      # Every crate's licence one Deckhand may ship (about.toml), with the notices it needs: what the
+      # release build puts in the AppImage, checked here so a dependency that may not be fails its
+      # pull request rather than a release.
+      - run: packaging/licences.sh target/THIRD-PARTY-LICENSES.md

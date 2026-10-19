@@ -1,0 +1,20 @@
+# The licences Deckhand may ship the crates it is built from under, for packaging/licences.sh and
+# cargo-about. A crate under any other — or under one cargo-about cannot make out — fails the script,
+# and with it CI and the release build. Each of these lets an MIT-licensed program carry the crate,
+# given its notice: that is what the script collects. Order is preference: of a crate offered under
+# several, the first here is taken.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "bzip2-1.0.6",
+    # option-ext: copyleft per file, so its own files only.
+    "MPL-2.0",
+]
+# The AppImage's. Crates only another platform builds are not in it.
+targets = ["x86_64-unknown-linux-gnu"]

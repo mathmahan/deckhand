@@ -15,6 +15,10 @@
 # job. Either way the argosy-sigil submodule has to be checked out (`git submodule update --init
 # --recursive`): build.rs compiles it.
 # It builds into CARGO_TARGET_DIR when that is set, so a target/ kept between builds is used.
+#
+# Beside the binary go Deckhand's LICENSE and the notices of everything built into it, in
+# usr/share/doc/deckhand/, which packaging/licences.sh writes from the same Cargo.lock — and refuses
+# to write, failing the build, for a crate under a licence about.toml does not accept.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +31,7 @@ echo "==> Building deckhand $VERSION against glibc 2.36"
 if [ "${1:-}" = --here ]; then
     BUILD="${CARGO_TARGET_DIR:-$BUILD}"
     (cd "$ROOT" && CARGO_TARGET_DIR="$BUILD" cargo build --release --locked)
+    CARGO_TARGET_DIR="$BUILD" "$ROOT/packaging/licences.sh" "$BUILD/THIRD-PARTY-LICENSES.md"
 else
     mkdir -p "${CARGO_HOME:-$HOME/.cargo}/registry"
     # As root, because gilrs links libudev and its headers have to be installed first; everything it
@@ -37,14 +42,16 @@ else
         -v "${CARGO_HOME:-$HOME/.cargo}/registry:/tmp/cargo/registry" \
         -w /src rust:1-bookworm \
         sh -c "apt-get update -qq && apt-get install -y -qq libudev-dev pkg-config cmake >/dev/null \
-            && cargo build --release --locked; status=\$?; \
+            && cargo build --release --locked && packaging/licences.sh /build/THIRD-PARTY-LICENSES.md; status=\$?; \
             chown -R $(id -u):$(id -g) /build /tmp/cargo/registry; exit \$status"
 fi
 
 APPDIR="$OUT/Deckhand.AppDir"
 rm -rf "$APPDIR"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/512x512/apps"
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/512x512/apps" "$APPDIR/usr/share/doc/deckhand"
 install -m755 "$BUILD/release/deckhand" "$APPDIR/usr/bin/deckhand"
+install -m644 "$ROOT/LICENSE" "$APPDIR/usr/share/doc/deckhand/LICENSE"
+install -m644 "$BUILD/THIRD-PARTY-LICENSES.md" "$APPDIR/usr/share/doc/deckhand/THIRD-PARTY-LICENSES.md"
 install -m755 "$ROOT/packaging/AppRun" "$APPDIR/AppRun"
 install -m644 "$ROOT/packaging/deckhand.desktop" "$APPDIR/deckhand.desktop"
 install -m644 "$ROOT/packaging/deckhand.desktop" "$APPDIR/usr/share/applications/deckhand.desktop"
