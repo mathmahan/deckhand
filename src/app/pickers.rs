@@ -123,6 +123,10 @@ impl App {
                 0 => self.change_steam(&games, add, true),
                 _ => Task::none(),
             },
+            Then::Extras { rom_id, extras } => match extras.get(chosen) {
+                Some(extra) => self.pick_extra(rom_id, extra),
+                None => Task::none(),
+            },
             Then::Restore { tile, version } => match chosen {
                 0 => self.restore_save(tile, *version),
                 _ => Task::none(),

@@ -41,6 +41,7 @@ mod art;
 mod browse;
 mod dispatch;
 mod download;
+mod extras;
 mod installs;
 mod library;
 mod navigation;
@@ -228,6 +229,8 @@ pub enum Message {
     DownloadEvent(downloads::Event),
     /// Take a game off the device, dismiss a failure, or drop something from the queue.
     RemoveDownload(i64),
+    /// Forget a failed download of a rom, leaving whatever of it is here — see [`Downloads::dismiss`].
+    DismissDownload(i64),
     /// What removing a game's files actually did, off the UI thread.
     DownloadRemoved(String, Result<usize, String>),
     /// A Downloads row was clicked: put the cursor on it and press it.
@@ -237,6 +240,12 @@ pub enum Message {
     RemoveFocusedDownload,
     /// RomM's detail of a game's own rom, for what Download offers — keyed by the tile's rom id.
     DownloadChoices(i64, Result<Box<crate::romm::models::RomDetail>, String>),
+    /// RomM's detail of a downloaded build, for the extras its game's page offers — see
+    /// [`App::load_files`].
+    FilesLoaded(i64, Result<Box<crate::romm::models::RomDetail>, String>),
+    /// An extra of a build taken off this device: the build, what the extra was, and the build's
+    /// record without it.
+    ExtraRemoved(i64, String, Result<Box<downloads::Installed>, String>),
     /// Time to ask RomM for the installs its web app queued for this device — see [`installs`].
     ClaimInstalls,
     /// The installs RomM holds taken by this device, or why it would not say.
@@ -525,6 +534,9 @@ pub struct App {
     /// Each game's RetroAchievements list as RomM last answered, by rom id: asked for when its
     /// detail page opens, for a game that has any.
     achievements: HashMap<i64, Result<Arc<crate::achievements::GameAchievements>, String>>,
+    /// What RomM holds of each downloaded build in a folder of its own — its files, and what each is
+    /// to the game — by rom id: asked for when its game's page opens, for the extras it offers.
+    rom_files: HashMap<i64, Arc<crate::romm::models::RomDetail>>,
     saves_focus: crate::game_saves::SavesFocus,
     /// A save that changed on both sides, waiting for the player to say which to keep. While there
     /// is one, the cursor keys and the pad answer it and nothing else.
@@ -673,6 +685,7 @@ impl App {
             handover: None,
             game_saves: HashMap::new(),
             achievements: HashMap::new(),
+            rom_files: HashMap::new(),
             saves_focus: Default::default(),
             conflict: None,
             pick: None,
@@ -1371,6 +1384,23 @@ enum Then {
     /// Close Steam, put these games in its library (or take them out), and open it again: the first
     /// row says yes.
     Steam { games: Vec<i64>, add: bool },
+    /// Put the extra chosen of the build `rom_id` on this device, or take it off when it is here.
+    Extras { rom_id: i64, extras: Vec<Extra> },
+}
+
+/// One of a build's extras, as its game's page offers it.
+#[derive(Debug, Clone)]
+struct Extra {
+    /// RomM's id for the file.
+    id: i64,
+    /// Where it goes, relative to the platform folder — see [`downloads::Installed::files`].
+    path: String,
+    /// Its category: "Manual", "Hack".
+    label: String,
+    /// The file's name on RomM: a category alone doesn't tell two hacks apart.
+    name: String,
+    bytes: u64,
+    here: bool,
 }
 
 /// What the watched folders were worked out from: the RetroArch config chosen, and the games here.

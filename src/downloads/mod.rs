@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Connection;
 use crate::library::{Fingerprint, Library, Stamp};
+use crate::romm::models::RomFile;
 use crate::romm::RommClient;
 
 /// How many downloads run at once. The Kotlin queue's own gate: a second request keeps the link
@@ -121,6 +122,12 @@ pub struct QueueItem {
     /// given to another game since is refused rather than fetched as that game.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stamp: Option<Stamp>,
+    /// One of the game's extras — a manual, a hack — fetched into the game already here, its
+    /// [`label`] the extra's category.
+    ///
+    /// [`label`]: QueueItem::label
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub extra: bool,
 }
 
 /// One game on this device: where its files are, and what they are.
@@ -163,9 +170,17 @@ pub struct Installed {
     /// None on a record from before it was kept, until a library refresh can vouch for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<Fingerprint>,
-    /// The RomM files this holds, by id — which discs of a set, for one fetched a disc at a time.
+    /// The RomM files this holds, by id — which discs of a set, for one fetched a disc at a time, and
+    /// which extras.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_files: Vec<i64>,
+    /// RomM's hash of each file as it was fetched ([`RomFile::sum`]), by its place in [`files`] —
+    /// what tells an update's unchanged files from the ones it changed. Only for files RomM hashes,
+    /// and only for ones fetched since this was kept.
+    ///
+    /// [`files`]: Installed::files
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sums: BTreeMap<String, String>,
     /// Only some of the rom's files are here — "Disc 1", "Disc 1, Disc 3" — or None for all of them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subset: Option<String>,
@@ -395,10 +410,11 @@ impl Downloads {
         if self.queue.iter().any(here) {
             return SyncState::Downloading(0.0);
         }
-        if let Some((_, why)) = self.failed.iter().find(|(i, _)| here(i)) {
+        let key = self.key(rom_id);
+        // A failed extra is the Downloads page's to retry: the game it was for is still here to play.
+        if let Some((_, why)) = self.failed.iter().find(|(i, _)| here(i) && !(i.extra && self.installed.contains_key(&key))) {
             return SyncState::Failed(why.clone());
         }
-        let key = self.key(rom_id);
         if self.installed.contains_key(&key) {
             return if self.stale.contains(&key) { SyncState::UpdateAvailable } else { SyncState::Installed };
         }
@@ -770,7 +786,10 @@ impl Downloads {
                     installed.pinned |= before.pinned;
                     installed.played_at = installed.played_at.take().or_else(|| before.played_at.clone());
                 }
-                self.stale.remove(&key);
+                // An extra leaves the game as up to date as it was — see `fetch`.
+                if !item.as_ref().is_some_and(|i| i.extra) {
+                    self.stale.remove(&key);
+                }
                 self.installed.insert(key, installed);
                 self.persist_installed();
             }
@@ -786,6 +805,16 @@ impl Downloads {
                 });
                 self.failed.push((item, why));
             }
+        }
+    }
+
+    /// Put `record` in place of the one it is a new version of — what is here of a game after part
+    /// of it went ([`shed`]). Nothing, when that record has gone meanwhile.
+    pub fn replace(&mut self, record: Installed) {
+        let key: (std::sync::Arc<str>, i64) = (record.host.as_str().into(), record.rom_id);
+        if let Some(slot) = self.installed.get_mut(&key) {
+            *slot = record;
+            self.persist_installed();
         }
     }
 
@@ -811,6 +840,14 @@ impl Downloads {
     /// files that are gone, which is the harmless direction: the next download overwrites them.
     ///
     /// On a game that only failed this is "dismiss": the reason goes and nothing was on disk.
+    /// Forget why a download of `rom_id` failed — and nothing else: a failed update, disc or extra of
+    /// a game here leaves the game. Answers whether there was a failure to forget.
+    pub fn dismiss(&mut self, rom_id: i64) -> bool {
+        let before = self.failed.len();
+        self.failed.retain(|(i, _)| !(i.rom_id == rom_id && same_host(&i.host, &self.host)));
+        before != self.failed.len()
+    }
+
     pub fn remove(&mut self, rom_id: i64) -> Option<Installed> {
         self.failed.retain(|(i, _)| !(i.rom_id == rom_id && same_host(&i.host, &self.host)));
         let gone = self.installed.remove(&self.key(rom_id))?;
@@ -975,14 +1012,11 @@ pub async fn fetch(
 
     // A rom RomM keeps as its own directory gets that directory here too, as a prefix on every one
     // of its files rather than as a deeper `dir` — see [`Installed::dir`].
-    let sub = layout::local_subdirectory(&detail);
-    let base = layout::base_path(&detail);
-    let relative_of = |file: &crate::romm::models::RomFile| match &sub {
-        Some(sub) => format!("{sub}/{}", layout::relative_path(file, &base)),
-        None => layout::relative_path(file, &base),
-    };
+    let places = layout::Places::of(&detail);
+    let sub = places.folder().map(str::to_string);
+    let relative_of = |file: &RomFile| places.path(file);
 
-    let wanted: Vec<&crate::romm::models::RomFile> = match &item.files {
+    let wanted: Vec<&RomFile> = match &item.files {
         Some(ids) => {
             let picked: Vec<_> = detail.files.iter().filter(|f| ids.contains(&f.id)).collect();
             if picked.is_empty() {
@@ -990,27 +1024,46 @@ pub async fn fetch(
             }
             picked
         }
-        None => detail.files.iter().collect(),
+        // The game, and the update and DLC that complete it. Its extras — a manual, a hack — are
+        // fetched one at a time, when asked for. A folder RomM holds nothing but extras in — a demo
+        // filed under `demo/` alone — is fetched whole, as every folder was before categories.
+        None => {
+            let game: Vec<_> = detail.files.iter().filter(|f| f.comes_with_game()).collect();
+            if game.is_empty() { detail.files.iter().collect() } else { game }
+        }
     };
+    // Extras alone join the game as it is: whether it is up to date is the game's question, not
+    // theirs, so they are never taken for an update of it.
+    let extras_only = item.files.is_some() && wanted.iter().all(|f| !f.comes_with_game());
     let fingerprint = Fingerprint::of(detail.fs_size_bytes, detail.md5_hash.as_deref());
-    // An update replaces what is here; another disc of a set only adds to it, and a file already
-    // here at RomM's size is the same file.
-    let update = existing.as_ref().is_some_and(|e| match (&e.fingerprint, &fingerprint) {
-        (Some(then), Some(now)) => !then.same(now),
-        _ => false,
-    });
+    // An update replaces what changed; another disc of a set or an extra only adds to what is here.
+    let update = !extras_only
+        && existing.as_ref().is_some_and(|e| match (&e.fingerprint, &fingerprint) {
+            (Some(then), Some(now)) => !then.same(now),
+            _ => false,
+        });
     let have: HashSet<String> = existing.iter().flat_map(|e| e.files.iter().cloned()).collect();
-    let needed: Vec<&crate::romm::models::RomFile> = wanted
-        .iter()
-        .copied()
-        .filter(|f| {
-            let relative = relative_of(f);
-            update || !have.contains(&relative) || fs::metadata(dir.join(&relative)).map_or(true, |m| m.len() != f.size())
-        })
-        .collect();
+    let recorded = |relative: &str| existing.as_ref().and_then(|e| e.sums.get(relative));
+    // A file is here already when it is at its place at RomM's size. For an update that is not
+    // enough on its own, since a file can change and keep its size: RomM's hash has to match the one
+    // it had when the file came. A platform RomM doesn't hash has only the size and the name to go
+    // by — an update there comes under a name of its own, and the game it updates is fetched once.
+    let here = |f: &RomFile| {
+        let relative = relative_of(f);
+        have.contains(&relative)
+            && fs::metadata(dir.join(&relative)).is_ok_and(|m| m.len() == f.size())
+            && (!update
+                || match (f.sum(), recorded(&relative)) {
+                    (Some(now), Some(then)) => now == *then,
+                    (None, _) => true,
+                    // Hashed now and not then: nothing to tell it by.
+                    (Some(_), None) => false,
+                })
+    };
+    let needed: Vec<&RomFile> = wanted.iter().copied().filter(|f| !here(f)).collect();
 
     // Room for the files, and for unpacking an archive among them before the archive goes.
-    let unpacks = |f: &crate::romm::models::RomFile| f.is_game() && extract::is_archive(&f.file_name) && !extract::keeps_archives(&slug);
+    let unpacks = |f: &RomFile| f.is_game() && extract::is_archive(&f.file_name) && !extract::keeps_archives(&slug);
     let total = needed.iter().map(|f| f.size()).sum::<u64>();
     let room = total + needed.iter().filter(|f| unpacks(f)).map(|f| f.size()).sum::<u64>();
     if let Some(free) = storage::available(&dir)
@@ -1097,17 +1150,18 @@ pub async fn fetch(
         }
     }
 
-    // An update's files RomM no longer has: this install's, so they go.
+    // An update's files RomM no longer has: this install's, so they go. What RomM still has stays —
+    // the files the update left as they were, and extras fetched before it.
     if update {
-        let now: HashSet<&String> = files.iter().collect();
+        let on_romm: HashSet<String> = detail.files.iter().map(&relative_of).collect();
         let fresh: HashSet<String> = fetched.iter().map(|(f, _)| f.clone()).chain(extracted.iter().cloned()).collect();
-        for old in existing.iter().flat_map(|e| e.files.iter()) {
-            if now.contains(old) && !fresh.contains(old) && !wanted.iter().any(|f| relative_of(f) == *old) {
-                let _ = fs::remove_file(dir.join(old));
-            }
+        let kept = |f: &String| fresh.contains(f) || on_romm.contains(f) || layout::noload_for(f).as_deref() == Some(f.as_str());
+        for old in files.iter().filter(|f| !kept(f)) {
+            let _ = fs::remove_file(dir.join(old));
         }
-        files.retain(|f| fresh.contains(f) || wanted.iter().any(|w| relative_of(w) == *f));
+        files.retain(kept);
     }
+    hide_from_es_de(&dir, &mut files);
 
     // The multi-disc playlist, over every disc here now — relative to the playlist, which sits in the
     // rom's own folder when it has one.
@@ -1132,8 +1186,12 @@ pub async fn fetch(
         }
     }
 
-    // What of the rom this holds, and what that is called when it is not all of it.
-    let mut source_files: Vec<i64> = if update { Vec::new() } else { existing.as_ref().map(|e| e.source_files.clone()).unwrap_or_default() };
+    // What of the rom this holds, and what that is called when it is not all of it. An update keeps
+    // what RomM still has of the files here, extras fetched before it among them.
+    let mut source_files: Vec<i64> = existing.as_ref().map(|e| e.source_files.clone()).unwrap_or_default();
+    if update {
+        source_files.retain(|id| detail.files.iter().any(|f| f.id == *id));
+    }
     for file in &wanted {
         if !source_files.contains(&file.id) {
             source_files.push(file.id);
@@ -1142,13 +1200,23 @@ pub async fn fetch(
     let complete = detail.files.iter().filter(|f| f.is_game()).all(|f| source_files.contains(&f.id));
     let subset = (!complete).then(|| {
         let mut parts: Vec<String> = existing.as_ref().and_then(|e| e.subset.clone()).into_iter().filter(|_| !update).collect();
-        if let Some(label) = &item.label
+        // An extra's label names the extra, not a part of the game.
+        if let Some(label) = item.label.as_ref().filter(|_| !extras_only)
             && !parts.iter().any(|p| p.split(", ").any(|x| x == label))
         {
             parts.push(label.clone());
         }
         parts.join(", ")
     });
+    // RomM's hash of each file as it came, for the next update to tell it by.
+    let mut sums = existing.as_ref().map(|e| e.sums.clone()).unwrap_or_default();
+    for file in &needed {
+        match file.sum() {
+            Some(sum) => sums.insert(relative_of(file), sum),
+            None => sums.remove(&relative_of(file)),
+        };
+    }
+    sums.retain(|path, _| files.contains(path));
 
     let bytes = files.iter().filter_map(|f| fs::metadata(dir.join(f)).ok()).map(|m| m.len()).sum();
     progress(Phase::Unpacking(1.0));
@@ -1163,8 +1231,10 @@ pub async fn fetch(
         dir,
         files,
         bytes,
-        fingerprint,
+        // Extras alone leave the game as up to date as it was.
+        fingerprint: if extras_only { existing.as_ref().and_then(|e| e.fingerprint.clone()) } else { fingerprint },
         source_files,
+        sums,
         subset: subset.filter(|s| !s.is_empty()),
         build: item.build.clone(),
         pinned: existing.as_ref().is_some_and(|e| e.pinned),
@@ -1177,6 +1247,64 @@ pub async fn fetch(
             .or_else(|| Some(crate::sync::format_timestamp(std::time::SystemTime::now()))),
         played_at: existing.and_then(|e| e.played_at),
     })
+}
+
+/// Give each folder beside the game ([`layout::beside_the_game`]) an empty `noload.txt`, which ES-DE
+/// skips a folder for: without one, ES-DE lists an update as a game of its own. Recorded in `files`
+/// like anything the download wrote, so Remove takes it too, and taken away — with the folder, when
+/// that leaves it empty — once nothing else of the game's is in the folder.
+///
+/// Only beside a game: a folder RomM holds nothing but extras in was fetched whole, and what is in
+/// it is all there is to start.
+fn hide_from_es_de(dir: &Path, files: &mut Vec<String>) {
+    let is_mark = |f: &String| layout::noload_for(f).as_deref() == Some(f.as_str());
+    let game_here = files.iter().any(|f| !layout::beside_the_game(f));
+    let marks: std::collections::BTreeSet<String> =
+        files.iter().filter(|f| game_here && !is_mark(f)).filter_map(|f| layout::noload_for(f)).collect();
+    files.retain(|f| {
+        if !is_mark(f) || marks.contains(f) {
+            return true;
+        }
+        let path = dir.join(f);
+        let _ = fs::remove_file(&path);
+        if let Some(folder) = path.parent() {
+            // Refused for a folder something else is still in, which is the test wanted.
+            let _ = fs::remove_dir(folder);
+        }
+        false
+    });
+    for mark in marks {
+        if files.contains(&mark) {
+            continue;
+        }
+        // Not worth failing a download over: what it costs is a line in ES-DE.
+        match fs::write(dir.join(&mark), b"") {
+            Ok(()) => files.push(mark),
+            Err(e) => eprintln!("deckhand: can't write {mark}: {e}"),
+        }
+    }
+}
+
+/// `record` without the files at `paths`, RomM's `ids` — an extra of the game, taken off this device.
+/// The files go from the disk, and so does the folder they were in when that leaves it empty.
+pub fn shed(record: &Installed, ids: &[i64], paths: &[String]) -> Installed {
+    let mut out = record.clone();
+    for path in paths.iter().filter(|p| record.files.contains(p)) {
+        let path = record.dir.join(path);
+        let _ = fs::remove_file(&path);
+        if let Some(folder) = path.parent()
+            && folder.starts_with(&record.dir)
+            && folder != record.dir
+        {
+            let _ = fs::remove_dir(folder);
+        }
+    }
+    out.files.retain(|f| !paths.contains(f));
+    hide_from_es_de(&record.dir, &mut out.files);
+    out.source_files.retain(|id| !ids.contains(id));
+    out.sums.retain(|path, _| out.files.contains(path));
+    out.bytes = out.paths().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+    out
 }
 
 /// What a record's files weigh on disk now, or None when one is missing.
@@ -1660,6 +1788,38 @@ mod tests {
         assert_eq!(downloads.state(b), SyncState::Installed);
         assert_eq!(downloads.installed(b).unwrap().fingerprint.as_ref().and_then(|f| f.md5.as_deref()), Some("same"));
         assert_eq!(downloads.state_of([999, a]), SyncState::UpdateAvailable, "a game's state covers every build of it");
+    }
+
+    #[test]
+    fn an_extra_leaves_the_game_as_it_was_and_dismissing_a_failed_one_leaves_the_game_here() {
+        let store = Store::new("failed-extra");
+        let mut downloads = store.downloads();
+        let mut games = crate::fixtures::library(1).all_games().to_vec();
+        games[0].fingerprint = Some(Fingerprint { bytes: 3, md5: Some("new".into()) });
+        let a = games[0].rom_id;
+        let library = Library::new(crate::fixtures::library(1).systems, games);
+        let mut record = installed_in(&store.0.join("roms"), a, &["a.sfc"]);
+        record.fingerprint = Some(Fingerprint { bytes: 3, md5: Some("old".into()) });
+        downloads.enqueue(item(a));
+        downloads.start_next();
+        downloads.finish(a, Ok(record.clone()));
+        downloads.check_updates(&library);
+        assert_eq!(downloads.state(a), SyncState::UpdateAvailable);
+
+        let manual = || QueueItem { files: Some(vec![9]), label: Some("Manual".into()), extra: true, ..item(a) };
+        downloads.enqueue(manual());
+        downloads.start_next();
+        downloads.finish(a, Ok(record));
+        assert_eq!(downloads.state(a), SyncState::UpdateAvailable, "the manual is no update of the game");
+
+        downloads.enqueue(manual());
+        downloads.start_next();
+        downloads.finish(a, Err("the server went away".into()));
+        assert_eq!(downloads.state(a), SyncState::UpdateAvailable, "a failed extra doesn't stop the game being played");
+        assert_eq!(downloads.failures().count(), 1, "the Downloads page has it to retry");
+        assert!(downloads.dismiss(a));
+        assert!(downloads.installed(a).is_some(), "and dismissing it leaves the game here");
+        assert_eq!(downloads.failures().count(), 0);
     }
 
     /// A library of SNES games, each (rom id, file name, when RomM made it).
@@ -2174,6 +2334,194 @@ mod round_trip {
             .expect("the download stands, archived");
         assert_eq!(installed.files, ["Game.zip"]);
         assert_eq!(fs::read(root.0.join("psx/Game.zip")).unwrap(), archive, "as RomM sent it");
+    }
+
+    /// A game in a folder of its own, the way RomM keeps one with an update and extras: each file in
+    /// the folder its category is named after. `md5` is RomM's hash of the rom, and of each file —
+    /// None, as on a platform RomM doesn't hash.
+    fn folder_game(id: i64, platform: &str, md5: Option<&str>, files: &[(i64, &str, &str, usize, Option<&str>)]) -> String {
+        serde_json::json!({
+            "id": id,
+            "fs_name": "Game",
+            "fs_path": format!("roms/{platform}"),
+            "platform_slug": platform,
+            "fs_size_bytes": files.iter().map(|f| f.3).sum::<usize>(),
+            "md5_hash": md5,
+            "files": files.iter().map(|(file, category, name, size, md5)| serde_json::json!({
+                "id": file,
+                "file_name": name,
+                "file_size_bytes": size,
+                "category": category,
+                "md5_hash": md5,
+                "file_path": if *category == "game" { format!("roms/{platform}/Game") } else { format!("roms/{platform}/Game/{category}") },
+            })).collect::<Vec<_>>(),
+        })
+        .to_string()
+    }
+
+    /// The content requests a stub saw, by the file ids they asked for.
+    fn fetched(requests: &stub_server::Requests) -> Vec<i64> {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("/content/"))
+            .filter_map(|line| line.split("file_ids=").nth(1)?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok())
+            .collect()
+    }
+
+    fn sorted(files: &[String]) -> Vec<&str> {
+        let mut files: Vec<&str> = files.iter().map(String::as_str).collect();
+        files.sort_unstable();
+        files
+    }
+
+    #[tokio::test]
+    async fn a_game_comes_with_its_update_and_dlc_and_leaves_its_extras_on_romm() {
+        let detail = folder_game(50, "switch", None, &[
+            (501, "game", "Game.xci", 7, None),
+            (502, "update", "Game [v1].nsp", 3, None),
+            (503, "dlc", "Game DLC.nsp", 4, None),
+            (504, "manual", "Game.pdf", 5, None),
+        ]);
+        let (host, requests) = stub_server::start_recording(vec![
+            ("GET file_ids=501", 200, "x".repeat(7)),
+            ("GET file_ids=502", 200, "u".repeat(3)),
+            ("GET file_ids=503", 200, "d".repeat(4)),
+            ("GET /api/roms/50", 200, detail),
+        ])
+        .await;
+        let root = Root::new("game-with-update");
+        let installed = fetch(&RommClient::new().unwrap(), &connection(&host), &root.0, &item(50, "switch", "Game"), None, |_| {})
+            .await
+            .expect("the download succeeds");
+
+        assert_eq!(fetched(&requests), [501, 502, 503], "the manual stays on RomM until it is asked for");
+        assert_eq!(
+            sorted(&installed.files),
+            ["Game/Game.xci", "Game/dlc/Game DLC.nsp", "Game/dlc/noload.txt", "Game/update/Game [v1].nsp", "Game/update/noload.txt"]
+        );
+        // ES-DE skips a folder holding one, so the update is not listed as a game of its own.
+        assert_eq!(fs::read(root.0.join("switch/Game/update/noload.txt")).unwrap(), b"");
+        assert_eq!(installed.bytes, 7 + 3 + 4);
+        assert_eq!(crate::launch::target(&installed), root.0.join("switch/Game/Game.xci"), "the game is what starts, not its update");
+        assert_eq!(installed.subset, None, "and it is the whole game");
+    }
+
+    /// [`folder_game`] downloaded whole, and its manual after it — what the update tests start from.
+    async fn with_its_manual(root: &Root) -> (Installed, Installed) {
+        let detail = folder_game(51, "switch", None, &[
+            (511, "game", "Game.xci", 7, None),
+            (512, "update", "Game [v1].nsp", 3, None),
+            (514, "manual", "Game.pdf", 5, None),
+        ]);
+        let host = stub_server::start(vec![
+            ("GET file_ids=511", 200, "x".repeat(7)),
+            ("GET file_ids=512", 200, "u".repeat(3)),
+            ("GET file_ids=514", 200, "m".repeat(5)),
+            ("GET /api/roms/51", 200, detail),
+        ])
+        .await;
+        let client = RommClient::new().unwrap();
+        let game = fetch(&client, &connection(&host), &root.0, &item(51, "switch", "Game"), None, |_| {}).await.unwrap();
+        let manual = QueueItem { files: Some(vec![514]), label: Some("Manual".into()), extra: true, ..item(51, "switch", "Game") };
+        let with_manual = fetch(&client, &connection(&host), &root.0, &manual, Some(game.clone()), |_| {}).await.unwrap();
+        (game, with_manual)
+    }
+
+    #[tokio::test]
+    async fn an_extra_joins_the_game_as_it_is() {
+        let root = Root::new("extra-joins");
+        let (game, with_manual) = with_its_manual(&root).await;
+        assert_eq!(
+            sorted(&with_manual.files),
+            ["Game/Game.xci", "Game/manual/Game.pdf", "Game/manual/noload.txt", "Game/update/Game [v1].nsp", "Game/update/noload.txt"]
+        );
+        assert_eq!(with_manual.subset, None, "still the whole game, not a part of it called Manual");
+        assert_eq!(with_manual.fingerprint, game.fingerprint, "and as up to date as it was: the manual is no update of it");
+        assert_eq!(with_manual.source_files, [511, 512, 514]);
+    }
+
+    #[tokio::test]
+    async fn an_update_fetches_only_what_changed_and_keeps_the_extras_here() {
+        let root = Root::new("update-changed");
+        let (game, with_manual) = with_its_manual(&root).await;
+        // RomM has a newer update in place of the old one; the game and the manual are as they were.
+        let detail = folder_game(51, "switch", None, &[
+            (511, "game", "Game.xci", 7, None),
+            (515, "update", "Game [v2].nsp", 6, None),
+            (514, "manual", "Game.pdf", 5, None),
+        ]);
+        let (host, requests) = stub_server::start_recording(vec![
+            ("GET file_ids=511", 200, "x".repeat(7)),
+            ("GET file_ids=515", 200, "v".repeat(6)),
+            ("GET file_ids=514", 200, "m".repeat(5)),
+            ("GET /api/roms/51", 200, detail),
+        ])
+        .await;
+        let updated = fetch(&RommClient::new().unwrap(), &connection(&host), &root.0, &item(51, "switch", "Game"), Some(with_manual), |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(fetched(&requests), [515], "the new update alone, not the game again");
+        assert!(!root.0.join("switch/Game/update/Game [v1].nsp").exists(), "the update RomM no longer has goes");
+        assert_eq!(
+            sorted(&updated.files),
+            ["Game/Game.xci", "Game/manual/Game.pdf", "Game/manual/noload.txt", "Game/update/Game [v2].nsp", "Game/update/noload.txt"],
+            "and the manual fetched before it stays"
+        );
+        let mut ids = updated.source_files.clone();
+        ids.sort_unstable();
+        assert_eq!(ids, [511, 514, 515]);
+        assert_ne!(updated.fingerprint, game.fingerprint, "it is RomM's version now");
+    }
+
+    #[tokio::test]
+    async fn on_a_hashed_platform_an_update_fetches_again_a_file_whose_hash_changed_at_the_same_size() {
+        let files = |b: &'static str| [(521, "game", "Game (Disc 1).chd", 4, Some("a1")), (522, "game", "Game (Disc 2).chd", 4, Some(b))];
+        let routes = |detail: String| {
+            vec![("GET file_ids=521", 200, "aaaa".to_string()), ("GET file_ids=522", 200, "bbbb".to_string()), ("GET /api/roms/52", 200, detail)]
+        };
+        let client = RommClient::new().unwrap();
+        let root = Root::new("update-hashed");
+        let host = stub_server::start(routes(folder_game(52, "psx", Some("r1"), &files("b1")))).await;
+        let first = fetch(&client, &connection(&host), &root.0, &item(52, "psx", "Game"), None, |_| {}).await.unwrap();
+        assert_eq!(first.sums.get("Game/Game (Disc 2).chd").map(String::as_str), Some("b1"));
+
+        let (host, requests) = stub_server::start_recording(routes(folder_game(52, "psx", Some("r2"), &files("b2")))).await;
+        let second = fetch(&client, &connection(&host), &root.0, &item(52, "psx", "Game"), Some(first), |_| {}).await.unwrap();
+        assert_eq!(fetched(&requests), [522], "the disc RomM hashes differently, and not the one it hashes the same");
+        assert_eq!(second.sums.get("Game/Game (Disc 2).chd").map(String::as_str), Some("b2"));
+
+        // A record from before hashes were kept has nothing to tell an unchanged file by.
+        let (host, requests) = stub_server::start_recording(routes(folder_game(52, "psx", Some("r3"), &files("b2")))).await;
+        let unhashed = Installed { sums: BTreeMap::new(), ..second };
+        fetch(&client, &connection(&host), &root.0, &item(52, "psx", "Game"), Some(unhashed), |_| {}).await.unwrap();
+        assert_eq!(fetched(&requests), [521, 522]);
+    }
+
+    #[tokio::test]
+    async fn taking_an_extra_off_leaves_the_game_and_its_folder_goes_with_it() {
+        let root = Root::new("extra-off");
+        let (game, with_manual) = with_its_manual(&root).await;
+        let left = shed(&with_manual, &[514], &["Game/manual/Game.pdf".to_string()]);
+        assert!(!root.0.join("switch/Game/manual").exists(), "the manual, its noload.txt and the folder they were in");
+        assert_eq!(sorted(&left.files), sorted(&game.files));
+        assert_eq!(left.source_files, [511, 512]);
+        assert_eq!(left.bytes, game.bytes);
+        assert!(root.0.join("switch/Game/Game.xci").exists());
+    }
+
+    #[tokio::test]
+    async fn a_folder_of_nothing_but_extras_is_fetched_whole_and_is_what_starts() {
+        let detail = folder_game(56, "psx", None, &[(561, "demo", "Game (Demo).iso", 3, None)]);
+        let host = stub_server::start(vec![("GET file_ids=561", 200, "iso".into()), ("GET /api/roms/56", 200, detail)]).await;
+        let root = Root::new("only-extras");
+        let installed = fetch(&RommClient::new().unwrap(), &connection(&host), &root.0, &item(56, "psx", "Game"), None, |_| {})
+            .await
+            .expect("the download succeeds");
+        assert_eq!(installed.files, ["Game/demo/Game (Demo).iso"], "and not hidden from ES-DE: it is all there is");
+        assert_eq!(crate::launch::target(&installed), root.0.join("psx/Game/demo/Game (Demo).iso"));
     }
 
     #[tokio::test]

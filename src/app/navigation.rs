@@ -188,10 +188,10 @@ impl App {
             }
             Route::Detail { .. } => {
                 // The detail page's cursor is its action row, which is one-dimensional.
-                let last = crate::ui::detail::Action::ALL.len() - 1;
+                let last = self.detail_actions().len().saturating_sub(1);
                 match direction {
                     Direction::Left => {
-                        self.detail_focus.action = self.detail_focus.action.saturating_sub(1)
+                        self.detail_focus.action = self.detail_focus.action.min(last).saturating_sub(1)
                     }
                     Direction::Right => {
                         self.detail_focus.action = (self.detail_focus.action + 1).min(last)
@@ -355,8 +355,11 @@ impl App {
                 }
             }
             Route::Detail { .. } => {
-                let action = crate::ui::detail::Action::ALL[self.detail_focus.action];
-                self.update(Message::DetailAction(action))
+                let actions = self.detail_actions();
+                match actions.get(self.detail_focus.action.min(actions.len().saturating_sub(1))) {
+                    Some(action) => self.update(Message::DetailAction(*action)),
+                    None => Task::none(),
+                }
             }
             // An in-game save offers to come back; a state says where it is.
             Route::Saves { rom_id, .. } => self.press_save(rom_id),

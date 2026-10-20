@@ -467,7 +467,7 @@ impl Rom {
 ///
 /// A plain rom has one; a multi-disc game has one per disc; a folder-structured rom (RomM calls it
 /// Structure A — a PS3 title, say) has a whole tree of them.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RomFile {
     pub id: i64,
     #[serde(default)]
@@ -482,9 +482,29 @@ pub struct RomFile {
     #[serde(default)]
     pub file_path: String,
     /// RomM's `RomFileCategory` — "game", "update", "dlc", "patch", "manual", … — or None on a
-    /// server too old to categorise files, which is treated the same as "game".
+    /// server too old to categorise files, which is treated the same as "game". RomM takes it from
+    /// the first folder below the game's own, so only a game with a folder of its own has any but
+    /// "game" — see [`crate::downloads::layout::beside_the_game`].
     #[serde(default)]
     pub category: Option<String>,
+    /// RomM's hashes of the file. None on a platform it doesn't hash (Switch, PS3), and on one where
+    /// hashing is turned off.
+    #[serde(default)]
+    pub md5_hash: Option<String>,
+    #[serde(default)]
+    pub sha1_hash: Option<String>,
+}
+
+/// What a file of a game is to it, by RomM's category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// The game itself: its file, or its discs.
+    Game,
+    /// What completes the game, and so comes with it: an update, DLC.
+    AddOn,
+    /// Everything else — a hack, a translation, a manual, a soundtrack, and any category RomM adds
+    /// later — fetched only when asked for.
+    Extra,
 }
 
 impl RomFile {
@@ -495,15 +515,51 @@ impl RomFile {
         self.category.as_deref().is_none_or(|c| c == "game")
     }
 
+    pub fn part(&self) -> Part {
+        match self.category.as_deref() {
+            None | Some("game") => Part::Game,
+            Some("update" | "dlc") => Part::AddOn,
+            Some(_) => Part::Extra,
+        }
+    }
+
+    /// Whether downloading the game brings this file: the game's own files, its update and its DLC.
+    pub fn comes_with_game(&self) -> bool {
+        self.part() != Part::Extra
+    }
+
+    /// How the file's category reads on a page: "Update", "DLC", "Manual".
+    pub fn category_label(&self) -> String {
+        match self.category.as_deref() {
+            None | Some("game") => "Game".into(),
+            Some("dlc") => "DLC".into(),
+            Some(other) => {
+                let mut chars = other.chars();
+                chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+            }
+        }
+    }
+
+    /// RomM's hash of the file — MD5, else SHA-1 — or None where it made none.
+    pub fn sum(&self) -> Option<String> {
+        [&self.md5_hash, &self.sha1_hash]
+            .into_iter()
+            .flatten()
+            .map(|hash| hash.trim().to_lowercase())
+            .find(|hash| !hash.is_empty())
+    }
+
     pub fn size(&self) -> u64 {
         self.file_size_bytes.max(0) as u64
     }
 }
 
-/// `GET /api/roms/{id}` — the one per-game fetch this build makes, and only to download it.
+/// `GET /api/roms/{id}` — the one per-game fetch this build makes: to download a game, and on the
+/// page of one downloaded in a folder of its own, for the extras RomM keeps beside it.
 ///
 /// Browsing deliberately needs none of this: the list response carries everything the grid and the
-/// detail page draw. What is only here is `files`, which is what a download has to be told.
+/// detail page draw. What is only here is `files` — the list sends none — which is what a download
+/// has to be told.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RomDetail {
     #[serde(default)]
@@ -753,4 +809,39 @@ pub struct RomPage {
 pub struct InstallRequest {
     pub id: String,
     pub rom_id: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(category: Option<&str>) -> RomFile {
+        RomFile { category: category.map(str::to_string), ..Default::default() }
+    }
+
+    #[test]
+    fn an_update_and_dlc_come_with_the_game_and_every_other_category_waits_to_be_asked_for() {
+        assert_eq!(file(None).part(), Part::Game, "a server too old to say");
+        assert_eq!(file(Some("game")).part(), Part::Game);
+        assert_eq!(file(Some("update")).part(), Part::AddOn);
+        assert_eq!(file(Some("dlc")).part(), Part::AddOn);
+        for extra in ["patch", "hack", "mod", "translation", "demo", "prototype", "manual", "soundtrack", "a-category-from-later"] {
+            assert_eq!(file(Some(extra)).part(), Part::Extra, "{extra}");
+            assert!(!file(Some(extra)).comes_with_game());
+        }
+        assert_eq!(file(Some("dlc")).category_label(), "DLC");
+        assert_eq!(file(Some("walkthrough")).category_label(), "Walkthrough");
+    }
+
+    #[test]
+    fn a_file_s_hash_is_romm_s_md5_else_its_sha1_and_none_for_a_platform_it_does_not_hash() {
+        let hashed = |md5: Option<&str>, sha1: Option<&str>| RomFile {
+            md5_hash: md5.map(str::to_string),
+            sha1_hash: sha1.map(str::to_string),
+            ..Default::default()
+        };
+        assert_eq!(hashed(Some("ABC"), Some("def")).sum().as_deref(), Some("abc"));
+        assert_eq!(hashed(Some(""), Some("def")).sum().as_deref(), Some("def"), "a blank one is none");
+        assert_eq!(hashed(Some(""), None).sum(), None);
+    }
 }

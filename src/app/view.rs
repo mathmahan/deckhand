@@ -475,6 +475,7 @@ impl App {
                     achievements: self.achievements.get(rom_id),
                     in_steam: game.builds().any(|id| self.steam_bindings.get(self.host(), id).is_some()),
                     favourite: game.builds().any(|id| self.favourites.contains(&id)),
+                    extras: self.has_extras(*rom_id),
                 };
                 crate::ui::detail::detail_view(&ctx)
             }

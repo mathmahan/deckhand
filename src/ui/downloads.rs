@@ -420,7 +420,7 @@ fn remove_chip<'a>(rom_id: i64, state: &SyncState, lit: bool) -> Element<'a, Mes
             .wrapping(Wrapping::None),
     )
     .padding([5, 12])
-    .on_press(Message::RemoveDownload(rom_id))
+    .on_press(if matches!(state, SyncState::Failed(_)) { Message::DismissDownload(rom_id) } else { Message::RemoveDownload(rom_id) })
     .style(move |_, status| {
         let hovered = matches!(status, button::Status::Hovered);
         button::Style {

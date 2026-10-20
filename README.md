@@ -27,9 +27,11 @@ and keep saves and save states in sync with your server.
 - **Game pages.** Art, rating, How Long to Beat, regions and builds, and the game's
   RetroAchievements, with the ones you have earned marked. *Favourite* marks it in RomM.
 - **Downloads.** A queue that survives restarts, unpacks archives, writes an `.m3u` for multi-disc
-  games and fetches the BIOS. Games can go to any drive (an SD card, for instance), with an optional
-  space budget. Games already in the folder are found and count as downloaded. With RomM 5.4 and a
-  QR pairing, a game can be sent to the Deck from RomM's web app with *Install on device*.
+  games and fetches the BIOS. A game's update and DLC come with it, and its other extras on RomM
+  (a manual, a hack, a translation) are on its page under *Extras*. Games can go to any drive (an
+  SD card, for instance), with an optional space budget. Games already in the folder are found and
+  count as downloaded. With RomM 5.4 and a QR pairing, a game can be sent to the Deck from RomM's
+  web app with *Install on device*.
 - **Playing.** Games start through [RetroDECK](https://retrodeck.net), a command of your own, or an emulator picked per
   system, such as a PCSX2 you installed yourself. They can resume from their newest save state.
   RomM 5.4's web app shows the game as being played on the Deck.

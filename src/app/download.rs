@@ -154,6 +154,7 @@ impl App {
             build: (!own).then(|| choice.label.clone()),
             bytes: choice.bytes.or_else(|| game.size_bytes.and_then(|b| u64::try_from(b).ok()).filter(|_| own && choice.files.is_none())),
             stamp: self.library.stamp(choice.rom_id),
+            extra: false,
         };
         self.enqueue_item(item)
     }
@@ -193,6 +194,7 @@ impl App {
             build: record.build,
             bytes: None,
             stamp: record.stamp,
+            extra: false,
         })
     }
 

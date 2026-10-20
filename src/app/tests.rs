@@ -224,6 +224,113 @@ fn the_downloads_page_opens_a_game_but_takes_delete_to_remove_one() {
     assert!(!app.shelves.iter().any(|s| s.id == "installed"), "and off the shelf with it");
 }
 
+/// A game on this device in a folder of its own, its page open, and RomM's word on what it holds:
+/// the game, its update and a manual.
+fn with_extras_on_romm(manual_here: bool) -> (App, Game) {
+    use crate::romm::models::{RomDetail, RomFile};
+    let mut app = paired_fixtures(12);
+    let game = app.library.all_games()[0].clone();
+    let mut record = installed(game.rom_id, &game.title, 1 << 20);
+    record.files = vec!["Game/Game.sfc".into(), "Game/update/Game.ips".into(), "Game/update/noload.txt".into()];
+    if manual_here {
+        record.files.extend(["Game/manual/Game.pdf".to_string(), "Game/manual/noload.txt".to_string()]);
+    }
+    app.downloads.finish(game.rom_id, Ok(record));
+    let _ = app.update(Message::OpenDetail(game.rom_id));
+    let file = |id: i64, category: &str, name: &str| RomFile {
+        id,
+        file_name: name.into(),
+        file_size_bytes: 10,
+        file_path: if category == "game" { "roms/snes/Game".into() } else { format!("roms/snes/Game/{category}") },
+        category: Some(category.into()),
+        ..Default::default()
+    };
+    let detail = RomDetail {
+        id: game.rom_id,
+        fs_name: Some("Game".into()),
+        fs_path: Some("roms/snes".into()),
+        files: vec![file(1, "game", "Game.sfc"), file(2, "update", "Game.ips"), file(3, "manual", "Game.pdf")],
+        ..Default::default()
+    };
+    let _ = app.update(Message::FilesLoaded(game.rom_id, Ok(Box::new(detail))));
+    (app, game)
+}
+
+#[test]
+fn a_game_s_extras_on_romm_get_a_button_that_comes_in_without_moving_the_cursor() {
+    use crate::ui::detail::Action;
+    let mut app = paired_fixtures(12);
+    let game = app.library.all_games()[0].clone();
+    let mut record = installed(game.rom_id, &game.title, 1 << 20);
+    record.files = vec!["Game/Game.sfc".into()];
+    app.downloads.finish(game.rom_id, Ok(record));
+    let _ = app.update(Message::OpenDetail(game.rom_id));
+    assert_eq!(app.detail_actions(), Action::shown(false), "nothing known of its extras yet");
+
+    // On Favourite, past where Extras comes in, as RomM answers.
+    let favourite = Action::shown(false).iter().position(|a| *a == Action::Favourite).unwrap();
+    for _ in 0..favourite {
+        let _ = app.update(Message::Nav(Direction::Right));
+    }
+    let (with, _) = with_extras_on_romm(false);
+    let detail = with.rom_files.get(&game.rom_id).cloned().expect("the answer kept");
+    let _ = app.update(Message::FilesLoaded(game.rom_id, Ok(Box::new((*detail).clone()))));
+    assert!(app.detail_actions().contains(&Action::Extras));
+    assert_eq!(app.detail_actions()[app.detail_focus.action], Action::Favourite, "the cursor stays on the action it was on");
+}
+
+#[test]
+fn picking_an_extra_queues_it_alone_into_the_game_here() {
+    let (mut app, game) = with_extras_on_romm(false);
+    let _ = app.update(Message::DetailAction(crate::ui::detail::Action::Extras));
+    let picker = &app.pick.as_ref().expect("the extras, to pick from").picker;
+    let rows: Vec<(&str, &str, bool)> = picker.rows.iter().map(|r| (r.label.as_str(), r.detail.as_str(), r.mark.is_some())).collect();
+    assert_eq!(rows, [("Manual", "Game.pdf", false)], "the update came with the game, so it is no extra");
+
+    let _ = app.update(Message::Activate);
+    let queued: Vec<QueueItem> = app.downloads.in_progress().map(|(item, _)| item.clone()).collect();
+    assert_eq!(queued.len(), 1);
+    assert_eq!((queued[0].rom_id, queued[0].files.clone(), queued[0].label.as_deref(), queued[0].extra), (game.rom_id, Some(vec![3]), Some("Manual"), true));
+}
+
+#[test]
+fn an_extra_here_is_marked_and_taking_it_off_keeps_the_game() {
+    let (mut app, game) = with_extras_on_romm(true);
+    let _ = app.update(Message::DetailAction(crate::ui::detail::Action::Extras));
+    let picker = &app.pick.as_ref().expect("the extras").picker;
+    assert_eq!(picker.rows[0].mark.as_deref(), Some("on this device"));
+
+    // What `downloads::shed` answers once the file is gone.
+    let mut left = app.downloads.installed(game.rom_id).cloned().unwrap();
+    left.files.retain(|f| !f.starts_with("Game/manual/"));
+    let _ = app.update(Message::ExtraRemoved(game.rom_id, "Manual".into(), Ok(Box::new(left))));
+    let record = app.downloads.installed(game.rom_id).expect("the game is still here");
+    assert!(!record.files.iter().any(|f| f.contains("manual")));
+    assert!(app.banner.as_deref().is_some_and(|b| b.contains("Manual is off this device")), "{:?}", app.banner);
+}
+
+#[test]
+fn deleting_a_failed_row_of_a_game_here_dismisses_the_failure_and_keeps_the_game() {
+    let (mut app, game) = with_extras_on_romm(false);
+    app.downloads.enqueue(QueueItem {
+        rom_id: game.rom_id,
+        system_id: game.system_id.clone(),
+        title: game.title.clone(),
+        files: Some(vec![3]),
+        label: Some("Manual".into()),
+        extra: true,
+        ..Default::default()
+    });
+    app.downloads.start_next();
+    app.downloads.finish(game.rom_id, Err("the server went away".into()));
+    let _ = app.update(Message::TabSelected(Tab::Downloads));
+    assert!(matches!(app.download_rows()[0].state, crate::downloads::SyncState::Failed(_)), "the failure leads the page");
+
+    let _ = app.update(Message::RemoveFocusedDownload);
+    assert_eq!(app.downloads.failures().count(), 0, "the failure is dismissed");
+    assert!(app.downloads.installed(game.rom_id).is_some(), "and the game it was for is still here");
+}
+
 #[test]
 fn delete_outside_the_downloads_page_removes_nothing() {
     let mut app = paired_fixtures(12);
@@ -609,6 +716,7 @@ mod render {
             file_size_bytes: 700 * 1024 * 1024,
             file_path: "roms/psx".into(),
             category: Some("game".into()),
+            ..Default::default()
         };
         let detail = RomDetail { id: tile, files: vec![disc(1, 1), disc(2, 2), disc(3, 3)], ..Default::default() };
         let _ = app.update(Message::OpenDetail(tile));
