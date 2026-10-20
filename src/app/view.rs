@@ -1,7 +1,7 @@
 //! What the window draws.
 
 use super::*;
-use iced::widget::{column, stack};
+use iced::widget::{column, opaque, stack};
 
 impl App {
     pub fn view(&self) -> Element<'_, Message> {
@@ -38,36 +38,42 @@ impl App {
             body
         };
 
-        if let Some(pending) = &self.conflict {
-            return conflict_view(pending, &self.title_of(pending.rom_id));
-        }
-        if let Some(handover) = &self.handover {
-            return self.handover_view(handover);
-        }
-        if let Some(pending) = &self.entry {
-            return crate::ui::entry::view(&pending.entry);
-        }
-        if let Some(pending) = &self.pick {
-            return crate::ui::picker::view(&pending.picker);
-        }
         // The banner's place is always there, empty without one, so the page keeps its place in the
-        // widget tree. Pushed in only when a banner came, it moved the page down a slot, and every
-        // scrollable in it started over at the top — Settings jumped up as an update was found and
-        // again as its banner went.
+        // widget tree. iced keeps a scrollable's offset by its slot: pushed in only when a banner
+        // came, the banner moved the page down one, and every scrollable in it started over at the
+        // top — Settings jumped up as an update was found, Downloads as a game was removed, and both
+        // again as the banner went.
+        //
+        // The empty place is a `Space` that shrinks to nothing, not one fixed at zero height: a
+        // column leaves out a child sized `Fixed(0.0)` altogether, so that one held no place at all.
         let banner: Element<Message> = match &self.banner {
             Some(banner) => banner_view(banner, self.chrome == Some(Chrome::Banner)),
-            None => Space::new().height(Length::Fixed(0.0)).into(),
+            None => Space::new().into(),
         };
-        let page = column![banner, chrome];
-
-        container(page)
+        let page = container(column![banner, chrome])
             .width(Length::Fill)
             .height(Length::Fill)
             .style(|_| container::Style {
                 background: Some(Background::Color(theme::BACKGROUND)),
                 ..Default::default()
-            })
-            .into()
+            });
+
+        // What takes the window for a while — a conflict to answer, a game being handed over, a
+        // text entry, a picker — is drawn over the page rather than in its place, for the same
+        // reason: put in its place, the page lost its slot, and closing a picker far down Settings
+        // brought Settings back at its top. Opaque, so the pointer reaches nothing under it.
+        let over: Element<Message> = if let Some(pending) = &self.conflict {
+            opaque(conflict_view(pending, &self.title_of(pending.rom_id)))
+        } else if let Some(handover) = &self.handover {
+            opaque(self.handover_view(handover))
+        } else if let Some(pending) = &self.entry {
+            opaque(crate::ui::entry::view(&pending.entry))
+        } else if let Some(pending) = &self.pick {
+            opaque(crate::ui::picker::view(&pending.picker))
+        } else {
+            Space::new().into()
+        };
+        stack![page, over].into()
     }
 
     /// The whole window while a game is handed to its emulator or back — see [`Handover`]. Its
