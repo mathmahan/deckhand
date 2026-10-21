@@ -108,11 +108,16 @@ pub fn tab_bar<'a>(current: Tab, focused: bool, status: Status) -> Element<'a, M
     }
     right = right.push(gear(current, focused));
 
+    // The pixel wordmark, three pixels a cell: about the height the name had as text.
+    let (letters, cells_w, cells_h) = theme::wordmark();
     let wordmark = row![
         iced::widget::image(theme::logo()).width(Length::Fixed(30.0)).height(Length::Fixed(30.0)),
-        text("Deckhand").size(22.0).font(theme::DISPLAY).color(theme::INK),
+        iced::widget::image(letters)
+            .width(Length::Fixed(cells_w as f32 * 3.0))
+            .height(Length::Fixed(cells_h as f32 * 3.0))
+            .filter_method(iced::widget::image::FilterMethod::Nearest),
     ]
-    .spacing(10)
+    .spacing(12)
     .align_y(Alignment::Center);
 
     row![
