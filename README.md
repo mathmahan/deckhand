@@ -33,8 +33,9 @@ and keep saves and save states in sync with your server.
   count as downloaded. With RomM 5.4 and a QR pairing, a game can be sent to the Deck from RomM's
   web app with *Install on device*.
 - **Playing.** Games start through [RetroDECK](https://retrodeck.net), a command of your own, or an emulator picked per
-  system, such as a PCSX2 you installed yourself. They can resume from their newest save state.
-  RomM 5.4's web app shows the game as being played on the Deck.
+  system, such as a PCSX2 you installed yourself. They can resume from their newest save state, and
+  *Resume from the newest state* decides that for the games Deckhand starts, whatever RetroArch's
+  own *Auto Load State* is set to. RomM 5.4's web app shows the game as being played on the Deck.
 - **Save sync.** Saves and save states sync both ways through RomM: around every launch, and while
   the window is open, as soon as a save changes. An older save can be restored from a game's Saves
   page, and a save state there put into a slot. See [Save sync](#save-sync) for what each system syncs.

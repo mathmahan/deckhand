@@ -23,7 +23,9 @@
 //! to whichever Deckhand starts next, which syncs the game's saves and sends the session
 //! ([`crate::launch::finish_left`]). A game whose saves or session RomM could not take as it closed —
 //! no network, say — is left the same way, on purpose. The marker carries what that needs ([`Game`]),
-//! so it can be done from anywhere, without the window's library or ES-DE's arguments.
+//! so it can be done from anywhere, without the window's library or ES-DE's arguments — and the
+//! RetroArch setting a launch laid another over, which is put back first, RomM or not
+//! ([`crate::launch::AutoLoad`]).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, Write};
@@ -80,6 +82,9 @@ struct Note {
     /// RomM has its time played already, and only its saves are owed — so it is never sent twice.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sent: bool,
+    /// RetroArch's own setting the launch laid another over, to put back once the game has closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_load: Option<crate::launch::AutoLoad>,
 }
 
 impl Note {
@@ -87,7 +92,7 @@ impl Note {
         let text = text.trim();
         serde_json::from_str(text)
             .ok()
-            .or_else(|| text.parse().ok().map(|start| Note { start, rom_id: None, kept: false, game: None, sent: false }))
+            .or_else(|| text.parse().ok().map(|start| Note { start, rom_id: None, kept: false, game: None, sent: false, auto_load: None }))
     }
 
     fn bytes(&self) -> Vec<u8> {
@@ -141,8 +146,8 @@ pub struct Held {
 
 /// Note that `game` starts now, held by this process until [`Held::end`]. Dropped without that, the
 /// marker stays for [`left`]. None when it cannot be written: the game still plays, its closing just
-/// has nothing behind it.
-pub fn hold(store: &Path, rom_id: i64, game: Game) -> Option<Held> {
+/// has nothing behind it. `auto_load` is RetroArch's own setting the launch laid another over.
+pub fn hold(store: &Path, rom_id: i64, game: Game, auto_load: Option<crate::launch::AutoLoad>) -> Option<Held> {
     let path = path(store, &game.rom);
     let dir = path.parent()?;
     fs::create_dir_all(dir).ok()?;
@@ -154,7 +159,7 @@ pub fn hold(store: &Path, rom_id: i64, game: Game) -> Option<Held> {
         Err(fs::TryLockError::WouldBlock) => return None,
     }
     let start = SystemTime::now();
-    let written = file.write_all(&Note { start: secs(start), rom_id: Some(rom_id), kept: true, game: Some(game), sent: false }.bytes());
+    let written = file.write_all(&Note { start: secs(start), rom_id: Some(rom_id), kept: true, game: Some(game), sent: false, auto_load }.bytes());
     if written.and_then(|()| fs::rename(&staging, &path)).is_err() {
         let _ = fs::remove_file(&staging);
         return None;
@@ -182,16 +187,21 @@ impl Held {
 
     /// RomM has the session, but not all of the game's saves: the marker stays for those alone.
     pub fn sent(self) {
-        mark_sent(&self.file, &self.path);
+        rewrite(&self.file, &self.path, |note| note.sent = true);
+    }
+
+    /// RetroArch's own setting is back as it was: nothing is left to put back.
+    pub fn auto_load_put_back(&self) {
+        rewrite(&self.file, &self.path, |note| note.auto_load = None);
     }
 }
 
-/// Say in the marker `file` holds that its time played has gone, through the held file so the lock
-/// stays on what the path names. Its last touch stays the end it was.
-fn mark_sent(file: &File, path: &Path) {
+/// Change the marker `file` holds, through the held file so the lock stays on what the path names.
+/// Its last touch stays the end it was.
+fn rewrite(file: &File, path: &Path, change: impl FnOnce(&mut Note)) {
     let Some(mut note) = fs::read_to_string(path).ok().and_then(|text| Note::read(&text)) else { return };
     let touched = file.metadata().and_then(|m| m.modified());
-    note.sent = true;
+    change(&mut note);
     let mut writer = file;
     if names(file, path) && writer.set_len(0).and_then(|()| writer.rewind()).and_then(|()| writer.write_all(&note.bytes())).is_ok()
         && let Ok(touched) = touched
@@ -203,7 +213,7 @@ fn mark_sent(file: &File, path: &Path) {
 /// Note that `rom` starts now with nothing to hold the marker: a `pre`, whose `post` takes it. ES-DE's
 /// hook then starts [`keep`] to hold it.
 pub fn start(store: &Path, rom: &Path, rom_id: Option<i64>, game: Option<Game>) {
-    let note = Note { start: secs(SystemTime::now()), rom_id, kept: false, game, sent: false };
+    let note = Note { start: secs(SystemTime::now()), rom_id, kept: false, game, sent: false, auto_load: None };
     let _ = crate::sync::write_atomic(&path(store, rom), &note.bytes());
 }
 
@@ -249,7 +259,7 @@ pub fn owe(store: &Path, rom: &Path, taken: &Taken, rom_id: Option<i64>, game: O
     if path.exists() {
         return;
     }
-    let note = Note { start: secs(taken.start), rom_id: Some(rom_id), kept: true, game: taken.game.clone().or(game), sent };
+    let note = Note { start: secs(taken.start), rom_id: Some(rom_id), kept: true, game: taken.game.clone().or(game), sent, auto_load: None };
     if crate::sync::write_atomic(&path, &note.bytes()).is_ok()
         && let Ok(file) = OpenOptions::new().write(true).open(&path)
     {
@@ -326,7 +336,17 @@ impl Left {
 
     /// Its time played went, its saves did not: the marker stays for those alone.
     pub fn sent(self) {
-        mark_sent(&self.file, &self.path);
+        rewrite(&self.file, &self.path, |note| note.sent = true);
+    }
+
+    /// RetroArch's own setting the launch laid another over, still to be put back.
+    pub fn auto_load(&self) -> Option<&crate::launch::AutoLoad> {
+        self.note.auto_load.as_ref()
+    }
+
+    /// RetroArch's own setting is back as it was: nothing is left to put back.
+    pub fn auto_load_put_back(&self) {
+        rewrite(&self.file, &self.path, |note| note.auto_load = None);
     }
 }
 
@@ -374,7 +394,7 @@ mod tests {
         /// A marker as one left by a session that started `ago` and was last touched `quiet` ago.
         fn left(&self, kept: bool, ago: u64, quiet: u64) {
             let now = SystemTime::now();
-            let note = Note { start: secs(now - Duration::from_secs(ago)), rom_id: Some(7), kept, game: Some(game()), sent: false };
+            let note = Note { start: secs(now - Duration::from_secs(ago)), rom_id: Some(7), kept, game: Some(game()), sent: false, auto_load: None };
             crate::sync::write_atomic(&self.marker(), &note.bytes()).unwrap();
             OpenOptions::new().write(true).open(self.marker()).unwrap().set_modified(now - Duration::from_secs(quiet)).unwrap();
         }
@@ -401,7 +421,7 @@ mod tests {
     #[test]
     fn a_held_marker_is_a_game_still_running_and_is_left_once_its_holder_is_gone() {
         let store = Store::new("held");
-        let held = hold(&store.0, 7, game()).unwrap();
+        let held = hold(&store.0, 7, game(), None).unwrap();
         assert_eq!(fs::read_dir(store.0.join("playing")).unwrap().count(), 1, "nothing staged is left beside it");
         assert!(left(&store.0).is_empty(), "a game still running is not left");
 
@@ -474,10 +494,10 @@ mod tests {
     fn ending_a_session_leaves_a_later_start_of_the_game_alone() {
         let store = Store::new("end");
         let rom = Path::new(ROM);
-        hold(&store.0, 7, game()).unwrap().end();
+        hold(&store.0, 7, game(), None).unwrap().end();
         assert!(!store.marker().exists());
 
-        let first = hold(&store.0, 7, game()).unwrap();
+        let first = hold(&store.0, 7, game(), None).unwrap();
         start(&store.0, rom, Some(7), None);
         first.end();
         assert!(store.marker().is_file());
@@ -504,7 +524,7 @@ mod tests {
     #[test]
     fn a_session_romm_has_is_never_sent_again_while_its_saves_are_still_owed() {
         let store = Store::new("sent");
-        let held = hold(&store.0, 7, game()).unwrap();
+        let held = hold(&store.0, 7, game(), None).unwrap();
         held.file.set_modified(held.start + Duration::from_secs(600)).unwrap();
         held.sent();
         let found = left(&store.0);

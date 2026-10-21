@@ -234,24 +234,26 @@ impl Launcher {
         }
     }
 
-    /// The argv that plays `rom` as `system` booting straight into RetroArch's state slot `slot`.
-    /// None when what runs it is not RetroArch, which has no such switch.
+    /// The argv that plays `rom` as `system` in RetroArch with `extra` on its command line: a state
+    /// slot to boot into, a config to lay over its own. None when what runs it is not RetroArch,
+    /// which has no such switches.
     ///
     /// RetroDECK passes nothing on to the emulator, but takes the command itself with `-e`, filling
-    /// in its placeholders as it does for its own choice: so the command it would choose, read from
-    /// the same tables, goes with `--entryslot <slot>` on the end.
-    pub fn resume_command(&self, system: &str, rom: &Path, slot: u32) -> Option<Vec<String>> {
+    /// in its placeholders as it does for its own choice and running it through the shell: so the
+    /// command it would choose, read from the same tables, goes with `extra` quoted on the end.
+    pub fn retroarch_command(&self, system: &str, rom: &Path, extra: &[String]) -> Option<Vec<String>> {
         match self {
             Launcher::RetroDeck(rd) => {
                 let text = rd.command_text(system, rom).filter(|t| t.contains("%EMULATOR_RETROARCH%"))?;
                 let rom = rom.to_string_lossy().into_owned();
-                Some(["flatpak", "run", RETRODECK, "-e", &format!("{text} --entryslot {slot}"), "-s", system, &rom].map(String::from).to_vec())
+                let text = format!("{text} {}", join_command(extra));
+                Some(["flatpak", "run", RETRODECK, "-e", &text, "-s", system, &rom].map(String::from).to_vec())
             }
             Launcher::Custom(_) => {
                 // RetroArch, by a core or not — nothing else boots into a slot.
                 self.emulator(system, rom).syncs()?;
                 let mut command = self.command(system, rom);
-                command.extend(["--entryslot".to_string(), slot.to_string()]);
+                command.extend(extra.iter().cloned());
                 Some(command)
             }
         }
@@ -654,9 +656,17 @@ fn reported(result: Result<Report, String>, failed: &str) -> Synced {
 /// was out of reach as it closed (see [`crate::playing`]): its saves synced, and its time played sent
 /// with them. One RomM still cannot take stays for the next time. Answers how many were finished.
 pub async fn finish_left(ctx: &Context) -> usize {
+    let left = crate::playing::left(&ctx.store);
+    // RetroArch's own setting first, RomM or not: putting it back needs nothing else.
+    for game in &left {
+        if let Some(laid) = game.auto_load() {
+            laid.put_back();
+            game.auto_load_put_back();
+        }
+    }
     let Some(conn) = &ctx.connection else { return 0 };
     let mut finished = 0;
-    for left in crate::playing::left(&ctx.store) {
+    for left in left {
         let Some(rom_id) = left.rom_id() else {
             left.done();
             continue;
@@ -813,18 +823,32 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: 
     // as it closed. Before this one's marker can take the place of the game's own.
     finish_left(&ctx).await;
     notes.extend(ready(&ctx, &plan).await);
-    // Into the newest state, when asked to and there is one here — the save sync has just brought
-    // down any newer from elsewhere. Only into a file that is there: RetroArch refuses to start at
-    // all over a missing one.
-    let resumed = resume.then(|| newest_state(&ctx, &plan)).flatten().and_then(|from| match from {
-        Resume::Slot(slot) => launcher.resume_command(&plan.system, &plan.rom, slot),
-        // RetroArch loads it by itself, and would not with a slot named.
-        Resume::Auto => Some(launcher.command(&plan.system, &plan.rom)),
-    });
-    if resumed.is_some() {
+    // Into the newest state when asked to, from the start when not, whatever RetroArch's own Auto
+    // Load State says — see [`start_in`]. The save sync has just brought down any newer state from
+    // elsewhere.
+    let here = states_here(&ctx, &plan);
+    let start = here.as_ref().map_or_else(Start::default, |h| start_in(resume, h.newest, h.auto, h.install.loads_auto_state()));
+    let laid = start.auto_load.zip(here.as_ref()).and_then(|(on, h)| AutoLoad::lay(&ctx.store, h.install.config(), on));
+    let mut extra = Vec::new();
+    if let Some(slot) = start.slot {
+        extra.extend(["--entryslot".to_string(), slot.to_string()]);
+    }
+    if laid.is_some() {
+        extra.extend(["--appendconfig".to_string(), auto_load_file(&ctx.store).to_string_lossy().into_owned()]);
+    }
+    let special = (!extra.is_empty()).then(|| launcher.retroarch_command(&plan.system, &plan.rom, &extra)).flatten();
+    // Laid over RetroArch's own only when the command carries it.
+    let laid = laid.filter(|_| special.is_some());
+    let resumed = match start {
+        Start { slot: Some(_), .. } => special.is_some(),
+        Start { auto_load: Some(on), .. } => on && laid.is_some(),
+        // RetroArch starts in the auto slot's state by itself.
+        Start { .. } => resume && here.as_ref().is_some_and(|h| h.newest == Some(Resume::Auto)),
+    };
+    if resumed {
         notes.push("resumed from the newest save state".into());
     }
-    let command = resumed.unwrap_or_else(|| launcher.command(&plan.system, &plan.rom));
+    let command = special.unwrap_or_else(|| launcher.command(&plan.system, &plan.rom));
     // Asked to stop before the game is up — Steam closing the shortcut while its save came down — so
     // it is not started only to be closed again.
     if stop.asked() {
@@ -833,7 +857,7 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: 
     tell(Stage::Running);
     // On disk for as long as the game runs, so what its closing owes outlives this process — see
     // `crate::playing`.
-    let held = crate::playing::hold(&ctx.store, plan.rom_id, plan.game());
+    let held = crate::playing::hold(&ctx.store, plan.rom_id, plan.game(), laid.clone());
     let start = held.as_ref().map_or_else(SystemTime::now, crate::playing::Held::start);
     let pid = Arc::new(AtomicU32::new(0));
     let game = tokio::task::spawn_blocking({
@@ -864,6 +888,12 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: 
     // When it closed, for a sync this process does not live to finish.
     if let Some(held) = &held {
         held.touch();
+    }
+    if let Some(laid) = &laid {
+        laid.put_back();
+        if let Some(held) = &held {
+            held.auto_load_put_back();
+        }
     }
     let play = play_session(plan.rom_id, start, SystemTime::now());
     if ctx.connection.is_some() {
@@ -1013,28 +1043,105 @@ async fn while_playing<T>(ctx: &Context, rom_id: i64, held: Option<&crate::playi
 }
 
 /// Where a resumed game starts: in RetroArch's state slot N, or in the auto slot's state, which
-/// RetroArch loads by itself on start when "load state on start" is on.
+/// RetroArch loads by itself on start when its Auto Load State is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resume {
     Slot(u32),
     Auto,
 }
 
-/// Where the game's newest save state on this device is, if RetroArch runs it and has one to start
-/// in: the newest of its slots RetroArch can be started in — any numbered one, and the auto slot
-/// only when RetroArch loads that by itself.
-fn newest_state(ctx: &Context, plan: &Plan) -> Option<Resume> {
+/// A game RetroArch runs, as far as starting it in a state goes.
+struct Here {
+    /// Its newest save state on this device that RetroArch can start in: any numbered slot
+    /// `--entryslot` takes, or the auto slot.
+    newest: Option<Resume>,
+    /// It has a state in the auto slot, which RetroArch's Auto Load State would start it in.
+    auto: bool,
+    /// RetroArch as the game sees it, its overrides laid over.
+    install: sync::retroarch::Install,
+}
+
+/// The game's save states on this device, if RetroArch runs it and they can be found.
+fn states_here(ctx: &Context, plan: &Plan) -> Option<Here> {
     let core = plan.emulator.syncs()?;
     let install = sync::retroarch::locate(ctx.retroarch_config.as_deref()).ok()?.for_game(&plan.rom, core);
     let dir = install.game_states_dir(&plan.rom, core).ok()?;
     let stem = plan.rom.file_stem()?.to_string_lossy().into_owned();
-    let mut here = sync::states::on_disk(&dir, &stem);
-    here.sort_by_key(|(_, written)| std::cmp::Reverse(*written));
-    here.into_iter().find_map(|(slot, _)| match slot {
+    let mut states = sync::states::on_disk(&dir, &stem);
+    states.sort_by_key(|(_, written)| std::cmp::Reverse(*written));
+    let auto = states.iter().any(|(slot, _)| *slot == sync::states::Slot::Auto);
+    let newest = states.into_iter().find_map(|(slot, _)| match slot {
         // `--entryslot` takes 0 to 999.
         sync::states::Slot::Number(n) => (n <= 999).then_some(Resume::Slot(n)),
-        sync::states::Slot::Auto => install.loads_auto_state().then_some(Resume::Auto),
-    })
+        sync::states::Slot::Auto => Some(Resume::Auto),
+    });
+    Some(Here { newest, auto, install })
+}
+
+/// How RetroArch is started: in a numbered state slot, and with its own Auto Load State laid over
+/// for this launch alone — None leaves it as it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Start {
+    slot: Option<u32>,
+    auto_load: Option<bool>,
+}
+
+/// How a game RetroArch runs starts, so that *Resume from the newest state* (`resume`) decides
+/// whether it resumes — not RetroArch's own Auto Load State (`loads_auto`), which on its own loads
+/// the auto slot's state (`auto`) at every start, whatever Deckhand asked.
+///
+/// Resuming, a numbered slot is named, which RetroArch loads instead of the auto slot's state; the
+/// auto slot's state, when it is the newest (`newest`), needs RetroArch's Auto Load State on. Not
+/// resuming, it needs it off where there is an auto state to load. Either is laid over RetroArch's
+/// own only where it differs, so a launch where nothing would load is left as it always was. Only
+/// into a state that is there: RetroArch refuses to start at all over a missing one.
+fn start_in(resume: bool, newest: Option<Resume>, auto: bool, loads_auto: bool) -> Start {
+    match (resume, newest) {
+        (true, Some(Resume::Slot(slot))) => Start { slot: Some(slot), auto_load: None },
+        (true, Some(Resume::Auto)) => Start { slot: None, auto_load: (!loads_auto).then_some(true) },
+        (false, _) if auto && loads_auto => Start { slot: None, auto_load: Some(false) },
+        _ => Start::default(),
+    }
+}
+
+/// The config a launch lays over RetroArch's own: its Auto Load State, one line.
+fn auto_load_file(store: &Path) -> PathBuf {
+    store.join("retroarch-auto-load.cfg")
+}
+
+/// RetroArch's own Auto Load State in `config`, which a launch laid `set` over for itself
+/// (`--appendconfig`), `was` before — put back once the game has closed. RetroArch, saving its
+/// settings as it quits, writes what was laid over them into its own config; a launch's marker
+/// carries this, so it is put back even when Deckhand did not see the game close.
+///
+/// A core's or a game's own override that sets it goes over what a launch lays, and RetroArch then
+/// saves nothing as it quits: such a game starts the way its override says.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AutoLoad {
+    config: PathBuf,
+    was: bool,
+    set: bool,
+}
+
+impl AutoLoad {
+    /// Write the config that turns RetroArch's Auto Load State `set` for a launch. None when it
+    /// cannot be written: the launch then leaves RetroArch's setting as it is.
+    fn lay(store: &Path, config: &Path, set: bool) -> Option<AutoLoad> {
+        let line = format!("{} = \"{set}\"\n", sync::retroarch::AUTO_LOAD);
+        sync::write_atomic(&auto_load_file(store), line.as_bytes()).ok()?;
+        let was = sync::retroarch::setting(config, sync::retroarch::AUTO_LOAD).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        Some(AutoLoad { config: config.to_path_buf(), was, set })
+    }
+
+    /// Put RetroArch's own setting back where it is what the launch laid over it. Anything else there
+    /// is the player's doing since, and stays.
+    pub fn put_back(&self) {
+        let key = sync::retroarch::AUTO_LOAD;
+        let now = sync::retroarch::setting(&self.config, key).map(|v| v.eq_ignore_ascii_case("true"));
+        if self.was != self.set && now == Some(self.set) {
+            let _ = sync::retroarch::set_setting(&self.config, key, if self.was { "true" } else { "false" });
+        }
+    }
 }
 
 /// A session shorter than this is a game that crashed on boot or was closed from its menu, not play.
@@ -1337,8 +1444,9 @@ mod tests {
         let tree = Tree::new("resume");
         let rd = Launcher::RetroDeck(tree.retrodeck());
         let rom = Path::new("/g/snes/Chrono.sfc");
+        let words = |w: &[&str]| w.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            rd.resume_command("snes", rom, 0).unwrap(),
+            rd.retroarch_command("snes", rom, &words(&["--entryslot", "0"])).unwrap(),
             [
                 "flatpak",
                 "run",
@@ -1351,12 +1459,36 @@ mod tests {
             ],
             "the command RetroDECK would choose, as RetroDECK's -e takes one"
         );
-        assert_eq!(rd.resume_command("gc", Path::new("/g/gc/Game.rvz"), 0), None, "Dolphin has no state slots to boot into");
+        // RetroDECK runs that through the shell: a path goes quoted.
+        let laid = rd.retroarch_command("snes", rom, &words(&["--appendconfig", "/home/me/My Store/ra.cfg"])).unwrap();
+        assert!(laid[4].ends_with("%ROM% --appendconfig '/home/me/My Store/ra.cfg'"), "{laid:?}");
+        assert_eq!(rd.retroarch_command("gc", Path::new("/g/gc/Game.rvz"), &words(&["--entryslot", "0"])), None, "Dolphin has no state slots to boot into");
 
         let ra = Launcher::Custom(vec!["retroarch".into(), "-L".into(), "/c/snes9x_libretro.so".into()]);
-        assert_eq!(ra.resume_command("snes", rom, 7).unwrap(), ["retroarch", "-L", "/c/snes9x_libretro.so", "/g/snes/Chrono.sfc", "--entryslot", "7"]);
+        assert_eq!(
+            ra.retroarch_command("snes", rom, &words(&["--entryslot", "7"])).unwrap(),
+            ["retroarch", "-L", "/c/snes9x_libretro.so", "/g/snes/Chrono.sfc", "--entryslot", "7"]
+        );
         let other = Launcher::Custom(vec!["dolphin-emu".into(), "-b".into()]);
-        assert_eq!(other.resume_command("gc", rom, 0), None);
+        assert_eq!(other.retroarch_command("gc", rom, &words(&["--entryslot", "0"])), None);
+    }
+
+    #[test]
+    fn the_resume_setting_decides_whether_a_game_resumes_whatever_retroarch_s_own_says() {
+        let (slot, auto) = (Some(Resume::Slot(3)), Some(Resume::Auto));
+        let start = |slot: Option<u32>, auto_load: Option<bool>| Start { slot, auto_load };
+        // Resuming: a numbered slot is named, which RetroArch loads instead of the auto state.
+        assert_eq!(start_in(true, slot, true, true), start(Some(3), None));
+        assert_eq!(start_in(true, slot, false, false), start(Some(3), None));
+        // The auto state, by RetroArch's own Auto Load State — turned on for this launch if it is off.
+        assert_eq!(start_in(true, auto, true, true), start(None, None));
+        assert_eq!(start_in(true, auto, true, false), start(None, Some(true)));
+        assert_eq!(start_in(true, None, false, false), start(None, None), "nothing to resume from");
+        // Not resuming: RetroArch's Auto Load State is turned off where it would load something.
+        assert_eq!(start_in(false, auto, true, true), start(None, Some(false)));
+        assert_eq!(start_in(false, slot, true, true), start(None, Some(false)), "the auto state, older or not");
+        assert_eq!(start_in(false, slot, false, true), start(None, None), "no auto state to load");
+        assert_eq!(start_in(false, auto, true, false), start(None, None), "RetroArch would not load it anyway");
     }
 
     #[test]
@@ -1484,6 +1616,78 @@ mod tests {
         let session = play(ctx, resuming, game, Stop::default(), |_| {}).await.unwrap();
         assert!(session.notes.iter().any(|n| n.contains("resumed from the newest save state")), "{:?}", session.notes);
         assert!(requests.lock().unwrap().iter().any(|r| r.starts_with("POST /api/saves?rom_id=1")));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// RetroArch's Auto Load State on, a game with an auto state, and Deckhand asked not to resume: the
+    /// launch turns it off for itself, and puts RetroArch's own back after — which RetroArch, saving
+    /// its settings as it quits, overwrote.
+    #[tokio::test]
+    async fn a_launch_not_resuming_keeps_retroarch_from_loading_the_auto_state_and_puts_its_setting_back() {
+        const GAME: &str = "Chrono Trigger (USA)";
+        let root = std::env::temp_dir().join(format!("deckhand-launch-auto-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("ra")).unwrap();
+        fs::create_dir_all(root.join("games/snes")).unwrap();
+        fs::write(root.join(format!("games/snes/{GAME}.sfc")), "rom").unwrap();
+        let config = root.join("ra/retroarch.cfg");
+        fs::write(
+            &config,
+            format!(
+                "savefile_directory = \"{0}/saves\"\nsavestate_directory = \"{0}/states\"\n\
+                 savestate_auto_load = \"true\"\nconfig_save_on_exit = \"true\"\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("states")).unwrap();
+        fs::write(root.join(format!("states/{GAME}.state.auto")), "state").unwrap();
+
+        // RetroArch in shape: what it was handed noted, and what was laid over its config saved into
+        // it as it quits.
+        let args = root.join("args");
+        let script = format!(
+            "printf '%s\\n' \"$@\" > '{args}'; for a; do last=$a; done; case \"$last\" in *.cfg) \
+             grep -v '^savestate_auto_load' '{cfg}' > '{cfg}.new'; cat \"$last\" >> '{cfg}.new'; mv '{cfg}.new' '{cfg}';; esac",
+            args = args.display(),
+            cfg = config.display()
+        );
+        let settings = Settings {
+            retroarch_config: Some(config.clone()),
+            launch_command: Some(vec!["sh".into(), "-c".into(), script, "-L".into(), "/cores/snes9x_libretro.so".into()]),
+            ..Settings::default()
+        };
+        let ctx = Context { client: RommClient::new().unwrap(), connection: None, retroarch_config: Some(config.clone()), store: root.join("store") };
+        let mut game = installed(&[&format!("{GAME}.sfc")]);
+        game.system_id = "snes".into();
+        game.dir = root.join("games/snes");
+        let auto_load = || sync::retroarch::setting(&config, sync::retroarch::AUTO_LOAD);
+
+        let session = play(ctx.clone(), settings.clone(), game.clone(), Stop::default(), |_| {}).await.unwrap();
+        assert!(session.exit.success, "{session:?}");
+        assert!(!session.notes.iter().any(|n| n.contains("resumed")), "{:?}", session.notes);
+        let handed = fs::read_to_string(&args).unwrap();
+        assert!(handed.contains("--appendconfig"), "{handed}");
+        assert_eq!(fs::read_to_string(auto_load_file(&ctx.store)).unwrap(), "savestate_auto_load = \"false\"\n");
+        assert_eq!(auto_load().as_deref(), Some("true"), "RetroArch's own setting is back");
+        assert_eq!(fs::read_dir(root.join("store/playing")).unwrap().count(), 0);
+
+        // Asked to resume, RetroArch's own setting already does it: nothing is laid over.
+        let resuming = Settings { resume_state: true, ..settings.clone() };
+        let session = play(ctx.clone(), resuming, game, Stop::default(), |_| {}).await.unwrap();
+        assert!(session.notes.iter().any(|n| n.contains("resumed from the newest save state")), "{:?}", session.notes);
+        assert!(!fs::read_to_string(&args).unwrap().contains("--appendconfig"));
+
+        // Deckhand ended with the game, which quit after: the next Deckhand puts it back, RomM or not.
+        let laid = AutoLoad::lay(&ctx.store, &config, false).unwrap();
+        let mut plan_game = Plan::new(&settings, &installed(&[&format!("{GAME}.sfc")])).game();
+        plan_game.rom = root.join(format!("games/snes/{GAME}.sfc"));
+        drop(crate::playing::hold(&ctx.store, 1, plan_game, Some(laid)).unwrap());
+        sync::retroarch::set_setting(&config, sync::retroarch::AUTO_LOAD, "false").unwrap();
+        assert_eq!(finish_left(&ctx).await, 0, "offline: the saves wait");
+        assert_eq!(auto_load().as_deref(), Some("true"));
+        let marker = fs::read_dir(root.join("store/playing")).unwrap().next().unwrap().unwrap().path();
+        assert!(!fs::read_to_string(&marker).unwrap().contains("auto_load"), "and is not put back twice");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1705,7 +1909,7 @@ mod tests {
             store: root.join("store"),
         };
         // Ten minutes in, and Deckhand ended with the game: last touched as it went.
-        let held = crate::playing::hold(&root.join("store"), 1, game).unwrap();
+        let held = crate::playing::hold(&root.join("store"), 1, game, None).unwrap();
         let end = held.start() + Duration::from_secs(600);
         drop(held);
         let marker = fs::read_dir(root.join("store/playing")).unwrap().next().unwrap().unwrap().path();
