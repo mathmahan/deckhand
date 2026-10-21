@@ -223,6 +223,35 @@ pub fn logo() -> iced::widget::image::Handle {
         .clone()
 }
 
+/// Deckhand's wordmark: the pixel letters `packaging/art/render.py` draws, as the transparent PNG
+/// Steam takes for its logo — each cell of the letters' grid drawn [`WORDMARK_CELL`] pixels square.
+const WORDMARK: &[u8] = include_bytes!("../packaging/art/steam/logo.png");
+
+/// How many pixels of [`WORDMARK`] one cell of the letters' grid takes: `render.py`'s unit.
+const WORDMARK_CELL: u32 = 20;
+
+/// The wordmark at a pixel a cell, and how many cells across and down that is — made once.
+///
+/// The header scales it up by whole pixels with nearest-neighbour filtering, so every cell stays a
+/// hard-edged square, as the ship's do. The 1100 px drawing shrunk by the GPU would blur instead.
+pub fn wordmark() -> (iced::widget::image::Handle, u32, u32) {
+    static WORDMARK_HANDLE: std::sync::OnceLock<(iced::widget::image::Handle, u32, u32)> = std::sync::OnceLock::new();
+    WORDMARK_HANDLE
+        .get_or_init(|| {
+            let cells = wordmark_cells();
+            let (w, h) = cells.dimensions();
+            (iced::widget::image::Handle::from_rgba(w, h, cells.into_raw()), w, h)
+        })
+        .clone()
+}
+
+/// [`WORDMARK`] cut down to one pixel a cell, each the colour at its cell's middle.
+fn wordmark_cells() -> image::RgbaImage {
+    let Ok(drawn) = image::load_from_memory(WORDMARK).map(|w| w.into_rgba8()) else { return image::RgbaImage::new(1, 1) };
+    let (w, h) = ((drawn.width() / WORDMARK_CELL).max(1), (drawn.height() / WORDMARK_CELL).max(1));
+    image::RgbaImage::from_fn(w, h, |x, y| *drawn.get_pixel(x * WORDMARK_CELL + WORDMARK_CELL / 2, y * WORDMARK_CELL + WORDMARK_CELL / 2))
+}
+
 /// The logo as the window's icon — what the taskbar and Alt-Tab show, where the system takes it from
 /// the window rather than from a desktop entry.
 pub fn window_icon() -> Option<iced::window::Icon> {
@@ -272,4 +301,19 @@ fn hsv(h: f32, s: f32, v: f32) -> Color {
         _ => (c, 0.0, x),
     };
     Color::from_rgb(r + m, g + m, b + m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_wordmark_is_its_letters_grid_a_pixel_a_cell() {
+        let cells = wordmark_cells();
+        assert_eq!(cells.dimensions(), (55, 7), "DECKHAND, seven cells high");
+        // The D's top-left corner is the top band's pink; the gap after the letter is clear.
+        assert_eq!(cells.get_pixel(0, 0).0, [0xFF, 0x4F, 0xD8, 0xFF]);
+        assert_eq!(cells.get_pixel(5, 0).0[3], 0, "nothing between the letters");
+        assert!(cells.pixels().all(|p| p.0[3] == 0 || p.0[3] == 0xFF), "every cell hard-edged");
+    }
 }
