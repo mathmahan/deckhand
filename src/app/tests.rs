@@ -677,6 +677,31 @@ mod render {
         snapshot_sized(&app, "home-compact", (1280.0, 600.0));
     }
 
+    /// The header's right with a download coming and the saves in each state, and on the Downloads
+    /// page, whose icon is then filled in.
+    #[test]
+    #[ignore = "draws pages to PNGs for a person to look at"]
+    fn render_header_icons() {
+        let mut app = paired_fixtures(30);
+        app.banner = None;
+        let game = app.library.all_games()[0].clone();
+        app.downloads.enqueue(QueueItem { rom_id: game.rom_id, title: game.title.clone(), system_id: game.system_id.clone(), ..Default::default() });
+        let started = app.downloads.start_next().expect("a download to start");
+        app.downloads.progress(started.rom_id, 0.4);
+        app.screen = Screen::Browsing(Route::Home);
+        for (name, sync) in [
+            ("header-quiet", SaveSync::Idle),
+            ("header-syncing", SaveSync::Running),
+            ("header-in-sync", SaveSync::Done(Box::default())),
+            ("header-failed", SaveSync::Failed("no RetroArch".into())),
+        ] {
+            app.save_sync = sync;
+            snapshot(&app, name);
+        }
+        let _ = app.update(Message::TabSelected(Tab::Downloads));
+        snapshot(&app, "header-downloads-page");
+    }
+
     /// A backdrop as it is once its hand-off is over — a render is one frame, and the frame wanted
     /// is the one after the fade.
     fn settled(mut backdrop: crate::animation::Backdrop) -> crate::animation::Backdrop {
