@@ -78,10 +78,8 @@ page.
 | Switch | Ryubing, Eden | ✅ Saves, each user's and the ones the console shares, which move between the two |
 | Xbox, Xbox 360 | — | ❌ Not synced yet |
 
-A Switch game is known by the id inside its NSP or XCI, which reading takes the `prod.keys` you gave
-Ryubing (`system/`) or Eden (`keys/`); without them, by an id in its file name, such as
-`Game [0100ABCD12345000].nsp`. Neither ships with RetroDECK, so set the one you installed under
-*Emulator for each system*.
+Neither Eden or Ryubing ships with RetroDECK, so you need to configure the one you have installed in
+*Emulator for each system* in *Settings*.
 
 ![Browse](screenshots/browse.jpg)
 
