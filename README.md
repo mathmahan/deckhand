@@ -123,6 +123,10 @@ Deckhand fills in the usual options for it:
 /home/deck/Applications/Eden-Linux-v0.2.0-amd64.AppImage -f -g {rom}
 ```
 
+A Flatpak only sees the folders it was granted, and some are granted none of yours. So Deckhand
+starts one with access to the game's folder for that launch (`flatpak run --filesystem=…`), and a
+game on an SD card opens without a `flatpak override`.
+
 Saves sync for RetroArch, and standalone emulators: PCSX2, DuckStation, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar,
 Cemu, Ryubing and Eden — see [Save sync](#save-sync).
 

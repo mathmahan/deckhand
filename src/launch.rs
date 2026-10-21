@@ -294,6 +294,54 @@ fn program_name(words: &[String]) -> String {
     file_name(program)
 }
 
+/// What a Flatpak is granted of a path for one launch — see [`with_access`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    /// The game's folder: an emulator may keep its save beside the game, and one the Flatpak already
+    /// writes to must not turn read-only for the launch, which a narrower grant would make it.
+    ReadWrite,
+}
+
+/// `command` with `paths` granted, when what it runs is a Flatpak.
+///
+/// A Flatpak sees only what its manifest grants, and some grant nothing of the host at all: handed a
+/// game on another drive, such an emulator cannot open it, and says so as a format it does not
+/// support. So the launch runs it through `flatpak run --filesystem=<path>`, for this launch alone.
+/// A Flatpak's exported launcher (`…/flatpak/exports/bin/<app id>`, what *Emulator for each system*
+/// fills in) is a script of one `flatpak run` line, which is read out of it and run instead, its
+/// branch and architecture kept. Anything else runs as it is, as does a launcher that cannot be read.
+fn with_access(command: Vec<String>, paths: &[(PathBuf, Access)]) -> Vec<String> {
+    let Some(program) = command.first() else { return command };
+    // `flatpak run`, then what follows it: the app, the options it runs with and the game's.
+    let (run, rest): (Vec<String>, Vec<String>) = if is_flatpak(program) && command.get(1).is_some_and(|w| w == "run") {
+        (command[..2].to_vec(), command[2..].to_vec())
+    } else if Path::new(program).parent().is_some_and(|dir| dir.ends_with("flatpak/exports/bin")) {
+        let Some(mut run) = exported(program) else { return command };
+        let rest = run.split_off(2).into_iter().chain(command[1..].iter().cloned()).collect();
+        (run, rest)
+    } else {
+        return command;
+    };
+    let grant = |(path, access): &(PathBuf, Access)| {
+        format!("--filesystem={}:{}", path.display(), if *access == Access::Read { "ro" } else { "rw" })
+    };
+    run.into_iter().chain(paths.iter().map(grant)).chain(rest).collect()
+}
+
+fn is_flatpak(word: &str) -> bool {
+    Path::new(word).file_name().is_some_and(|n| n == "flatpak")
+}
+
+/// The `flatpak run` line a Flatpak's exported launcher runs, up to where the launcher's own
+/// arguments go: `/usr/bin/flatpak run --branch=stable --arch=x86_64 <app id>`.
+fn exported(launcher: &str) -> Option<Vec<String>> {
+    let script = fs::read_to_string(launcher).ok()?;
+    let line = script.lines().filter_map(|l| split_command(l).ok()).find(|words| words.iter().any(|w| is_flatpak(w)))?;
+    let run: Vec<String> = line.into_iter().skip_while(|w| !is_flatpak(w)).take_while(|w| w != "$@" && !w.starts_with("@@")).collect();
+    (run.len() > 2 && run[1] == "run").then_some(run)
+}
+
 /// A command for an emulator picked by its file — a program, an AppImage, or a Flatpak's launcher
 /// in `exports/bin`: the options ES-DE starts it with, for those Deckhand knows, and `{rom}` last.
 /// RetroArch's needs a core as well, which is the player's to add.
@@ -848,7 +896,14 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: 
     if resumed {
         notes.push("resumed from the newest save state".into());
     }
-    let command = special.unwrap_or_else(|| launcher.command(&plan.system, &plan.rom));
+    let mut command = special.unwrap_or_else(|| launcher.command(&plan.system, &plan.rom));
+    // A Flatpak of the player's own sees only what it was granted: the game's folder, and the config
+    // laid over RetroArch's, for this launch — see [`with_access`]. RetroDECK sees every folder.
+    if matches!(launcher, Launcher::Custom(_)) {
+        let folder = plan.rom.parent().map(|dir| (dir.to_path_buf(), Access::ReadWrite));
+        let config = laid.is_some().then(|| (auto_load_file(&ctx.store), Access::Read));
+        command = with_access(command, &folder.into_iter().chain(config).collect::<Vec<_>>());
+    }
     // Asked to stop before the game is up — Steam closing the shortcut while its save came down — so
     // it is not started only to be closed again.
     if stop.asked() {
@@ -1489,6 +1544,51 @@ mod tests {
         assert_eq!(start_in(false, slot, true, true), start(None, Some(false)), "the auto state, older or not");
         assert_eq!(start_in(false, slot, false, true), start(None, None), "no auto state to load");
         assert_eq!(start_in(false, auto, true, false), start(None, None), "RetroArch would not load it anyway");
+    }
+
+    #[test]
+    fn a_flatpak_is_run_with_the_game_s_folder_granted_for_the_launch() {
+        let words = |w: &[&str]| w.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let game = PathBuf::from("/run/media/sd/roms/switch/Game");
+        let paths = [(game.clone(), Access::ReadWrite), (PathBuf::from("/home/me/.config/deckhand-rust/ra.cfg"), Access::Read)];
+
+        let own = words(&["/opt/eden.AppImage", "-f", "-g", "/run/media/sd/roms/switch/Game/x.xci"]);
+        assert_eq!(with_access(own.clone(), &paths), own, "not a Flatpak: as it is");
+
+        let run = words(&["flatpak", "run", "--command=dolphin-emu", "org.DolphinEmu.dolphin-emu", "-b", "/g/x.rvz"]);
+        assert_eq!(
+            with_access(run, &paths[..1]),
+            words(&["flatpak", "run", "--filesystem=/run/media/sd/roms/switch/Game:rw", "--command=dolphin-emu", "org.DolphinEmu.dolphin-emu", "-b", "/g/x.rvz"]),
+            "granted before the app, the options it runs with kept"
+        );
+
+        // An exported launcher: the line it runs, its branch and architecture kept.
+        let root = std::env::temp_dir().join(format!("deckhand-launch-flatpak-{}", std::process::id()));
+        let bin = root.join("flatpak/exports/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("dev.eden_emu.eden"), "#!/bin/sh\nexec /usr/bin/flatpak run --branch=stable --arch=x86_64 dev.eden_emu.eden \"$@\"\n").unwrap();
+        let launcher = bin.join("dev.eden_emu.eden").to_string_lossy().into_owned();
+        let granted = with_access(words(&[&launcher, "-f", "-g", "/g/x.xci"]), &paths);
+        assert_eq!(
+            granted,
+            words(&[
+                "/usr/bin/flatpak",
+                "run",
+                "--filesystem=/run/media/sd/roms/switch/Game:rw",
+                "--filesystem=/home/me/.config/deckhand-rust/ra.cfg:ro",
+                "--branch=stable",
+                "--arch=x86_64",
+                "dev.eden_emu.eden",
+                "-f",
+                "-g",
+                "/g/x.xci"
+            ])
+        );
+        assert_eq!(program_name(&granted), "dev.eden_emu.eden", "still the same emulator");
+
+        let gone = words(&[&bin.join("org.gone.App").to_string_lossy(), "/g/x"]);
+        assert_eq!(with_access(gone.clone(), &paths), gone, "a launcher that cannot be read runs as it is");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
