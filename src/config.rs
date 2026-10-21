@@ -72,8 +72,9 @@ pub struct Settings {
     /// [`crate::watch`]. On unless turned off.
     #[serde(default = "on", skip_serializing_if = "is_on")]
     pub watch_saves: bool,
-    /// Play boots straight into the game's newest save state, where there is one on this device —
-    /// RetroArch's `--entryslot 0`; see [`crate::launch`]. Off until chosen.
+    /// Play boots straight into the game's newest save state, where there is one on this device, and
+    /// off starts it fresh — whatever RetroArch's own Auto Load State says; see [`crate::launch`].
+    /// Off until chosen.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resume_state: bool,
 }

@@ -378,7 +378,12 @@ impl Install {
     /// Whether RetroArch loads a game's auto slot state by itself when the game starts —
     /// `savestate_auto_load`, which naming a slot to start in overrides.
     pub fn loads_auto_state(&self) -> bool {
-        self.settings.get("savestate_auto_load").is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        self.settings.get(AUTO_LOAD).is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    }
+
+    /// The `retroarch.cfg` this was read from.
+    pub fn config(&self) -> &Path {
+        &self.config
     }
 
     /// The folder RetroArch keeps `rom`'s save states in, run by `core` (an id) if known.
@@ -499,6 +504,28 @@ fn cores(dir: &Path) -> HashMap<String, String> {
         .collect()
 }
 
+/// RetroArch's *Auto Load State*: whether it loads a game's auto slot state by itself on start.
+pub const AUTO_LOAD: &str = "savestate_auto_load";
+
+/// What the config at `config` sets `key` to, read now. None when it says nothing of it, or cannot be
+/// read.
+pub fn setting(config: &Path, key: &str) -> Option<String> {
+    parse(&fs::read_to_string(config).ok()?).remove(key)
+}
+
+/// Set `key` to `value` in the config at `config`, written as RetroArch writes it, every other line
+/// left as it is.
+pub fn set_setting(config: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    let text = fs::read_to_string(config)?;
+    let line = format!("{key} = \"{value}\"");
+    let named = |l: &str| !l.trim_start().starts_with('#') && l.split_once('=').is_some_and(|(k, _)| k.trim() == key);
+    let mut lines: Vec<&str> = text.lines().map(|l| if named(l) { line.as_str() } else { l }).collect();
+    if !text.lines().any(named) {
+        lines.push(&line);
+    }
+    super::write_atomic(config, format!("{}\n", lines.join("\n")).as_bytes())
+}
+
 /// RetroArch's config format, shared by `retroarch.cfg` and the `.info` files: `key = "value"`, one
 /// per line, `#` comments, quotes optional.
 fn parse(text: &str) -> HashMap<String, String> {
@@ -584,6 +611,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn one_setting_is_set_and_every_other_line_is_left_as_it_was() {
+        let ra = Fixture::new("set", "# kept\nsavestate_auto_load = \"true\"\nvideo_fullscreen=\"true\"\n");
+        let config = ra.root.join("retroarch.cfg");
+        set_setting(&config, AUTO_LOAD, "false").unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), "# kept\nsavestate_auto_load = \"false\"\nvideo_fullscreen=\"true\"\n");
+        assert_eq!(setting(&config, AUTO_LOAD).as_deref(), Some("false"));
+        assert!(!ra.install().loads_auto_state());
+
+        set_setting(&config, "savestate_auto_save", "true").unwrap();
+        assert!(fs::read_to_string(&config).unwrap().ends_with("video_fullscreen=\"true\"\nsavestate_auto_save = \"true\"\n"), "added when it was not there");
+        assert_eq!(setting(&config, "savestate_thumbnail_enable"), None);
     }
 
     #[test]
