@@ -3,7 +3,8 @@
 //! A game downloaded here has its saves found by sigil, whatever runs it: a RetroArch core's `.srm`
 //! or memory card files, a PCSX2 memory card's folders for it, a PPSSPP game's save folders, a
 //! Dolphin GCI folder's files with its id. They travel to RomM as the unit sigil packs — one file as
-//! it is, or a zip — in the game's `autosave` slot, the shape RomM's Android app syncs; and a unit
+//! it is, or a zip — in the game's `autosave` slot, the shape RomM's Android app syncs (one file goes
+//! on in another slot when RomM's newest version of it is there — see [`super::session`]); and a unit
 //! from RomM goes back through sigil, which writes only this game's files, into a memory card every
 //! other game shares as well.
 //!
@@ -269,7 +270,10 @@ fn assemble(
         resolved.artifact.clone()
     };
     let kinds = kinds(request.platform.as_deref(), &resolved.artifact);
-    let shared_slot = resolved.shape != Shape::Single;
+    // A zip of a game's save folders shares its slot with the ones before it and other clients'
+    // files, which RomM's history-trimming would count against it. One file has the slot to itself,
+    // and so does the one file a game with nothing here yet will have.
+    let one_file = resolved.shape == Shape::Single || (resolved.shape == Shape::None && expected.len() == 1 && members.is_empty());
     let unit = Unit {
         request,
         artifact: resolved.artifact,
@@ -290,9 +294,7 @@ fn assemble(
         name,
         emulator: tag,
         place: Place::Sigil(Box::new(unit)),
-        // A zip of a game's save folders shares its slot with the ones before it and other clients'
-        // files, which RomM's history-trimming would count against it.
-        shared: shared_slot,
+        shared: !one_file,
     })
 }
 

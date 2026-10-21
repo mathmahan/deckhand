@@ -10,7 +10,13 @@
 //! (game, slot) — the same pairing RomM's own web player, Argosy and Grout use, so a save made in any
 //! of them comes down here, and the other way.
 //!
-//! Three things are this engine's own, on top of what RomM says:
+//! Four things are this engine's own, on top of what RomM says:
+//!
+//! - **A save goes on in the slot its newest version is in** ([`follow`]). Every save starts in
+//!   `autosave`, but a client may keep a game's save in a slot of its own, and RomM's web player goes
+//!   on in whichever slot holds the game's newest save. Each slot is a history of its own to RomM, so
+//!   a save left in `autosave` would never see that progress: it goes where the newest version is,
+//!   and stays there until another slot has a newer one.
 //!
 //! - **Hashes are RomM's to the bit** ([`super::hash`]): a save that is the same on both sides is a
 //!   no-op whatever its timestamps say, and moves no data.
@@ -58,8 +64,9 @@ use crate::library::Stamp;
 use crate::romm::models::{ClientSave, PlaySession, SaveAsset, SyncOperation};
 use crate::romm::{ApiError, Push, Pushed, RommClient};
 
-/// The slot a game's rolling save lives in — RomM's own convention, which its web player, Argosy,
-/// Grout and this app all keep to.
+/// The slot a game's rolling save starts in — RomM's own convention, which its web player, Argosy,
+/// Grout and this app all keep to. It goes on in another when RomM's newest version of it is there —
+/// see [`follow`].
 pub const AUTOSAVE: &str = "autosave";
 
 /// The most games one negotiation can be scoped to.
@@ -315,7 +322,8 @@ pub async fn sync(
 
     // What is here, read once: the negotiation states it, and the decisions weigh it.
     let mut local: Vec<(Thread, Option<Held>)> = Vec::with_capacity(threads.len());
-    for thread in threads {
+    for mut thread in threads {
+        run.recall(&mut thread);
         match thread.held() {
             Ok(held) => local.push((thread, held)),
             Err(e) => run.report.failed.push(format!("{}: {e}", thread.name)),
@@ -378,9 +386,25 @@ pub async fn sync(
         let in_order = ops.len() >= sent.len()
             && sent.iter().zip(&ops).all(|(&i, op)| op.rom_id == local[i].0.rom_id && op.slot.as_deref() == Some(local[i].0.slot.as_str()));
         let (answers, offered) = if in_order { ops.split_at(sent.len()) } else { (&ops[..0], &ops[..]) };
+        // Each save goes on in the slot of RomM's newest version of it, which need not be the one it
+        // was sent in — see [`follow`].
+        let own: HashMap<usize, &SyncOperation> = sent.iter().copied().zip(answers).collect();
+        for (i, (thread, _)) in local.iter_mut().enumerate() {
+            if !in_chunk(thread.rom_id) {
+                continue;
+            }
+            let baseline = run.baseline(thread);
+            if let Some(slot) = follow(thread, baseline.as_ref(), own.get(&i).copied().into_iter().chain(offered)) {
+                thread.slot = slot;
+            }
+        }
         let mut todo: Vec<(usize, Option<SyncOperation>)> = Vec::new();
         let mut decided: HashSet<usize> = HashSet::new();
         for (&i, op) in sent.iter().zip(answers) {
+            // A save that goes on in another slot is settled by that slot's answer, below.
+            if op.slot.as_deref() != Some(local[i].0.slot.as_str()) {
+                continue;
+            }
             decided.insert(i);
             // An answer about another save in the slot says nothing about this one.
             let ours = op.save_id.is_none() || same_save(&local[i].0, &op.file_name);
@@ -392,6 +416,8 @@ pub async fn sync(
             match found {
                 Some(i) if decided.insert(i) => todo.push((i, Some(op.clone()))),
                 Some(_) => {}
+                // An older version of a save that goes on in another slot: history, not news.
+                None if local.iter().any(|(t, _)| !t.shared && t.rom_id == op.rom_id && t.slot != slot && same_save(t, &op.file_name)) => {}
                 // A save RomM has that no thread names: a place for it if there is one.
                 None => match late(op).filter(|t| !local.iter().any(|(other, _)| other.key() == t.key())) {
                     Some(thread) => match thread.held() {
@@ -478,16 +504,62 @@ fn same_save(thread: &Thread, server_name: &str) -> bool {
     }
 }
 
+/// The slot `thread`'s save goes on in, when that is not the one it is in: the slot RomM's newest
+/// version of it is in, among `ops` — a negotiation's answers.
+///
+/// Another client may keep a game's save in a slot of its own (a phone app's `battery`), and RomM's
+/// web player goes on in whichever slot the game's newest save is in, so going on there too is what
+/// keeps every client on one line of progress. The slot it is in wins a tie. Its newest version there
+/// is what RomM answered about it, or else — RomM leaves out a version this device has synced and
+/// nobody has changed since — the one `baseline` agreed on. A save that shares its slot with the
+/// game's others stays put: only clients of sigil write those, and all of them in `autosave`.
+///
+/// Nothing moves on RomM: the slot left behind keeps its history.
+fn follow<'o>(thread: &Thread, baseline: Option<&Entry>, ops: impl IntoIterator<Item = &'o SyncOperation>) -> Option<String> {
+    if thread.shared {
+        return None;
+    }
+    let made = |op: &SyncOperation| op.server_updated_at.as_deref().and_then(names::parse_timestamp);
+    // Here: None while RomM has said nothing of this slot, Some(None) when it holds none of the save.
+    let mut here: Option<Option<SystemTime>> = None;
+    let mut elsewhere: Option<(SystemTime, &str)> = None;
+    for op in ops.into_iter().filter(|op| op.rom_id == thread.rom_id) {
+        let slot = op.slot.as_deref().unwrap_or_default();
+        match (slot == thread.slot, op.save_id.is_some() && same_save(thread, &op.file_name)) {
+            // RomM holds nothing in this slot.
+            (true, _) if op.save_id.is_none() => here = Some(here.flatten()),
+            (true, true) => here = Some(here.flatten().max(made(op))),
+            (false, true) => {
+                if let Some(at) = made(op).filter(|at| elsewhere.is_none_or(|(newest, _)| *at > newest)) {
+                    elsewhere = Some((at, slot));
+                }
+            }
+            // Another save's newest: it says nothing of where this one is.
+            (_, false) => {}
+        }
+    }
+    let (at, slot) = elsewhere?;
+    let here = here.unwrap_or_else(|| {
+        baseline.filter(|b| b.slot.as_deref().unwrap_or(AUTOSAVE) == thread.slot).and_then(|b| b.synced_at.as_deref()).and_then(names::parse_timestamp)
+    });
+    here.is_none_or(|here| at > here).then(|| slot.to_string())
+}
+
 /// Put RomM's `version` of `thread`'s save back as the current one, everywhere.
 ///
 /// This device's copy goes into `save-backups/` first, then the version is put in place and sent up
 /// again as the slot's newest — past RomM's check that this device holds the newest, since going
 /// back on it is the point. Sending it up is what makes it stick: left only on disk, an old version
 /// is exactly what the sync reads as this device being behind, and the next sync would take the
-/// newest back. Pushed, every device takes it, and this one's index agrees with RomM on it.
+/// newest back. Pushed, every device takes it, and this one's index agrees with RomM on it. It goes
+/// into the slot the save goes on in, wherever `version` itself was: that is where every client
+/// looks for the newest.
 pub async fn restore(client: &RommClient, conn: &Connection, store: &Path, thread: &Thread, version: &SaveAsset) -> Result<Report, String> {
     let _one_at_a_time = exclusive(store).await?;
     let mut run = Run::new(client, conn, store, conn.device_id.clone().unwrap_or_default());
+    let mut thread = thread.clone();
+    run.recall(&mut thread);
+    let thread = &thread;
     let failed = |run: &Run| run.report.failed.join("; ");
     if thread.held()?.is_some() && run.set_aside(thread).is_none() {
         return Err(failed(&run));
@@ -770,6 +842,17 @@ impl<'a> Run<'a> {
     fn baseline(&mut self, thread: &Thread) -> Option<Entry> {
         let key = thread.key();
         self.index(thread).agreed(&key, thread.rom_id, thread.stamp.as_ref()).cloned()
+    }
+
+    /// Put `thread` in the slot its save last agreed with RomM in: the one it goes on in, until RomM
+    /// holds a newer version of it in another — see [`follow`].
+    fn recall(&mut self, thread: &mut Thread) {
+        if thread.shared {
+            return;
+        }
+        if let Some(slot) = self.baseline(thread).and_then(|b| b.slot) {
+            thread.slot = slot;
+        }
     }
 
     /// The first sync of games whose saves sigil now keeps ([`Place::Sigil`]) while RomM may still
