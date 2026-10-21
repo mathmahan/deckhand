@@ -230,12 +230,6 @@ impl App {
                     }
                     // On Home, the spotlit game's saves and states: the X the spotlight shows beside
                     // the button.
-                    Pad::Erase if matches!(self.screen, Screen::Browsing(Route::Home)) && self.chrome.is_none() => {
-                        match self.focus.spotlit(&self.shelves) {
-                            Some(game) => Message::OpenSaves(game.rom_id),
-                            None => return Task::none(),
-                        }
-                    }
                     Pad::Erase => return Task::none(),
                     Pad::PrevTab => Message::CycleTab(-1),
                     Pad::NextTab => Message::CycleTab(1),
@@ -760,11 +754,11 @@ impl App {
                     }
                 };
                 // Up the wheel is up the page. It walks the shelves only: it does not climb out of
-                // them onto the spotlight's buttons, or past those into the bar.
+                // them into the bar.
                 let direction = if steps > 0.0 { Direction::Up } else { Direction::Down };
                 let mut tasks = Vec::new();
                 for _ in 0..(steps.abs() as usize).min(3) {
-                    if direction == Direction::Up && (self.focus.shelf_pos() == 0 || self.focus.zone() != crate::focus::Zone::Shelves) {
+                    if direction == Direction::Up && self.focus.shelf_pos() == 0 {
                         break;
                     }
                     tasks.push(self.navigate_page(Route::Home, direction));
@@ -772,8 +766,6 @@ impl App {
                 self.up_stopped = false;
                 Task::batch(tasks)
             }
-            // The spotlight's heart is the detail page's Favourite.
-            Message::FavouritePressed(rom_id) => self.toggle_favourite(rom_id),
             Message::AwardedLoaded(result) => {
                 // A record that cannot be read leaves the spotlight saying only how many there are.
                 if let Ok(awarded) = result {
@@ -782,17 +774,6 @@ impl App {
                 Task::none()
             }
             Message::Activate => self.activate(),
-            Message::GameActivated(rom_id) => {
-                let state = self.game_state(rom_id);
-                if state.is_here() {
-                    self.play_game(rom_id)
-                } else if state.is_busy() {
-                    // The button is inert while a download runs; this can only be a stale press.
-                    Task::none()
-                } else {
-                    self.download_game(rom_id)
-                }
-            }
             Message::Dismiss => {
                 // Back from the tab bar is back down into the page.
                 if self.chrome.take().is_some() {
