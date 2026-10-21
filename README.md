@@ -23,7 +23,7 @@ and keep saves and save states in sync with your server.
   an A–Z jump. Your favourites and your own collections are a chip each, and RomM's genres,
   franchises and series are browsable across systems.
 - **Search.** Ranked search across every system, by title and by other names, so `ff7` finds
-  *Final Fantasy VII*. An on-screen keyboard makes it work with a pad.
+  *Final Fantasy VII*. An on-screen keyboard makes it work with a gamepad.
 - **Game pages.** Art, rating, How Long to Beat, regions and builds, and the game's
   RetroAchievements, with the ones you have earned marked. *Favourite* marks it in RomM.
 - **Downloads.** A queue that survives restarts, unpacks archives, writes an `.m3u` for multi-disc
@@ -39,7 +39,7 @@ and keep saves and save states in sync with your server.
 - **Steam and ES-DE.** Downloaded games can be added to Steam with their art, and still sync when
   started there. Games started from ES-DE sync too, through hooks Deckhand installs. Add Deckhand
   itself to Steam as a non-Steam game and it gives itself a cover, banner, logo and backdrop.
-- **Made for a pad.** The d-pad reaches every page and button, and L1/R1 move between tabs.
+- **Made for a gamepad.** The d-pad reaches every page and button, and L1/R1 move between tabs.
 - **Updates itself** from this repository's releases.
 
 ## Save sync
