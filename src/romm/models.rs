@@ -706,8 +706,8 @@ pub struct SaveAsset {
     pub core: Option<String>,
     #[serde(default)]
     pub file_size_bytes: Option<i64>,
-    /// A save's slot on RomM — `autosave` for the history this app and the Kotlin app write. States
-    /// carry none; their slot is in their name.
+    /// A save's slot on RomM — `autosave` for the history this app and the Kotlin app write, unless
+    /// another client went on in a slot of its own. States carry none; their slot is in their name.
     #[serde(default)]
     pub slot: Option<String>,
     /// What RomM hashed the upload to — see [`crate::sync::hash`]. RomM 5 and up.

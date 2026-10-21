@@ -50,7 +50,9 @@ Saves go through [argosy-sigil](https://github.com/rommapp/argosy-sigil), RomM's
 it reads each game's id off its disc and finds that game's saves in the emulator's folders, even on a
 memory card every game shares. A game's saves travel as one file in its `autosave` slot, in the same
 shape RomM's Android app syncs. Saves put on RomM by earlier versions of Deckhand are read and moved
-over on each game's first sync.
+over on each game's first sync. A client that keeps a game's save in a slot of its own, such as
+`battery`, is followed there: like RomM's web player, Deckhand goes on in whichever slot holds the
+newest version of the save, and leaves the slot it came from as it is.
 
 Save states are RetroArch's slots, one to one: slot 0, every numbered slot however many there are,
 and the auto slot are each one state on RomM, under a name that says the slot and the core. Saving

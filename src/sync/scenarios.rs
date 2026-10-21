@@ -476,6 +476,112 @@ async fn a_save_made_in_romm_s_own_player_comes_down() {
     assert_eq!(deck.save().as_deref(), Some("chapter 2, in the browser"));
 }
 
+/// The slot a phone app keeps a game's save in, rather than `autosave`.
+const BATTERY: &str = "battery";
+
+#[tokio::test]
+async fn a_save_another_client_keeps_in_a_slot_of_its_own_is_followed_there() {
+    let server = FakeRomm::start().await;
+    let (deck, pc) = (Device::new("follow-deck", &server), Device::new("follow-pc", &server));
+    deck.play("chapter 1", server.now());
+    deck.launch().await;
+
+    // A phone app plays on from it, into a slot of its own, under a name of its own.
+    server.advance(Duration::from_secs(600));
+    server.push_from(Some("phone"), ROM_ID, BATTERY, "1.srm", b"chapter 2, on the phone");
+    let report = deck.launch().await;
+    assert_eq!((report.pulled.len(), report.conflicts.len()), (1, 0), "{report:?}");
+    assert_eq!(deck.save().as_deref(), Some("chapter 2, on the phone"));
+
+    // Played on here, it goes up where the phone looks — and nothing is taken out of autosave.
+    server.advance(Duration::from_secs(600));
+    deck.play("chapter 3", server.now());
+    let report = deck.launch().await;
+    assert_eq!(report.pushed.len(), 1, "{report:?}");
+    assert_eq!(server.newest(ROM_ID, BATTERY).unwrap().bytes, b"chapter 3");
+    assert_eq!(server.newest(ROM_ID, AUTOSAVE).unwrap().bytes, b"chapter 1");
+
+    // A device new to the game takes the newest, and autosave's older one is not news to it.
+    let report = pc.launch().await;
+    assert_eq!(report.pulled.len(), 1, "{report:?}");
+    assert!(!report.notes.iter().any(|n| n.contains("nowhere")), "{report:?}");
+    assert_eq!(pc.save().as_deref(), Some("chapter 3"));
+    let again = deck.launch().await;
+    assert!(again.pushed.is_empty() && again.pulled.is_empty(), "{again:?}");
+}
+
+#[tokio::test]
+async fn a_save_goes_back_to_autosave_when_that_is_newer_and_leaves_the_older_slot_without_a_word() {
+    let server = FakeRomm::start().await;
+    let deck = Device::new("follow-back", &server);
+    deck.play("chapter 1", server.now());
+    deck.launch().await;
+    server.advance(Duration::from_secs(600));
+    server.push_from(Some("phone"), ROM_ID, BATTERY, "1.srm", b"chapter 2, on the phone");
+    deck.launch().await;
+
+    // The phone plays on in its slot, then a client that keeps autosave plays on after it.
+    server.advance(Duration::from_secs(600));
+    server.push_from(Some("phone"), ROM_ID, BATTERY, "1.srm", b"chapter 3, on the phone");
+    server.advance(Duration::from_secs(600));
+    server.push_from(Some("tv"), ROM_ID, AUTOSAVE, &format!("{GAME}.srm"), b"chapter 4, on the tv");
+    let report = deck.launch().await;
+    assert_eq!((report.pulled.len(), report.conflicts.len()), (1, 0), "{report:?}");
+    assert_eq!(deck.save().as_deref(), Some("chapter 4, on the tv"));
+    assert!(!report.notes.iter().any(|n| n.contains("nowhere")), "{report:?}");
+
+    server.advance(Duration::from_secs(600));
+    deck.play("chapter 5", server.now());
+    deck.launch().await;
+    assert_eq!(server.newest(ROM_ID, AUTOSAVE).unwrap().bytes, b"chapter 5");
+    assert_eq!(server.newest(ROM_ID, BATTERY).unwrap().bytes, b"chapter 3, on the phone");
+}
+
+#[tokio::test]
+async fn progress_here_and_in_another_client_s_slot_is_put_to_the_player() {
+    let server = FakeRomm::start().await;
+    let deck = Device::new("follow-conflict", &server);
+    deck.play("chapter 1", server.now());
+    deck.launch().await;
+
+    server.advance(Duration::from_secs(600));
+    deck.play("deck: chapter 2", server.now());
+    server.advance(Duration::from_secs(600));
+    server.push_from(Some("phone"), ROM_ID, BATTERY, "1.srm", b"phone: chapter 2");
+
+    let (resolver, asked) = chooser(Choice::Local);
+    let report = with_resolver(resolver, deck.launch()).await;
+    assert_eq!(asked.lock().unwrap().len(), 1, "the player is asked: {report:?}");
+    assert_eq!(deck.save().as_deref(), Some("deck: chapter 2"));
+    // Kept here, and sent up where the phone looks; the phone's stays in that slot's history.
+    let battery: Vec<Vec<u8>> = server.rows(ROM_ID).into_iter().filter(|r| r.slot.as_deref() == Some(BATTERY)).map(|r| r.bytes).collect();
+    assert_eq!(battery, [b"phone: chapter 2".to_vec(), b"deck: chapter 2".to_vec()]);
+}
+
+#[tokio::test]
+async fn a_version_restored_goes_into_the_slot_the_save_follows() {
+    let server = FakeRomm::start().await;
+    let deck = Device::new("follow-restore", &server);
+    deck.play("chapter 1", server.now());
+    deck.launch().await;
+    server.advance(Duration::from_secs(600));
+    server.push_from(Some("phone"), ROM_ID, BATTERY, "1.srm", b"chapter 2, on the phone");
+    deck.launch().await;
+
+    // Chapter 1, from autosave's history, put back from the Saves page.
+    let client = RommClient::new().unwrap();
+    let first = client.slot_saves(&deck.conn, ROM_ID, AUTOSAVE).await.unwrap().remove(0);
+    let install = retroarch::read(&deck.root.join("ra/retroarch.cfg")).unwrap();
+    let rom = deck.root.join("roms/snes").join(format!("{GAME}.sfc"));
+    let save = install.game_saves(&rom, Some("snes9x")).existing.into_iter().next().unwrap();
+    let thread = Thread { rom_id: ROM_ID, stamp: None, slot: AUTOSAVE.into(), name: format!("{GAME}.srm"), emulator: save.emulator, place: Place::File(save.path), shared: false };
+    server.advance(Duration::from_secs(60));
+    let report = session::restore(&client, &deck.conn, &deck.store(), &thread, &first).await.unwrap();
+    assert_eq!(report.pushed.len(), 1, "{report:?}");
+    assert_eq!(server.newest(ROM_ID, BATTERY).unwrap().bytes, b"chapter 1", "the newest where the phone looks");
+    assert_eq!(server.rows(ROM_ID).len(), 3, "and nowhere else");
+}
+
 #[tokio::test]
 async fn a_first_sync_with_different_saves_on_both_sides_asks() {
     let server = FakeRomm::start().await;
@@ -675,6 +781,26 @@ async fn a_slot_another_client_keeps_a_different_file_in_is_settled_by_name() {
     let report = deck.launch().await;
     assert_eq!((report.pulled.len(), report.conflicts.len()), (1, 0), "{report:?}");
     assert_eq!(deck.save().as_deref(), Some("chapter 2"));
+}
+
+#[tokio::test]
+async fn save_folders_that_share_their_slot_stay_in_autosave() {
+    let server = FakeRomm::start().await;
+    let deck = Device::new("folders-stay", &server);
+    let a = "ULUS10041DATA00";
+    write_folder(&deck, a, "a1");
+    sync_folders(&deck, &[a]).await;
+
+    // A newer copy of the folder in another slot is not where the game's other folders are.
+    server.advance(Duration::from_secs(60));
+    server.push_from(Some("phone"), ROM_ID, BATTERY, &format!("{a}.zip"), b"not read");
+    server.advance(Duration::from_secs(60));
+    write_folder(&deck, a, "a2");
+    let report = sync_folders(&deck, &[a]).await;
+    assert_eq!((report.pushed.len(), report.pulled.len()), (1, 0), "{report:?}");
+    assert_eq!(read_folder(&deck, a).as_deref(), Some("a2"));
+    let battery = server.rows(ROM_ID).into_iter().filter(|r| r.slot.as_deref() == Some(BATTERY)).count();
+    assert_eq!(battery, 1, "nothing went into the other slot");
 }
 
 #[tokio::test]
