@@ -152,6 +152,7 @@ impl App {
             bytes: detail.fs_size_bytes.and_then(|b| u64::try_from(b).ok()),
             build: None,
             stamp: detail.stamp(),
+            extra: false,
         });
         self.say(format!("RomM sent \"{title}\" to this device — downloading it."));
         task

@@ -104,16 +104,25 @@ impl App {
             downloads::Event::Finished(rom_id, result) => {
                 self.download_workers.remove(&rom_id);
                 let title = self.title_of(rom_id);
-                self.say(match &result {
-                    Ok(installed) => format!(
+                // An extra of a game already here is said as the extra: the game itself, its BIOS and
+                // its saves are as they were.
+                let extra = self
+                    .downloads
+                    .in_progress()
+                    .find(|(item, _)| item.rom_id == rom_id && item.extra)
+                    .and_then(|(item, _)| item.label.clone());
+                self.say(match (&result, &extra) {
+                    (Ok(_), Some(label)) => format!("\"{title}\" — {label} is on this device."),
+                    (Ok(installed), None) => format!(
                         "\"{}\" is on this device — {}.",
                         installed.name(),
                         downloads::human_bytes(installed.bytes)
                     ),
-                    Err(why) => format!("\"{title}\" could not be downloaded: {why}"),
+                    (Err(why), Some(label)) => format!("\"{title}\" — {label} could not be downloaded: {why}"),
+                    (Err(why), None) => format!("\"{title}\" could not be downloaded: {why}"),
                 });
                 // A copy for the BIOS and save pull, which runs after the record is written.
-                let ready = result.as_ref().ok().map(|installed| self.ready_download((**installed).clone()));
+                let ready = result.as_ref().ok().filter(|_| extra.is_none()).map(|installed| self.ready_download((**installed).clone()));
                 let answered = self.answer_installs(rom_id, match &result {
                     Ok(_) => crate::romm::Outcome::Done,
                     Err(why) => crate::romm::Outcome::Failed(why.clone()),
@@ -123,7 +132,12 @@ impl App {
                 // rebuilt before the next frame draws — the shelves hold cloned games, which is
                 // what makes this a rebuild rather than a field update.
                 self.rebuild_shelves();
-                Task::batch([self.pump_downloads(), self.fetch_art(), ready.unwrap_or_else(Task::none), answered])
+                // On the game's page, what it now has here decides the extras it offers.
+                let files = match &self.screen {
+                    Screen::Browsing(Route::Detail { rom_id: open, .. }) if self.builds_of(*open).contains(&rom_id) => self.load_files(*open),
+                    _ => Task::none(),
+                };
+                Task::batch([self.pump_downloads(), self.fetch_art(), ready.unwrap_or_else(Task::none), answered, files])
             }
         }
     }

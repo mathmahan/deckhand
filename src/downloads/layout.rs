@@ -103,6 +103,78 @@ pub fn relative_path(file: &RomFile, base: &str) -> String {
     segments.join("/")
 }
 
+/// Where each of one rom's files lands, relative to the platform folder — the paths
+/// [`super::Installed::files`] records. Worked out once per rom: [`rom_root`] reads every file.
+pub struct Places {
+    sub: Option<String>,
+    base: String,
+}
+
+impl Places {
+    pub fn of(detail: &RomDetail) -> Self {
+        Self { sub: local_subdirectory(detail), base: base_path(detail) }
+    }
+
+    /// The rom's own folder here, when it has one — see [`local_subdirectory`].
+    pub fn folder(&self) -> Option<&str> {
+        self.sub.as_deref()
+    }
+
+    pub fn path(&self, file: &RomFile) -> String {
+        match &self.sub {
+            Some(sub) => format!("{sub}/{}", relative_path(file, &self.base)),
+            None => relative_path(file, &self.base),
+        }
+    }
+}
+
+/// The folders RomM files a game's other files in, directly below the game's own folder, each by
+/// the category it names. Every category but `game`: RomM matches a folder named `game` too, and
+/// what is in it is the game.
+const BESIDE: [&str; 13] = [
+    "dlc",
+    "update",
+    "patch",
+    "hack",
+    "mod",
+    "translation",
+    "demo",
+    "prototype",
+    "manual",
+    "walkthrough",
+    "soundtrack",
+    "cheat",
+    "screenshot",
+];
+
+/// What ES-DE looks for in a folder to skip it — "Folder … skipped as a noload.txt file is
+/// present".
+pub const NOLOAD: &str = "noload.txt";
+
+/// Whether a folder directly below a game's own is one RomM files its update, DLC or extras in. As
+/// RomM matches it: the name, lowercased, is a category in the singular or the plural (`updates`,
+/// `patches`).
+fn is_beside(folder: &str) -> bool {
+    let folder = folder.to_lowercase();
+    BESIDE.iter().any(|c| folder == *c || folder.strip_suffix('s') == Some(c) || folder.strip_suffix("es") == Some(c))
+}
+
+/// Whether `path`, a file as [`super::Installed::files`] records it, is beside the game rather than
+/// the game: in a folder RomM keeps its update, its DLC or an extra in. Read off the path, the way
+/// RomM reads it, so a record needs no note of each file's category.
+pub fn beside_the_game(path: &str) -> bool {
+    noload_for(path).is_some()
+}
+
+/// The `noload.txt` that hides from ES-DE the folder `path` is in, when that is one beside the game.
+/// Without one ES-DE, which scans a system's folder all the way down, lists an update as a game of
+/// its own.
+pub fn noload_for(path: &str) -> Option<String> {
+    let mut parts = path.splitn(3, '/');
+    let (game, folder, _) = (parts.next()?, parts.next()?, parts.next()?);
+    is_beside(folder).then(|| format!("{game}/{folder}/{NOLOAD}"))
+}
+
 /// The `.m3u` content for a multi-disc set, or None when the set is not multi-disc.
 ///
 /// `files` are on-disk paths relative to the game's own download directory, which is where the
@@ -137,6 +209,7 @@ mod tests {
             file_size_bytes: 1,
             file_path: path.into(),
             category: None,
+            ..Default::default()
         }
     }
 
@@ -185,6 +258,20 @@ mod tests {
         // The library path above the rom's own folder is gone: this is what rebuilt
         // `roms/psx/roms_psx/roms/psx/…` when `file_path` was read as a subpath.
         assert_eq!(relative_path(&detail.files[0], &base), "Driver 2 (USA) (Disc 1).cue");
+    }
+
+    #[test]
+    fn a_file_in_a_folder_romm_keeps_an_update_or_an_extra_in_is_beside_the_game() {
+        assert!(beside_the_game("Game/update/Game [v1].nsp"));
+        assert!(beside_the_game("Game/Updates/v2/Game.nsp"), "in the plural, in any case, at any depth below");
+        assert!(beside_the_game("Game/patches/fix.ips"));
+        assert!(!beside_the_game("Game/Game.xci"), "the game's own file");
+        assert!(!beside_the_game("Game/game/Game.xci"), "a folder named game holds the game");
+        assert!(!beside_the_game("Game/PS3_GAME/USRDIR/EBOOT.BIN"), "a game's own tree");
+        assert!(!beside_the_game("dlc.nsp"), "a rom with no folder of its own has no category folders");
+        assert_eq!(noload_for("Game/dlc/a.nsp").as_deref(), Some("Game/dlc/noload.txt"));
+        assert_eq!(noload_for("Game/DLC/pack/a.nsp").as_deref(), Some("Game/DLC/noload.txt"), "the category's folder, not one inside it");
+        assert_eq!(noload_for("Game/Game.xci"), None);
     }
 
     #[test]

@@ -45,6 +45,9 @@ pub enum Action {
     Download,
     /// The game's saves and states — see [`crate::ui::saves`].
     Saves,
+    /// What RomM keeps beside the game — a manual, a hack, a translation — to put on this device or
+    /// take off it. Only on a game that has any, and only once the game is here.
+    Extras,
     LaunchWith,
     Favourite,
     /// Keep it when a space budget makes room — see [`crate::downloads::storage`].
@@ -55,8 +58,15 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 7] =
-        [Action::Download, Action::Saves, Action::LaunchWith, Action::Favourite, Action::Pin, Action::Steam, Action::Remove];
+    pub const ALL: [Action; 8] =
+        [Action::Download, Action::Saves, Action::Extras, Action::LaunchWith, Action::Favourite, Action::Pin, Action::Steam, Action::Remove];
+
+    /// The actions the page draws, in order: all of them, but Extras only for a game with extras on
+    /// this device to offer. Every other action is drawn either way and says why it can't, when it
+    /// can't — a game without extras is most games, and a button that is never live is just noise.
+    pub fn shown(extras: bool) -> Vec<Action> {
+        Self::ALL.into_iter().filter(|a| *a != Action::Extras || extras).collect()
+    }
 
     fn label(self, sync: &SyncState, pinned: bool, missing: bool, in_steam: bool, favourite: bool) -> String {
         match self {
@@ -74,6 +84,7 @@ impl Action {
                 SyncState::RemoteOnly => "Download".into(),
             },
             Action::Saves => "Saves & states".into(),
+            Action::Extras => "Extras".into(),
             Action::LaunchWith => "Launch with...".into(),
             // The word carries it, as the Kotlin app has it: a heart glyph comes from a fallback
             // face, set tight against the word.
@@ -98,6 +109,10 @@ impl Action {
                 Some("isn't on RomM's disk, so there is nothing to download — rescan its platform in RomM")
             }
             (Action::Download | Action::Saves | Action::Favourite, _) => None,
+            // Not while the game itself is being fetched: both would write the one record of it.
+            (Action::Extras, s) if s.is_busy() => Some("is downloading — its extras can be picked once that's done"),
+            (Action::Extras, s) if s.is_here() => None,
+            (Action::Extras, _) => Some("isn't on this device, and its extras go in beside it"),
             // ES-DE's per-game emulator choice is what RetroDECK follows, so that is where it is made.
             (Action::LaunchWith, _) => {
                 Some("can't pick an emulator from here yet — choose one for the game in ES-DE, and Play follows it")
@@ -134,6 +149,8 @@ pub struct DetailContext<'a> {
     /// RetroAchievements' list for the game, once asked; None while it is on its way, or for a game
     /// with none.
     pub achievements: Option<&'a Result<std::sync::Arc<crate::achievements::GameAchievements>, String>>,
+    /// RomM has extras of the build on this device to offer — see [`Action::Extras`].
+    pub extras: bool,
 }
 
 impl<'a> DetailContext<'a> {
@@ -419,9 +436,11 @@ fn actions<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     let state = ctx.downloads.state_of(ctx.game.builds());
     let pinned = ctx.downloads.installed_builds(ctx.game.builds()).iter().any(|i| i.pinned);
     let mut buttons = row![].spacing(12);
-    for (i, action) in Action::ALL.iter().enumerate() {
+    let shown = Action::shown(ctx.extras);
+    for (i, action) in shown.iter().enumerate() {
         let primary = i == 0;
-        let lit = ctx.focus.action == i;
+        // Held to the row: a button that went (Extras, with the game) can leave the cursor past it.
+        let lit = ctx.focus.action.min(shown.len() - 1) == i;
         let label = action.label(&state, pinned, ctx.game.missing(), ctx.in_steam, ctx.favourite);
         // A running download is inert: the percentage is the progress, and a second press on the
         // one button the thumb is already resting on should not be a cancel found by accident.

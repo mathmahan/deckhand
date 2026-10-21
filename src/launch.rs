@@ -92,8 +92,14 @@ pub fn es_system(slug: &str) -> String {
 /// file among notes, pictures and patches that can be the game (a cartridge rom). A folder of
 /// files with no entry point (a PS3 game's tree) is the folder, which is how RetroDECK takes a
 /// "directory as a file" game.
+///
+/// Never a file beside the game — its update, its DLC, an extra, each in a folder of its own below
+/// the game's ([`crate::downloads::layout::beside_the_game`]): an update is not the game, and an
+/// emulator handed one starts nothing, or the wrong thing.
 pub fn target(installed: &Installed) -> PathBuf {
-    let files = &installed.files;
+    let game: Vec<String> = installed.files.iter().filter(|f| !crate::downloads::layout::beside_the_game(f)).cloned().collect();
+    // A folder of nothing but extras was fetched whole (see `downloads::fetch`): its files are the game.
+    let files = if game.is_empty() { &installed.files } else { &game };
     let pick = files
         .iter()
         .find(|f| extension(f) == "m3u")

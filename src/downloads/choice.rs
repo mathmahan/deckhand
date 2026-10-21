@@ -159,7 +159,11 @@ pub fn choices(game: &Game, detail: Option<&RomDetail>, installed: &[&Installed]
     let own_name = game.file_stems.iter().find(|(id, _)| *id == game.rom_id).map(|(_, s)| s.as_str()).unwrap_or(&game.title);
     let mut out = Vec::new();
     let discs = detail.map(|d| discs(&d.files)).unwrap_or_default();
-    let total = detail.map(|d| d.files.iter().map(RomFile::size).sum::<u64>()).filter(|b| *b > 0).or(game.size_bytes.and_then(|b| u64::try_from(b).ok()));
+    // What the whole game weighs: its files, its update and its DLC — not the extras it leaves on RomM.
+    let total = detail
+        .map(|d| d.files.iter().filter(|f| f.comes_with_game()).map(RomFile::size).sum::<u64>())
+        .filter(|b| *b > 0)
+        .or(game.size_bytes.and_then(|b| u64::try_from(b).ok()));
     let own = record(game.rom_id);
     if game.unavailable {
         // RomM has lost this build's file: only the others are offered.
@@ -229,7 +233,7 @@ mod tests {
     use super::*;
 
     fn file(id: i64, name: &str, bytes: i64) -> RomFile {
-        RomFile { id, file_name: name.into(), file_size_bytes: bytes, file_path: "roms/psx".into(), category: None }
+        RomFile { id, file_name: name.into(), file_size_bytes: bytes, file_path: "roms/psx".into(), ..Default::default() }
     }
 
     #[test]
@@ -291,6 +295,22 @@ mod tests {
         assert_eq!((all[0].files.clone(), all[0].bytes), (None, Some(30)));
         assert_eq!(all[2].files, Some(vec![2]));
         assert_eq!(all[3].rom_id, 11);
+    }
+
+    #[test]
+    fn the_whole_game_weighs_its_update_and_dlc_but_not_the_extras_left_on_romm() {
+        let filed = |id: i64, category: &str, bytes: i64| RomFile { category: Some(category.into()), ..file(id, &format!("{id}.nsp"), bytes) };
+        let detail = RomDetail {
+            id: 10,
+            files: vec![filed(1, "game", 100), filed(2, "update", 20), filed(3, "dlc", 5), filed(4, "manual", 1000)],
+            ..Default::default()
+        };
+        let mut solo = game();
+        solo.sibling_ids.clear();
+        solo.file_stems.truncate(1);
+        let all = choices(&solo, Some(&detail), &[]);
+        assert_eq!(all.len(), 1, "an update is no disc, so there is nothing to ask");
+        assert_eq!((all[0].files.clone(), all[0].bytes), (None, Some(125)));
     }
 
     #[test]

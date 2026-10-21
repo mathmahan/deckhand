@@ -205,7 +205,7 @@ impl App {
                 self.detail_focus = Default::default();
                 self.detail_offset = 0.0;
                 self.screen = Screen::Browsing(Route::Detail { rom_id, from: Box::new(from) });
-                Task::batch([self.scroll_page_to_top(), self.load_saves(rom_id), self.load_achievements(rom_id)])
+                Task::batch([self.scroll_page_to_top(), self.load_saves(rom_id), self.load_achievements(rom_id), self.load_files(rom_id)])
             }
             Message::Back => {
                 if let Screen::Browsing(Route::Detail { from, .. } | Route::Search { from } | Route::Saves { from, .. }) = &self.screen {
@@ -440,6 +440,7 @@ impl App {
                     Action::Pin => self.toggle_pin(rom_id),
                     Action::Steam => self.press_steam(rom_id),
                     Action::Saves => self.update(Message::OpenSaves(rom_id)),
+                    Action::Extras => self.press_extras(rom_id),
                     Action::Favourite => self.toggle_favourite(rom_id),
                     // This returned a reason above.
                     Action::LaunchWith => Task::none(),
@@ -877,6 +878,8 @@ impl App {
             }
             Message::Download(rom_id) => self.download_game(rom_id),
             Message::DownloadChoices(tile, result) => self.offer_choices(tile, result),
+            Message::FilesLoaded(build, result) => self.files_loaded(build, result),
+            Message::ExtraRemoved(build, label, result) => self.extra_removed(build, label, result),
             Message::ClaimInstalls => self.claim_installs(),
             Message::InstallsClaimed(result) => self.on_installs_claimed(result),
             Message::InstallDetail(request, result) => self.on_install_detail(request, result),
@@ -907,6 +910,11 @@ impl App {
             }
             Message::DownloadEvent(event) => self.on_download_event(event),
             Message::RemoveDownload(rom_id) => self.remove_download(rom_id),
+            Message::DismissDownload(rom_id) => {
+                self.downloads.dismiss(rom_id);
+                self.rebuild_shelves();
+                Task::none()
+            }
             Message::DownloadRemoved(title, result) => {
                 self.say(match result {
                     Ok(0) => format!("\"{title}\" was already gone from this device."),
@@ -944,11 +952,17 @@ impl App {
                     return Task::none();
                 }
                 let rows = self.download_rows();
-                let Some(rom_id) =
-                    rows.get(self.downloads_focus.index(rows.len())).map(|e| e.rom_id)
+                let Some((rom_id, failed)) = rows
+                    .get(self.downloads_focus.index(rows.len()))
+                    .map(|e| (e.rom_id, matches!(e.state, crate::downloads::SyncState::Failed(_))))
                 else {
                     return Task::none();
                 };
+                // A failed row is a failure to dismiss, even of a game that is here: removing the
+                // game for it would take what a failed update or extra never touched.
+                if failed {
+                    return self.update(Message::DismissDownload(rom_id));
+                }
                 self.remove_download(rom_id)
             }
             Message::SavesSynced(result) => {
