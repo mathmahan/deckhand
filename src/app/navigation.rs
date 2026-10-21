@@ -143,10 +143,9 @@ impl App {
         let up = direction == Direction::Up;
         match route {
             Route::Home => {
-                let actions = crate::ui::home::Action::ALL.len();
                 let moved = match direction {
-                    Direction::Left => self.focus.step(&self.shelves, -1, actions),
-                    Direction::Right => self.focus.step(&self.shelves, 1, actions),
+                    Direction::Left => self.focus.step(&self.shelves, -1),
+                    Direction::Right => self.focus.step(&self.shelves, 1),
                     Direction::Up => self.focus.step_vertical(&self.shelves, -1),
                     Direction::Down => self.focus.step_vertical(&self.shelves, 1),
                 };
@@ -287,31 +286,13 @@ impl App {
             None => {}
         }
         match route.clone() {
-            Route::Home => {
-                use crate::ui::home::Action;
-                let Some(rom_id) = self.focus.spotlit(&self.shelves).map(|g| g.rom_id) else { return Task::none() };
-                match self.focus.zone() {
-                    // On the spotlight's buttons, the one the cursor is on.
-                    crate::focus::Zone::Actions => match Action::ALL.get(self.focus.action()) {
-                        Some(Action::Primary) => self.update(Message::GameActivated(rom_id)),
-                        Some(Action::Saves) => self.update(Message::OpenSaves(rom_id)),
-                        Some(Action::Details) => self.update(Message::OpenDetail(rom_id)),
-                        Some(Action::Favourite) => self.update(Message::FavouritePressed(rom_id)),
-                        None => Task::none(),
-                    },
-                    // On a card, a game on this device plays — most sessions are "carry on with what
-                    // I was playing", and the page opens with that game under the cursor. Any other
-                    // opens its page, where fetching it is one more, deliberate, press: a download
-                    // started by a press on a shelf would be one nobody meant.
-                    crate::focus::Zone::Shelves => {
-                        if self.game_state(rom_id).is_here() {
-                            self.update(Message::GameActivated(rom_id))
-                        } else {
-                            self.update(Message::OpenDetail(rom_id))
-                        }
-                    }
-                }
-            }
+            // A card's game opens its page — the spotlight's View — where it is played or fetched, its
+            // saves are, and it is a favourite. One press for every game on every shelf, and never a
+            // download or a launch nobody meant.
+            Route::Home => match self.focus.spotlit(&self.shelves).map(|g| g.rom_id) {
+                Some(rom_id) => self.update(Message::OpenDetail(rom_id)),
+                None => Task::none(),
+            },
             Route::Collections => match self.collections_focus.zone {
                 crate::collections::Zone::Kinds => {
                     self.collections_focus.zone = crate::collections::Zone::Cards;

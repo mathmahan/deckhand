@@ -1,4 +1,4 @@
-//! Home's cursor: which band it is in, which shelf, and where on that shelf.
+//! Home's cursor: which shelf, and where on that shelf.
 //!
 //! A port of `HomeFocus`/`HomeState` from `HomeView.kt`. Deckhand is gamepad-first, which means
 //! selection is a model the app owns rather than the toolkit's focus ring — so navigation stays
@@ -8,26 +8,15 @@ use std::collections::HashMap;
 
 use crate::library::Shelf;
 
-/// Home's vertical bands, top to bottom. Up and Down walk between them; everything else is
-/// interpreted by the band that has it.
-///
-/// There is no hero of its own any more. The spotlight across the top of the page is whichever game
-/// the shelf cursor rests on, so its buttons are a band of their own above the shelves: Up from the
-/// first shelf reaches them, Down goes back to the card they are for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Zone {
-    /// The spotlight's buttons, for the game the shelf cursor rests on.
-    Actions,
-    #[default]
-    Shelves,
-}
-
 /// The Home cursor, kept outside the per-frame shelf list so it survives a library refresh — a
 /// refresh rebuilds the shelves, and without a persistent holder the cursor snapped back to the
 /// first card every time.
+///
+/// It is always on a card. The spotlight across the top of the page is whichever game it rests on,
+/// and that game's one button, View, is what A on the card does too — so the cursor never has to
+/// leave the shelves for it, and Up from the first shelf goes on to the tab bar.
 #[derive(Debug, Default)]
 pub struct HomeFocus {
-    zone: Zone,
     shelf_pos: usize,
     /// Where the cursor sits **on each shelf**, keyed by shelf id — not one index shared by all.
     ///
@@ -41,8 +30,6 @@ pub struct HomeFocus {
     /// currently drawn are kept, not evicted — that is what restores your place when the shelf comes
     /// back, and the key space is bounded by the collection count.
     index_by_shelf: HashMap<String, usize>,
-    /// Which of the spotlight's buttons the cursor is on, in [`Zone::Actions`].
-    action: usize,
 }
 
 impl HomeFocus {
@@ -61,33 +48,19 @@ impl HomeFocus {
                 *remembered = (*remembered).min(shelf.games.len().saturating_sub(1));
             }
         }
-        // With no shelf there is no game for the buttons to be about.
-        if shelves.is_empty() {
-            self.zone = Zone::Shelves;
-        }
     }
 
     /// Put the cursor back where the page opens: the first card of the first shelf — the game
     /// played last, under the cursor with the spotlight on it.
     pub fn reset_to_top(&mut self, shelves: &[Shelf]) {
-        self.zone = Zone::Shelves;
         self.shelf_pos = 0;
         if let Some(first) = shelves.first() {
             self.index_by_shelf.insert(first.id.clone(), 0);
         }
     }
 
-    pub fn zone(&self) -> Zone {
-        self.zone
-    }
-
     pub fn shelf_pos(&self) -> usize {
         self.shelf_pos
-    }
-
-    /// Which of the spotlight's buttons the cursor is on — meaningful in [`Zone::Actions`].
-    pub fn action(&self) -> usize {
-        self.action
     }
 
     /// Where the cursor sits on `shelf` — its own remembered position, whether or not it is the
@@ -101,15 +74,9 @@ impl HomeFocus {
             .min(shelf.games.len().saturating_sub(1))
     }
 
-    /// The card the spotlight is on: the shelf cursor's, in either band. On the buttons the cursor
-    /// is still *about* that card, which stays lifted under them.
-    pub fn is_spotlit(&self, shelves: &[Shelf], shelf_index: usize, card: usize) -> bool {
-        self.shelf_pos == shelf_index && shelves.get(shelf_index).is_some_and(|s| self.index_of(s) == card)
-    }
-
-    /// The card under the cursor itself — the spotlit one, while the cursor is on the shelves.
+    /// The card under the cursor, which is the one the spotlight is on.
     pub fn is_focused(&self, shelves: &[Shelf], shelf_index: usize, card: usize) -> bool {
-        self.zone == Zone::Shelves && self.is_spotlit(shelves, shelf_index, card)
+        self.shelf_pos == shelf_index && shelves.get(shelf_index).is_some_and(|s| self.index_of(s) == card)
     }
 
     /// The game in the spotlight.
@@ -124,22 +91,13 @@ impl HomeFocus {
         if card >= shelf.games.len() {
             return;
         }
-        self.zone = Zone::Shelves;
         self.shelf_pos = shelf_index;
         self.index_by_shelf.insert(shelf.id.clone(), card);
     }
 
-    /// Horizontal step: along the focused shelf, or across the spotlight's `actions` buttons. False
-    /// = fell off the edge, and the caller keeps the cursor put.
-    pub fn step(&mut self, shelves: &[Shelf], delta: isize, actions: usize) -> bool {
-        if self.zone == Zone::Actions {
-            let next = self.action as isize + delta;
-            if next < 0 || next >= actions as isize {
-                return false;
-            }
-            self.action = next as usize;
-            return true;
-        }
+    /// Horizontal step along the focused shelf. False = fell off the edge, and the caller keeps the
+    /// cursor put.
+    pub fn step(&mut self, shelves: &[Shelf], delta: isize) -> bool {
         let Some(shelf) = shelves.get(self.shelf_pos) else { return false };
         let next = self.index_of(shelf) as isize + delta;
         if next < 0 || next >= shelf.games.len() as isize {
@@ -149,42 +107,20 @@ impl HomeFocus {
         true
     }
 
-    /// Vertical move: between bands at the edges, between shelves inside the shelf band.
+    /// Vertical move between shelves. False = off the top or the bottom: Up from the first shelf is
+    /// the caller's, which takes it on to the tab bar.
     ///
     /// Deliberately does **not** carry the column across when changing shelf. Doing so made the
     /// shelves read as one grid: the third card of Continue playing sat above the third card of
     /// Recently added, and stepping back up landed on whatever the shortest shelf had clamped you
     /// to rather than where you were. Each shelf keeps its own place.
-    ///
-    /// Up into the buttons always lands on the first, the main action: that is the one the
-    /// spotlight is built around, and the one most likely wanted on the way up.
     pub fn step_vertical(&mut self, shelves: &[Shelf], delta: isize) -> bool {
-        match self.zone {
-            Zone::Actions => {
-                if delta > 0 && !shelves.is_empty() {
-                    self.zone = Zone::Shelves;
-                    return true;
-                }
-                false
-            }
-            Zone::Shelves => {
-                let next = self.shelf_pos as isize + delta;
-                if next < 0 {
-                    // Off the top of the shelves: up to the spotlight's buttons.
-                    if shelves.is_empty() {
-                        return false;
-                    }
-                    self.zone = Zone::Actions;
-                    self.action = 0;
-                    return true;
-                }
-                if next >= shelves.len() as isize {
-                    return false;
-                }
-                self.shelf_pos = next as usize;
-                true
-            }
+        let next = self.shelf_pos as isize + delta;
+        if next < 0 || next >= shelves.len() as isize {
+            return false;
         }
+        self.shelf_pos = next as usize;
+        true
     }
 }
 
@@ -212,7 +148,6 @@ mod tests {
         let shelves = vec![shelf("continue", 3)];
         let mut focus = HomeFocus::default();
         focus.reconcile(&shelves);
-        assert_eq!(focus.zone(), Zone::Shelves);
         assert_eq!(focus.spotlit(&shelves).map(|g| g.rom_id), Some(0), "the game played last");
         assert!(focus.is_focused(&shelves, 0, 0));
     }
@@ -223,8 +158,8 @@ mod tests {
         let mut focus = HomeFocus::default();
         focus.reconcile(&shelves);
 
-        assert!(focus.step(&shelves, 1, 4));
-        assert!(focus.step(&shelves, 1, 4));
+        assert!(focus.step(&shelves, 1));
+        assert!(focus.step(&shelves, 1));
         assert_eq!(focus.index_of(&shelves[0]), 2);
 
         // Down to the next shelf: it starts at its own place, not the outgoing shelf's column.
@@ -242,45 +177,23 @@ mod tests {
         let mut focus = HomeFocus::default();
         focus.reconcile(&shelves);
 
-        assert!(!focus.step(&shelves, -1, 4), "left of the first card goes nowhere");
-        assert!(focus.step(&shelves, 1, 4));
-        assert!(!focus.step(&shelves, 1, 4), "right of the last card goes nowhere");
+        assert!(!focus.step(&shelves, -1), "left of the first card goes nowhere");
+        assert!(focus.step(&shelves, 1));
+        assert!(!focus.step(&shelves, 1), "right of the last card goes nowhere");
         assert!(!focus.step_vertical(&shelves, 1), "below the last shelf goes nowhere");
     }
 
     #[test]
-    fn up_from_the_first_shelf_reaches_the_spotlights_buttons_and_down_comes_back() {
+    fn up_from_the_first_shelf_is_the_tab_bar_s_and_leaves_the_cursor_on_its_card() {
         let shelves = vec![shelf("continue", 3), shelf("recent", 3)];
         let mut focus = HomeFocus::default();
         focus.reconcile(&shelves);
-        focus.step(&shelves, 1, 4);
-
-        assert!(focus.step_vertical(&shelves, -1));
-        assert_eq!(focus.zone(), Zone::Actions);
-        assert_eq!(focus.action(), 0, "on the main action");
-        assert_eq!(focus.spotlit(&shelves).map(|g| g.rom_id), Some(1), "still about the card it came from");
-        assert!(focus.is_spotlit(&shelves, 0, 1) && !focus.is_focused(&shelves, 0, 1), "but not on it");
-
-        // Across the buttons, stopping at both ends.
-        assert!(!focus.step(&shelves, -1, 4));
-        for _ in 0..3 {
-            assert!(focus.step(&shelves, 1, 4));
-        }
-        assert!(!focus.step(&shelves, 1, 4), "past the last button goes nowhere");
-        assert!(!focus.step_vertical(&shelves, -1), "above the buttons is the tab bar's business");
-
-        assert!(focus.step_vertical(&shelves, 1));
-        assert!(focus.is_focused(&shelves, 0, 1), "back on the card the buttons were for");
-    }
-
-    #[test]
-    fn up_from_a_lower_shelf_is_the_shelf_above_not_the_buttons() {
-        let shelves = vec![shelf("continue", 3), shelf("recent", 3)];
-        let mut focus = HomeFocus::default();
-        focus.reconcile(&shelves);
+        focus.step(&shelves, 1);
         focus.step_vertical(&shelves, 1);
-        assert!(focus.step_vertical(&shelves, -1));
-        assert_eq!((focus.zone(), focus.shelf_pos()), (Zone::Shelves, 0));
+
+        assert!(focus.step_vertical(&shelves, -1), "a lower shelf's Up is the shelf above");
+        assert!(!focus.step_vertical(&shelves, -1), "the first shelf's is the tab bar's");
+        assert!(focus.is_focused(&shelves, 0, 1), "and the cursor stays on the card it was on");
     }
 
     #[test]
@@ -288,8 +201,6 @@ mod tests {
         let shelves = vec![shelf("continue", 3), shelf("recent", 4)];
         let mut focus = HomeFocus::default();
         focus.reconcile(&shelves);
-        focus.step_vertical(&shelves, -1);
-        assert_eq!(focus.zone(), Zone::Actions);
         focus.focus_card(&shelves, 1, 3);
         assert!(focus.is_focused(&shelves, 1, 3));
         focus.focus_card(&shelves, 1, 9);
@@ -303,7 +214,7 @@ mod tests {
         focus.reconcile(&big);
         focus.step_vertical(&big, 1);
         for _ in 0..5 {
-            focus.step(&big, 1, 4);
+            focus.step(&big, 1);
         }
         assert_eq!(focus.shelf_pos(), 1);
         assert_eq!(focus.index_of(&big[1]), 5);
@@ -320,8 +231,8 @@ mod tests {
         let both = vec![shelf("continue", 4), shelf("recent", 4)];
         let mut focus = HomeFocus::default();
         focus.reconcile(&both);
-        focus.step(&both, 1, 4);
-        focus.step(&both, 1, 4);
+        focus.step(&both, 1);
+        focus.step(&both, 1);
         assert_eq!(focus.index_of(&both[0]), 2);
 
         // Continue playing empties out (offline), then comes back on the next refresh.
@@ -336,7 +247,7 @@ mod tests {
         let shelves = vec![shelf("continue", 4), shelf("recent", 4)];
         let mut focus = HomeFocus::default();
         focus.reconcile(&shelves);
-        focus.step(&shelves, 1, 4);
+        focus.step(&shelves, 1);
         focus.step_vertical(&shelves, 1);
         focus.reset_to_top(&shelves);
         assert!(focus.is_focused(&shelves, 0, 0));

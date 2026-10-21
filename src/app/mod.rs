@@ -163,8 +163,6 @@ pub enum Message {
     HomeCardClicked(usize, usize),
     /// The wheel turned over Home's shelves, which walks them as Up and Down do.
     HomeWheel(iced::mouse::ScrollDelta),
-    /// The spotlight's heart.
-    FavouritePressed(i64),
     /// What this user has earned of their games' achievements, by RetroAchievements id — or why
     /// RomM could not say.
     AwardedLoaded(Result<Option<HashMap<i64, usize>>, String>),
@@ -173,7 +171,6 @@ pub enum Message {
     Unhovered(Cursor),
     /// Confirm on whatever the cursor is on — a card, a button, a row.
     Activate,
-    GameActivated(i64),
     /// RomM's answer to a favourite being set or cleared: the favourites collection as it now is —
     /// or why not, in which case `ids` go back the way they were.
     FavouriteChanged { tile: i64, adding: bool, ids: Vec<i64>, result: Result<Collection, String> },

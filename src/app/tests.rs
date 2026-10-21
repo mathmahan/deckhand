@@ -405,7 +405,7 @@ fn the_detail_pages_action_row_does_what_it_says_at_each_stage() {
     assert_eq!(app.playing, Some(game.rom_id));
     assert!(app.handover.is_some_and(|h| h.rom_id == game.rom_id && !h.closing), "the window says it is opening");
     let _ = app.view();
-    let _ = app.update(Message::GameActivated(game.rom_id));
+    let _ = app.update(Message::DetailAction(Action::Download));
     assert!(app.banner.as_deref().unwrap().contains("still running"), "{:?}", app.banner);
     // Keys pressed while it opens are for no page under it.
     let screen = app.screen_name();
@@ -1641,9 +1641,8 @@ fn an_empty_library_still_builds_home_rather_than_dividing_by_nothing() {
 
 #[test]
 fn arrow_keys_walk_the_shelves_without_leaving_the_cursor_off_a_card() {
-    use crate::focus::Zone;
     let (mut app, _) = App::new(Some(60));
-    assert_eq!(app.focus.zone(), Zone::Shelves, "Home opens on its first card");
+    assert!(app.focus.is_focused(&app.shelves, 0, 0), "Home opens on its first card");
     let first = app.shelves[0].games[0].rom_id;
     assert_eq!(app.spotlit_id(), Some(first), "with the spotlight on it");
 
@@ -1662,9 +1661,9 @@ fn arrow_keys_walk_the_shelves_without_leaving_the_cursor_off_a_card() {
     let _ = app.update(Message::Nav(Direction::Up));
     assert_eq!(app.spotlit_id(), Some(third), "coming back up restores the column");
 
-    // Up once more is the spotlight's buttons, still about that card.
+    // Up once more is the tab bar, the spotlight still on that card.
     let _ = app.update(Message::Nav(Direction::Up));
-    assert_eq!(app.focus.zone(), Zone::Actions);
+    assert_eq!(app.chrome, Some(Chrome::Tabs));
     assert_eq!(app.spotlit_id(), Some(third));
     let _ = app.view();
 }
@@ -1705,61 +1704,34 @@ fn a_spotlight_picture_still_on_its_way_is_shown_when_it_lands() {
 }
 
 #[test]
-fn confirm_on_a_card_plays_a_game_that_is_here_and_opens_one_that_is_not() {
+fn confirm_on_a_card_opens_its_page_on_any_shelf_whether_or_not_the_game_is_here() {
+    use crate::gamepad::Pad;
     let (mut app, _) = App::new(Some(60));
-    let card = app.spotlit_id().unwrap();
+    let opened = |app: &App, card: i64| matches!(&app.screen, Screen::Browsing(Route::Detail { rom_id, .. }) if *rom_id == card);
 
     // Not on this device: its page, where fetching it is a press of its own.
+    let card = app.spotlit_id().unwrap();
     let _ = app.update(Message::Activate);
-    assert!(
-        matches!(&app.screen, Screen::Browsing(Route::Detail { rom_id, .. }) if *rom_id == card),
-        "the card's page opened, got {:?}",
-        app.screen_name()
-    );
+    assert!(opened(&app, card), "the card's page opened, got {:?}", app.screen_name());
     assert!(app.downloads.in_progress().next().is_none(), "and nothing started downloading");
-
-    // Back to Home, where the cursor is still on it.
     let _ = app.update(Message::Back);
-    assert!(matches!(app.screen, Screen::Browsing(Route::Home)));
-    assert_eq!(app.spotlit_id(), Some(card));
+    assert_eq!(app.spotlit_id(), Some(card), "back on Home, the cursor is still on it");
 
-    // On this device: Confirm plays it.
+    // On this device, on a lower shelf: its page too, where playing it is.
+    let _ = app.update(Message::Nav(Direction::Down));
+    let card = app.spotlit_id().unwrap();
     let game = app.library.game(card).unwrap().clone();
     app.downloads.adopt(vec![installed(card, &game.title, 1 << 20)]);
     app.rebuild_shelves();
+    let _ = app.view();
     let _ = app.update(Message::Activate);
-    assert_eq!(app.playing, Some(card), "the game was started");
-}
+    assert!(opened(&app, card), "got {:?}", app.screen_name());
+    assert_eq!(app.playing, None, "nothing was started");
+    let _ = app.update(Message::Back);
 
-#[test]
-fn the_spotlights_buttons_do_what_they_say() {
-    use crate::gamepad::Pad;
-    let (mut app, _) = App::new(Some(60));
-    let card = app.spotlit_id().unwrap();
-
-    // X, from the shelf, is the game's saves and states.
+    // X is nothing on Home: the saves are on the game's page.
     let _ = app.update(Message::Pad(Pad::Erase));
-    assert!(matches!(&app.screen, Screen::Browsing(Route::Saves { rom_id, .. }) if *rom_id == card), "got {:?}", app.screen_name());
-    let _ = app.update(Message::Back);
-
-    // Up onto the buttons, along to Details, and press it.
-    let _ = app.update(Message::Nav(Direction::Up));
-    let _ = app.update(Message::Nav(Direction::Right));
-    let _ = app.update(Message::Nav(Direction::Right));
-    let _ = app.view();
-    let _ = app.update(Message::Activate);
-    assert!(matches!(&app.screen, Screen::Browsing(Route::Detail { rom_id, .. }) if *rom_id == card), "got {:?}", app.screen_name());
-    let _ = app.update(Message::Back);
-
-    // The heart is the game page's Favourite: in fixture mode, with no RomM to tell, simply so.
-    let _ = app.update(Message::Nav(Direction::Right));
-    let _ = app.update(Message::Activate);
-    assert!(app.favourites.contains(&card), "the spotlit game is a favourite");
-    let _ = app.view();
-
-    // Down is back on the card the buttons were for.
-    let _ = app.update(Message::Nav(Direction::Down));
-    assert!(app.focus.is_focused(&app.shelves, 0, 0));
+    assert!(matches!(app.screen, Screen::Browsing(Route::Home)), "got {:?}", app.screen_name());
 }
 
 #[test]
@@ -1786,7 +1758,7 @@ fn the_wheel_walks_the_shelves_and_stops_at_the_first() {
     }
     assert_eq!(app.focus.shelf_pos(), 0, "75 px up is one shelf");
     let _ = app.update(Message::HomeWheel(ScrollDelta::Lines { x: 0.0, y: 3.0 }));
-    assert_eq!((app.focus.shelf_pos(), app.focus.zone()), (0, crate::focus::Zone::Shelves), "and stops at the first shelf");
+    assert_eq!(app.focus.shelf_pos(), 0, "and stops at the first shelf");
     assert_eq!(app.chrome, None, "never climbing into the bar");
 }
 
@@ -1864,7 +1836,6 @@ fn the_spotlight_asks_for_its_picture_and_its_neighbours() {
 
 #[test]
 fn pressing_the_current_tab_returns_to_the_top() {
-    use crate::focus::Zone;
     let (mut app, _) = App::new(Some(60));
     for direction in [Direction::Down, Direction::Right] {
         let _ = app.update(Message::Nav(direction));
@@ -1872,8 +1843,7 @@ fn pressing_the_current_tab_returns_to_the_top() {
     assert_eq!(app.focus.shelf_pos(), 1);
 
     let _ = app.update(Message::TabSelected(Tab::Home));
-    assert_eq!(app.focus.zone(), Zone::Shelves, "back to the top of the page");
-    assert_eq!(app.focus.shelf_pos(), 0);
+    assert_eq!(app.focus.shelf_pos(), 0, "back to the top of the page");
     assert!(app.focus.is_focused(&app.shelves, 0, 0), "on the game played last");
 }
 
@@ -2480,7 +2450,7 @@ fn every_destination_is_reached_with_the_shoulders_and_with_the_d_pad_alone() {
     for _ in 0..12 {
         let _ = app.update(Message::Pad(Pad::Nav(Direction::Up)));
     }
-    assert_eq!(app.chrome, Some(Chrome::Tabs), "up past the spotlight's buttons is the bar");
+    assert_eq!(app.chrome, Some(Chrome::Tabs), "up off the top of Home is the bar");
     for _ in 0..5 {
         let _ = app.update(Message::Pad(Pad::Nav(Direction::Right)));
     }

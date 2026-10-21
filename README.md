@@ -16,9 +16,9 @@ and keep saves and save states in sync with your server.
 
 - **Pairing without a keyboard.** Scan a QR code with your phone and approve Deckhand in RomM, or
   type a pairing code.
-- **Home.** A spotlight on the last played game, press A to play and
-  X to check the games saves. Below it are sections for *Continue playing*, *On this device*, your RomM *Now
-  playing*.
+- **Home.** A spotlight on the game under the cursor, starting with the last one played; press A
+  on any game to view its page, where it's played, downloaded and its saves are. Below it are
+  sections for *Continue playing*, *On this device*, your RomM *Now playing*.
 - **Library and Collections.** Every system or collection as a cover grid, with filters, sorting and
   an A–Z jump. Your favourites and your own collections are a chip each, and RomM's genres,
   franchises and series are browsable across systems.

@@ -12,7 +12,6 @@
 //! own alpha; the scrims are gradients; the lift of the card under the cursor is padding and its
 //! glow a box shadow. So the page draws the same on the software renderer as on the GPU.
 
-use std::collections::HashSet;
 use std::time::Instant;
 
 use iced::widget::text::LineHeight;
@@ -30,7 +29,7 @@ use crate::animation::{lerp, mix, Backdrop, Cursor, FocusFade, Glide};
 use crate::app::Message;
 use crate::covers::{self, Covers, Kind};
 use crate::downloads::{human_bytes, Downloads, SyncState};
-use crate::focus::{HomeFocus, Zone};
+use crate::focus::HomeFocus;
 use crate::library::{Game, Library, Shelf};
 use crate::theme::{self, alpha};
 use crate::ui::tab_bar::{glyph, MARGIN};
@@ -47,7 +46,7 @@ const CARD_GAP: f32 = 20.0;
 
 /// The spotlight's band, from under the header to the shelves. Its text sits on the bottom of it,
 /// over the picture, and everything from the meta line down has a fixed height — so walking a shelf
-/// changes what the band says without moving the buttons; only the tag over a shorter name moves.
+/// changes what the band says without moving its button; only the tag over a shorter name moves.
 pub const SPOTLIGHT_H: f32 = 400.0;
 
 /// The spotlight's band in a window too short for all of it: the description and the facts go,
@@ -108,22 +107,6 @@ const EDGE_FADE: f32 = 140.0;
 /// edge, with a card's worth still showing that there is more.
 pub const SHELF_PEEK: f32 = 72.0;
 
-/// The spotlight's buttons, in the order the cursor walks them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    /// Play, or Resume, a game on this device; Download one that is not.
-    Primary,
-    /// The game's saves and states — see [`crate::ui::saves`].
-    Saves,
-    /// The game's own page.
-    Details,
-    Favourite,
-}
-
-impl Action {
-    pub const ALL: [Action; 4] = [Action::Primary, Action::Saves, Action::Details, Action::Favourite];
-}
-
 pub struct HomeContext<'a> {
     pub library: &'a Library,
     pub shelves: &'a [Shelf],
@@ -131,7 +114,7 @@ pub struct HomeContext<'a> {
     pub covers: &'a Covers,
     /// What this device has of each game. Live state rather than a property of the library
     /// snapshot, which is why it is threaded in here instead of sitting on [`Game`] — a download
-    /// finishing has to change the spotlight's button and a card's badge without rebuilding the
+    /// finishing has to change the spotlight's facts and a card's badge without rebuilding the
     /// library.
     pub downloads: &'a Downloads,
     /// The connected server, for resolving host-relative RomM asset paths.
@@ -145,8 +128,6 @@ pub struct HomeContext<'a> {
     pub now: Instant,
     /// The card under the mouse pointer, if any.
     pub hovered: Option<Cursor>,
-    /// Rom ids in RomM's favourites collection.
-    pub favourites: &'a HashSet<i64>,
     /// How many of the spotlit game's achievements this user has earned, when RomM said.
     pub earned: Option<usize>,
     /// The spotlit game's name and description, cut to the lines the spotlight gives them — see
@@ -428,7 +409,7 @@ fn spotlight<'a>(ctx: &HomeContext<'a>, shelf: &'a Shelf, game: &'a Game) -> Ele
             .clip(true),
         );
     }
-    info = info.push(Space::new().height(Length::Fixed(24.0))).push(actions(ctx, game, &state));
+    info = info.push(Space::new().height(Length::Fixed(24.0))).push(view_button(game));
     if !ctx.compact {
         info = info.push(Space::new().height(Length::Fixed(18.0))).push(facts(ctx, game, &state));
     }
@@ -501,7 +482,7 @@ fn title_art<'a>(ctx: &HomeContext<'a>, game: &'a Game) -> Element<'a, Message> 
         }
     };
     // As tall as what is in it, so the tag above sits on it: everything under it is a fixed height
-    // and the band sits on its bottom edge, so a short name moves only the tag, never the buttons.
+    // and the band sits on its bottom edge, so a short name moves only the tag, never the button.
     container(art).width(Length::Fill).max_height(LOGO_H).into()
 }
 
@@ -540,78 +521,17 @@ fn meta_line<'a>(game: &'a Game) -> Element<'a, Message> {
         .into()
 }
 
-/// The spotlight's buttons: the main action, the saves, the game's page, and the heart.
-///
-/// The pad button that does a thing from the shelf is set on the button it does: X is always Saves
-/// & states, and A is the main action for a game on this device but the game's page for one that is
-/// not — a press that started a download from the shelf would be a download nobody meant. On the
-/// buttons themselves A presses whichever has the cursor, which its ring already says.
-fn actions<'a>(ctx: &HomeContext<'a>, game: &'a Game, state: &SyncState) -> Element<'a, Message> {
-    let on_buttons = ctx.focus.zone() == Zone::Actions;
-    let lit = |action: Action| on_buttons && Action::ALL.get(ctx.focus.action()) == Some(&action);
-    let here = state.is_here();
-
-    let (label, icon, live) = primary_label(game, state);
-    let mut primary = row![].spacing(10).align_y(Alignment::Center);
-    primary = if !on_buttons && here { primary.push(glyph("A", true)) } else { primary.push(icon.size(16.0).color(Color::WHITE)) };
-    primary = primary.push(text(label).size(16.0).font(theme::BOLD).color(Color::WHITE));
-    let mut primary = button(container(primary).height(Length::Fill).align_y(Alignment::Center))
+/// The spotlight's one button: the game's own page, where it is played or fetched, its saves and
+/// states are, and it is a favourite. A on its card presses it, whichever shelf the card is on.
+fn view_button<'a>(game: &'a Game) -> Element<'a, Message> {
+    let label = row![glyph("A", true), text("View").size(16.0).font(theme::BOLD).color(Color::WHITE)]
+        .spacing(10)
+        .align_y(Alignment::Center);
+    button(container(label).height(Length::Fill).align_y(Alignment::Center))
         .height(Length::Fixed(52.0))
         .padding([0.0, 22.0])
-        .style(crate::ui::style::spotlight(true, lit(Action::Primary)));
-    if live {
-        primary = primary.on_press(Message::GameActivated(game.rom_id));
-    }
-
-    let favourite = game.builds().any(|id| ctx.favourites.contains(&id));
-    row![
-        primary,
-        quiet(Some("X"), "Saves & states", lit(Action::Saves), Message::OpenSaves(game.rom_id)),
-        quiet((!on_buttons && !here).then_some("A"), "Details", lit(Action::Details), Message::OpenDetail(game.rom_id)),
-        button(
-            container(lucide::heart().size(20.0).color(if favourite { theme::ACCENT_400 } else { theme::INK }))
-                .center(Length::Fill),
-        )
-        .width(Length::Fixed(52.0))
-        .height(Length::Fixed(52.0))
-        .padding(0)
-        .on_press(Message::FavouritePressed(game.rom_id))
-        .style(crate::ui::style::spotlight(false, lit(Action::Favourite))),
-    ]
-    .spacing(12)
-    .height(Length::Fixed(52.0))
-    .into()
-}
-
-/// The main action's words, its icon for when no pad button is set beside it, and whether it can
-/// be pressed — a download already running cannot be started again.
-fn primary_label(game: &Game, state: &SyncState) -> (String, iced::widget::Text<'static>, bool) {
-    match state {
-        SyncState::Installed | SyncState::UpdateAvailable => {
-            // A game played before carries on from where it was left; one never played starts.
-            let label = if game.last_played.is_some() { "Resume" } else { "Play" };
-            (label.into(), lucide::play(), true)
-        }
-        SyncState::Downloading(progress) => (format!("Downloading {}%", (progress * 100.0) as i32), lucide::download(), false),
-        SyncState::Unpacking(progress) => (format!("Unpacking {}%", (progress * 100.0) as i32), lucide::package_open(), false),
-        SyncState::Failed(_) => ("Try again".into(), lucide::rotate_cw(), true),
-        SyncState::RemoteOnly if game.missing() => ("Not on RomM's disk".into(), lucide::cloud_off(), false),
-        SyncState::RemoteOnly => ("Download".into(), lucide::download(), true),
-    }
-}
-
-/// A glass button, with the pad button that presses it from the shelf when there is one.
-fn quiet<'a>(pad: Option<&'a str>, label: &'a str, lit: bool, message: Message) -> Element<'a, Message> {
-    let mut content = row![].spacing(10).align_y(Alignment::Center);
-    if let Some(letter) = pad {
-        content = content.push(glyph(letter, false));
-    }
-    content = content.push(text(label).size(16.0).font(theme::SEMIBOLD).color(theme::INK));
-    button(container(content).height(Length::Fill).align_y(Alignment::Center))
-        .height(Length::Fixed(52.0))
-        .padding(if pad.is_some() { Padding { top: 0.0, right: 20.0, bottom: 0.0, left: 14.0 } } else { Padding::from([0.0, 20.0]) })
-        .on_press(message)
-        .style(crate::ui::style::spotlight(false, lit))
+        .on_press(Message::OpenDetail(game.rom_id))
+        .style(crate::ui::style::spotlight(true, false))
         .into()
 }
 
@@ -749,13 +669,11 @@ fn shelf_band<'a>(ctx: &HomeContext<'a>, shelf: &'a Shelf, shelf_index: usize) -
     column![heading, Space::new().height(Length::Fixed(HEADING_GAP)), strip, Space::new().height(Length::Fixed(SHELF_GAP))].into()
 }
 
-/// One card. Its light and its lift follow the spotlight, which stays on it while the cursor is up
-/// on the buttons; its ring follows the cursor itself, which is how the eye finds where the cursor
-/// went.
+/// One card. Its light, its lift and its ring follow the cursor, which the spotlight is on: that is
+/// how the eye finds where the cursor went.
 fn card<'a>(ctx: &HomeContext<'a>, shelf_index: usize, index: usize, game: &'a Game) -> Element<'a, Message> {
     let key = Cursor::HomeCard(shelf_index, index);
-    let spotlit = ctx.focus.is_spotlit(ctx.shelves, shelf_index, index);
-    let focused = spotlit && ctx.focus.zone() == Zone::Shelves;
+    let spotlit = ctx.focus.is_focused(ctx.shelves, shelf_index, index);
     // How lit this card is *right now*: 1 in the spotlight, 0 well away from it, and somewhere
     // between while the spotlight is handing over to or from it.
     let lit = ctx.fade.amount(key, spotlit, ctx.now);
@@ -777,7 +695,7 @@ fn card<'a>(ctx: &HomeContext<'a>, shelf_index: usize, index: usize, game: &'a G
             .into(),
         None => placeholder(game, ctx.library.system_name(&game.system_id), 14.0, bright),
     };
-    let ring = if focused { mix(rest, theme::INK, lit) } else { rest };
+    let ring = if spotlit { mix(rest, theme::INK, lit) } else { rest };
     let cover = container(ring_of(badged(art, &ctx.downloads.state_of(game.builds())), theme::SURFACE_VARIANT, ring))
         .width(Length::Fixed(width))
         .height(Length::Fixed(COVER_H))

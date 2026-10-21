@@ -194,7 +194,6 @@ impl App {
             backdrop: &self.backdrop,
             now: std::time::Instant::now(),
             hovered: self.hovered,
-            favourites: &self.favourites,
             earned,
             title,
             summary,
