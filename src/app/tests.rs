@@ -1253,6 +1253,31 @@ mod render {
         snapshot(&app, "settings-saves-syncing");
     }
 
+    /// The save sync page after a sync with a failure, filtered to what went up, and while one runs.
+    #[test]
+    #[ignore = "writes PNGs; run explicitly"]
+    fn render_save_sync() {
+        let mut app = paired_fixtures(30);
+        app.banner = None;
+        let ids = super::with_a_sync(&mut app);
+        let _ = app.update(Message::TabSelected(Tab::Settings));
+        let _ = app.update(Message::TabSelected(Tab::Sync));
+        snapshot(&app, "save-sync");
+        let _ = app.update(Message::SyncFilter(crate::ui::save_sync::Filter::InSync));
+        snapshot(&app, "save-sync-in-sync");
+        let _ = app.update(Message::SyncFilter(crate::ui::save_sync::Filter::All));
+        app.sync_before = std::mem::replace(&mut app.save_sync, SaveSync::Running);
+        crate::sync::progress::begin(40);
+        for _ in 0..14 {
+            crate::sync::progress::step();
+        }
+        crate::sync::progress::at(ids[1]);
+        snapshot(&app, "save-sync-running");
+        crate::sync::progress::end();
+        app.save_sync = SaveSync::Idle;
+        snapshot(&app, "save-sync-never");
+    }
+
     #[test]
     #[ignore = "writes PNGs; run explicitly"]
     fn render_app_update() {
@@ -2451,6 +2476,80 @@ fn x_syncs_the_saves_from_the_saves_section_and_nowhere_else() {
     let _ = app.view();
 }
 
+/// A finished sync of three games' saves: one sent up with a state brought down, one failed, one
+/// in sync — and a save no game is named for.
+fn with_a_sync(app: &mut App) -> Vec<i64> {
+    use crate::sync::{Event, Happened, Report};
+    let ids: Vec<i64> = app.library.all_games()[..3].iter().map(|g| g.rom_id).collect();
+    let event = |rom_id: Option<i64>, name: &str, state: bool, happened: Happened| Event { rom_id, name: name.into(), state, happened };
+    let events = vec![
+        event(Some(ids[0]), "a.srm", false, Happened::Up),
+        event(Some(ids[0]), "a.slot2.retroarch.deckhand.state", true, Happened::Down),
+        event(Some(ids[1]), "b.srm", false, Happened::InSync),
+        event(Some(ids[2]), "c.srm", false, Happened::Failed("RomM refused it (HTTP 404)".into())),
+        event(None, "Loose Thing.srm", false, Happened::LeftAlone(crate::sync::NO_GAME.into())),
+    ];
+    app.save_sync = SaveSync::Done(Box::new(Report { events, in_sync: 1, pushed: vec!["a.srm".into()], ..Default::default() }));
+    app.save_synced_at = Some(std::time::Instant::now());
+    ids
+}
+
+#[test]
+fn the_cloud_opens_what_the_last_sync_did_and_back_returns() {
+    use crate::gamepad::Pad;
+    use crate::ui::save_sync::Filter;
+    let (mut app, _) = App::new(Some(60));
+    app.banner = None;
+    app.settings.connection = None;
+    let ids = with_a_sync(&mut app);
+    let _ = app.update(Message::TabSelected(Tab::Settings));
+    let _ = app.update(Message::TabSelected(Tab::Sync));
+    assert!(matches!(&app.screen, Screen::Browsing(Route::Sync { from }) if **from == Route::Settings));
+    let _ = app.view();
+
+    // A card per game, the failed one first; the save in sync only counted.
+    let cards: Vec<Option<i64>> = app.sync_groups().iter().map(|g| g.game.map(|g| g.rom_id)).collect();
+    assert_eq!(cards, [Some(ids[2]), Some(ids[0]), None]);
+    let _ = app.update(Message::Nav(Direction::Down));
+    assert_eq!(app.sync_focus.card, 1);
+
+    // The triggers walk the filters the run has anything for.
+    let _ = app.update(Message::CycleSystem(1));
+    assert_eq!((app.sync_focus.filter, app.sync_focus.card), (Filter::Up, 0), "Went up, from its first card");
+    let _ = app.update(Message::CycleSystem(-1));
+    assert_eq!(app.sync_focus.filter, Filter::All);
+    let _ = app.view();
+
+    // X syncs again — here, unpaired, it says why.
+    let _ = app.update(Message::Pad(Pad::Erase));
+    assert!(matches!(&app.save_sync, SaveSync::Failed(why) if why.contains("not paired")));
+    with_a_sync(&mut app);
+
+    // A on a game's card is its page; back from there is back here, and back again is Settings.
+    let _ = app.update(Message::Activate);
+    assert!(matches!(&app.screen, Screen::Browsing(Route::Detail { rom_id, .. }) if *rom_id == ids[2]));
+    let _ = app.update(Message::Back);
+    assert!(matches!(app.screen, Screen::Browsing(Route::Sync { .. })));
+    let _ = app.update(Message::Pad(Pad::Back));
+    assert!(matches!(app.screen, Screen::Browsing(Route::Settings)));
+}
+
+#[test]
+fn a_save_the_sync_only_named_is_put_with_its_game() {
+    use crate::sync::{Event, Happened, Report};
+    let (mut app, _) = App::new(Some(60));
+    let mut games: Vec<Game> = app.library.all_games().to_vec();
+    games[4].file_stems = vec![(games[4].rom_id, "Ember Blade (USA)".into())];
+    let game = games[4].clone();
+    app.library = Arc::new(Library::new(app.library.systems.clone(), games));
+    let mut report = Report {
+        events: vec![Event { rom_id: None, name: "Ember Blade (USA).srm".into(), state: false, happened: Happened::Failed("could not keep a copy".into()) }],
+        ..Default::default()
+    };
+    app.name_games(&mut report);
+    assert_eq!(report.events[0].rom_id, Some(game.rom_id));
+}
+
 #[test]
 fn syncing_saves_unpaired_says_why_instead_of_starting() {
     let (mut app, _) = App::new(Some(60));
@@ -2810,13 +2909,13 @@ fn every_destination_is_reached_with_the_shoulders_and_with_the_d_pad_alone() {
         Screen::Browsing(route) => route.tab(),
         _ => panic!("not browsing"),
     };
-    // The shoulders walk all six, wrapping.
+    // The shoulders walk all seven, wrapping: the header's icons in their order, the cloud among them.
     let mut seen = vec![tab(&app)];
-    for _ in 0..6 {
+    for _ in 0..7 {
         let _ = app.update(Message::Pad(Pad::NextTab));
         seen.push(tab(&app));
     }
-    assert_eq!(seen, [Tab::Home, Tab::Browse, Tab::Collections, Tab::Search, Tab::Downloads, Tab::Settings, Tab::Home]);
+    assert_eq!(seen, [Tab::Home, Tab::Browse, Tab::Collections, Tab::Search, Tab::Downloads, Tab::Sync, Tab::Settings, Tab::Home]);
     let _ = app.update(Message::Pad(Pad::PrevTab));
     assert_eq!(tab(&app), Tab::Settings);
 
@@ -2827,10 +2926,10 @@ fn every_destination_is_reached_with_the_shoulders_and_with_the_d_pad_alone() {
         let _ = app.update(Message::Pad(Pad::Nav(Direction::Up)));
     }
     assert_eq!(app.chrome, Some(Chrome::Tabs), "up off the top of Home is the bar");
-    for _ in 0..5 {
+    for _ in 0..6 {
         let _ = app.update(Message::Pad(Pad::Nav(Direction::Right)));
     }
-    assert_eq!(tab(&app), Tab::Settings, "Downloads and Settings are on the way");
+    assert_eq!(tab(&app), Tab::Settings, "Downloads, the save sync page and Settings are on the way");
     assert_eq!(app.chrome, Some(Chrome::Tabs), "the cursor stays on the bar while walking it");
     let _ = app.view();
     let _ = app.update(Message::Pad(Pad::Nav(Direction::Down)));

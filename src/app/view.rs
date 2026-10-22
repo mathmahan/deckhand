@@ -33,7 +33,7 @@ impl App {
             match route {
                 Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
                 Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
-                Route::Settings | Route::Collections => stack![crate::ui::home::plain_stage(), page].into(),
+                Route::Settings | Route::Collections | Route::Sync { .. } => stack![crate::ui::home::plain_stage(), page].into(),
                 Route::Detail { .. } => stack![self.detail_backdrop(), page].into(),
                 _ => page.into(),
             }
@@ -473,6 +473,7 @@ impl App {
     pub(super) fn browse_body<'a>(&'a self, route: &'a Route) -> Element<'a, Message> {
         match route {
             Route::Home => home_view(&self.home_context()),
+            Route::Sync { .. } => crate::ui::save_sync::save_sync_view(&self.save_sync_context()),
             Route::Collections => crate::ui::collections::collections_view(&crate::ui::collections::CollectionsContext {
                 kinds: self.all_collections.kinds(),
                 cards: self.collection_cards(),

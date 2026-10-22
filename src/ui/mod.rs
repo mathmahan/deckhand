@@ -10,6 +10,7 @@ pub mod home;
 pub mod login;
 pub mod picker;
 pub mod reveal;
+pub mod save_sync;
 pub mod saves;
 pub mod search;
 pub mod style;

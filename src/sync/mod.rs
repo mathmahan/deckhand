@@ -35,6 +35,7 @@ mod index;
 pub(crate) mod names;
 pub mod device;
 pub mod hash;
+pub mod progress;
 pub mod session;
 pub mod standalone;
 pub mod states;
@@ -208,6 +209,62 @@ pub struct Report {
     /// a sync's own writes are not read back as changes to sync again — and only those, leaving a
     /// save a game wrote while the sync ran the news it is. See [`crate::watch::Watcher::wrote`].
     pub written: Vec<PathBuf>,
+    /// What happened to each save and state, one entry each, in the order it happened — what the
+    /// save sync page lists, game by game. The lists above say the same in a line each.
+    pub events: Vec<Event>,
+}
+
+/// What happened to one save or state in a run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    /// The game whose save it is, where the run knew; None where only its name says — see
+    /// [`game_of`].
+    pub rom_id: Option<i64>,
+    /// Its name: the file here, or what it goes up to RomM as.
+    pub name: String,
+    /// A save state, rather than the game's own save.
+    pub state: bool,
+    pub happened: Happened,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Happened {
+    /// Sent up to RomM.
+    Up,
+    /// Brought down from RomM.
+    Down,
+    /// The same on both sides already.
+    InSync,
+    /// Changed here and on RomM: which side was kept, and where this device's went when RomM's was.
+    Settled { kept_here: bool, aside: Option<PathBuf> },
+    /// Removed on RomM; this device's copy was set aside here.
+    SetAside(PathBuf),
+    /// Left as it is, and why.
+    LeftAlone(String),
+    /// Could not be synced, and why.
+    Failed(String),
+}
+
+/// What a save RomM put off is left with.
+pub const PUT_OFF: &str = "RomM put it off; the next sync tries again";
+
+/// What a save no game in the library is named for is left with.
+pub const NO_GAME: &str = "No game in the library is named for it";
+
+/// What a save RomM has that this device has nowhere to put is left with.
+pub const NOWHERE: &str = "On RomM, but nothing here keeps saves for this game yet";
+
+/// The game a save named `name` is the save of, by the library's file stems, as a sweep matches
+/// them — for an [`Event`] the run could only name. None for no game, or several.
+pub fn game_of(builds: &[Build], name: &str) -> Option<i64> {
+    // The longest stem the name starts with, then a dot: a state's name runs on past the save's
+    // (`.slot2.retroarch.deckhand.state`), and a name can hold dots of its own (`Bros. 3`).
+    let name = name.to_lowercase();
+    let named = |b: &&Build| name.strip_prefix(&b.stem.to_lowercase()).is_some_and(|rest| rest.starts_with('.'));
+    let longest = builds.iter().filter(named).map(|b| b.stem.len()).max()?;
+    let mut found = builds.iter().filter(named).filter(|b| b.stem.len() == longest).map(|b| b.rom_id);
+    let first = found.next()?;
+    found.all(|other| other == first).then_some(first)
 }
 
 impl Report {
@@ -227,6 +284,60 @@ impl Report {
         self.notes.extend(other.notes);
         self.plays_recorded += other.plays_recorded;
         self.written.extend(other.written);
+        self.events.extend(other.events);
+    }
+
+    fn saw(&mut self, rom_id: Option<i64>, name: &str, state: bool, happened: Happened) {
+        self.events.push(Event { rom_id, name: name.to_string(), state, happened });
+    }
+
+    /// A save sent up.
+    pub(crate) fn up(&mut self, rom_id: Option<i64>, name: &str, state: bool) {
+        self.pushed.push(name.to_string());
+        self.saw(rom_id, name, state, Happened::Up);
+    }
+
+    /// A save brought down.
+    pub(crate) fn down(&mut self, rom_id: Option<i64>, name: &str, state: bool) {
+        self.pulled.push(name.to_string());
+        self.saw(rom_id, name, state, Happened::Down);
+    }
+
+    /// A save the same on both sides.
+    pub(crate) fn agreed(&mut self, rom_id: Option<i64>, name: &str, state: bool) {
+        self.in_sync += 1;
+        self.saw(rom_id, name, state, Happened::InSync);
+    }
+
+    /// A save that could not be synced, and why.
+    pub(crate) fn fail(&mut self, rom_id: Option<i64>, name: &str, state: bool, why: impl std::fmt::Display) {
+        let why = why.to_string();
+        self.failed.push(format!("{name}: {why}"));
+        self.saw(rom_id, name, state, Happened::Failed(why));
+    }
+
+    /// A save changed on both sides, settled — `said` in a line, for [`Report::conflicts`].
+    pub(crate) fn settled(&mut self, rom_id: Option<i64>, name: &str, state: bool, kept_here: bool, aside: Option<PathBuf>, said: String) {
+        self.conflicts.push(said);
+        self.saw(rom_id, name, state, Happened::Settled { kept_here, aside });
+    }
+
+    /// A push RomM put off.
+    pub(crate) fn put_off(&mut self, rom_id: Option<i64>, name: &str, state: bool) {
+        self.deferred.push(name.to_string());
+        self.saw(rom_id, name, state, Happened::LeftAlone(PUT_OFF.into()));
+    }
+
+    /// A save removed on RomM, this device's copy set aside at `kept` — `said` in a line, for
+    /// [`Report::removed`].
+    pub(crate) fn set_aside(&mut self, rom_id: Option<i64>, name: &str, kept: PathBuf, said: String) {
+        self.removed.push(said);
+        self.saw(rom_id, name, false, Happened::SetAside(kept));
+    }
+
+    /// A save left as it is, and why.
+    pub(crate) fn left(&mut self, rom_id: Option<i64>, name: &str, state: bool, why: String) {
+        self.saw(rom_id, name, state, Happened::LeftAlone(why));
     }
 
     /// One line, for the Settings row: only what happened, in the order it matters.
@@ -400,6 +511,9 @@ pub async fn run(
         Outcome::Done(report) => {
             let mut report = *report;
             report.folder = install.saves.clone();
+            for name in &unmatched {
+                report.left(None, name, false, NO_GAME.into());
+            }
             report.unmatched = unmatched;
             report.notes.extend(notes);
             if !report.homeless.is_empty() {
@@ -612,7 +726,9 @@ async fn sweep(
     let matcher = Matcher::new(builds);
     for save in &saves {
         let Match::One(rom_id) = rom_of(&matcher, &run.index, save) else {
-            run.report.unmatched.push(file_name(&save.path));
+            let name = file_name(&save.path);
+            run.report.left(None, &name, false, NO_GAME.into());
+            run.report.unmatched.push(name);
             continue;
         };
         run.stamp = matcher.stamp(rom_id);
@@ -862,10 +978,10 @@ impl<'a> Run<'a> {
     async fn fetch_new(&mut self, target: &LocalSave, rom_id: i64, server: &[SaveAsset]) {
         let name = file_name(&target.path);
         let Some(remote) = newest_on_server(server, &target.stem, &name) else { return };
-        if let Some(bytes) = self.download(remote, &name).await
+        if let Some(bytes) = self.download(remote, rom_id, &name).await
             && self.write(target, rom_id, remote, &bytes, &name)
         {
-            self.report.pulled.push(name);
+            self.report.down(Some(rom_id), &name, false);
         }
     }
 
@@ -873,23 +989,23 @@ impl<'a> Run<'a> {
         let name = file_name(&save.path);
         let local = match fs::read(&save.path) {
             Ok(bytes) => bytes,
-            Err(e) => return self.report.failed.push(format!("{name}: {e}")),
+            Err(e) => return self.report.fail(Some(rom_id), &name, false, e),
         };
         let hash = md5_hex(&local);
         let newest = newest_on_server(server, &save.stem, &name);
 
         match (plan(&hash, self.index.agreed(&save.path, rom_id, self.stamp.as_ref()), newest.map(|s| s.id)), newest) {
-            (Plan::InSync, _) => self.report.in_sync += 1,
+            (Plan::InSync, _) => self.report.agreed(Some(rom_id), &name, false),
             (Plan::Push, _) => {
                 if self.push(save, rom_id, &name, local, hash).await {
-                    self.report.pushed.push(name);
+                    self.report.up(Some(rom_id), &name, false);
                 }
             }
             (Plan::Pull, Some(remote)) => {
-                if let Some(bytes) = self.download(remote, &name).await
+                if let Some(bytes) = self.download(remote, rom_id, &name).await
                     && self.write(save, rom_id, remote, &bytes, &name)
                 {
-                    self.report.pulled.push(name);
+                    self.report.down(Some(rom_id), &name, false);
                 }
             }
             (Plan::Conflict, Some(remote)) => self.settle(save, rom_id, remote, local, hash, name).await,
@@ -908,12 +1024,12 @@ impl<'a> Run<'a> {
         hash: String,
         name: String,
     ) {
-        let Some(bytes) = self.download(remote, &name).await else { return };
+        let Some(bytes) = self.download(remote, rom_id, &name).await else { return };
         // The same progress on both sides — a save first seen on this device that another one had
         // already pushed, say. Agreeing on it costs nothing and moves no data.
         if md5_hex(&bytes) == hash {
             if self.remember(save, rom_id, hash, remote.id, &name) {
-                self.report.in_sync += 1;
+                self.report.agreed(Some(rom_id), &name, false);
                 self.acks.push(remote.id);
             }
             return;
@@ -925,10 +1041,11 @@ impl<'a> Run<'a> {
             // The local copy holds progress RomM has never seen, so it is set aside before it goes.
             let Some(kept) = self.back_up(&save.path, &local, &name) else { return };
             if self.write(save, rom_id, remote, &bytes, &name) {
-                self.report.conflicts.push(format!("{name}: kept RomM's copy; this device's is at {}", kept.display()));
+                let said = format!("{name}: kept RomM's copy; this device's is at {}", kept.display());
+                self.report.settled(Some(rom_id), &name, false, false, Some(kept), said);
             }
         } else if self.push(save, rom_id, &name, local, hash).await {
-            self.report.conflicts.push(format!("{name}: kept this device's copy; RomM keeps the other"));
+            self.report.settled(Some(rom_id), &name, false, true, None, format!("{name}: kept this device's copy; RomM keeps the other"));
         }
     }
 
@@ -936,21 +1053,21 @@ impl<'a> Run<'a> {
         match self.client.upload_save(self.connection, rom_id, &save.emulator, name, bytes).await {
             Ok(Some(created)) => self.remember(save, rom_id, hash, created.id, name),
             Ok(None) => {
-                self.report.deferred.push(name.to_string());
+                self.report.put_off(Some(rom_id), name, false);
                 false
             }
             Err(e) => {
-                self.report.failed.push(format!("{name}: {}", describe(&e)));
+                self.report.fail(Some(rom_id), name, false, describe(&e));
                 false
             }
         }
     }
 
-    async fn download(&mut self, remote: &SaveAsset, name: &str) -> Option<Vec<u8>> {
+    async fn download(&mut self, remote: &SaveAsset, rom_id: i64, name: &str) -> Option<Vec<u8>> {
         match self.client.download_save(self.connection, remote).await {
             Ok(bytes) => Some(bytes),
             Err(e) => {
-                self.report.failed.push(format!("{name}: {}", describe(&e)));
+                self.report.fail(Some(rom_id), name, false, describe(&e));
                 None
             }
         }
@@ -963,7 +1080,7 @@ impl<'a> Run<'a> {
     /// conflict weighs when the progress was made, not when it was copied here.
     fn write(&mut self, save: &LocalSave, rom_id: i64, remote: &SaveAsset, bytes: &[u8], name: &str) -> bool {
         if let Err(e) = write_atomic(&save.path, bytes) {
-            self.report.failed.push(format!("{name}: {e}"));
+            self.report.fail(Some(rom_id), name, false, e);
             return false;
         }
         if let Some(time) = remote.updated_at.as_deref().and_then(names::parse_timestamp)
@@ -997,7 +1114,7 @@ impl<'a> Run<'a> {
         match self.index.set(&save.path, Entry { rom_id, hash, save_id, stamp: self.stamp.clone(), ..Default::default() }) {
             Ok(()) => true,
             Err(e) => {
-                self.report.failed.push(format!("{name}: synced, but could not record it ({e})"));
+                self.report.fail(Some(rom_id), name, false, format!("synced, but could not record it ({e})"));
                 false
             }
         }
@@ -1011,7 +1128,7 @@ impl<'a> Run<'a> {
             Ok(kept) => Some(kept),
             Err(e) => {
                 // Without the copy the overwrite would lose the only one, so it does not happen.
-                self.report.failed.push(format!("{name}: could not keep a copy of {} ({e})", path.display()));
+                self.report.fail(None, name, false, format!("could not keep a copy of {} ({e})", path.display()));
                 None
             }
         }
@@ -1181,6 +1298,16 @@ mod tests {
         // Deleting a save on the server is a choice; re-uploading it unasked would undo it.
         assert_eq!(plan("aaa", Some(&entry("aaa", 10)), None), Plan::InSync);
         assert_eq!(plan("bbb", Some(&entry("aaa", 10)), None), Plan::Push);
+    }
+
+    #[test]
+    fn a_save_only_named_finds_its_game_by_the_librarys_stems() {
+        let builds = [build(1, "Chrono Trigger (USA)", "snes"), build(2, "Twin", "snes"), build(3, "Twin", "n64"), build(4, "Bros. 3", "nes"), build(5, "Bros", "nes")];
+        assert_eq!(game_of(&builds, "Chrono Trigger (USA).srm"), Some(1));
+        assert_eq!(game_of(&builds, "chrono trigger (usa).slot2.retroarch.deckhand.state"), Some(1), "a state's name, any case");
+        assert_eq!(game_of(&builds, "Twin.srm"), None, "two games named alike: neither");
+        assert_eq!(game_of(&builds, "Homebrew Thing.srm"), None);
+        assert_eq!(game_of(&builds, "Bros. 3.srm"), Some(4), "a name with a dot of its own, over a shorter one");
     }
 
     fn build(rom_id: i64, stem: &str, system: &str) -> Build {
@@ -1423,6 +1550,8 @@ mod tests {
         .await;
         let report = device.sync(host, &chrono()).await;
         assert_eq!(report.pushed, vec![format!("{CHRONO}.srm")], "{report:?}");
+        let sent = Event { rom_id: Some(1), name: format!("{CHRONO}.srm"), state: false, happened: Happened::Up };
+        assert_eq!(report.events, vec![sent], "what the page lists, by game");
         let upload = requests.lock().unwrap().iter().find(|r| r.starts_with("POST")).cloned().unwrap();
         assert!(upload.contains("rom_id=1") && upload.contains("slot=autosave"), "{upload}");
 
@@ -1431,6 +1560,7 @@ mod tests {
         let report = device.sync(host, &chrono()).await;
         assert_eq!(report.in_sync, 1, "{report:?}");
         assert!(report.pushed.is_empty() && report.pulled.is_empty(), "{report:?}");
+        assert_eq!(report.events.iter().map(|e| (e.rom_id, &e.happened)).collect::<Vec<_>>(), [(Some(1), &Happened::InSync)]);
     }
 
     #[tokio::test]

@@ -125,7 +125,10 @@ impl App {
                 let title = self.title_of(rom_id);
                 // What the sync after the game did: where the saves icon stands now, unless a sync of
                 // every save is under way, whose answer is newer.
-                let report = result.as_ref().ok().and_then(|session| session.report.clone());
+                let report = result.as_ref().ok().and_then(|session| session.report.clone()).map(|mut report| {
+                    self.name_games(&mut report);
+                    report
+                });
                 let pictureless = report.as_ref().is_some_and(|r| r.pictureless > 0);
                 if let Some(report) = report
                     && !matches!(self.save_sync, SaveSync::Running)

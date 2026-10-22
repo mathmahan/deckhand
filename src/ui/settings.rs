@@ -518,7 +518,12 @@ fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
         snap: true,
     })
     .on_press(Message::SyncNow);
-    card = card.push(press);
+    // What each save went through is the save sync page's — the header's cloud opens it too.
+    let details = button(text("Details").size(15.0).font(theme::SEMIBOLD))
+        .padding([10, 16])
+        .on_press(Message::TabSelected(crate::ui::tab_bar::Tab::Sync))
+        .style(crate::ui::style::spotlight(false, false));
+    card = card.push(row![press, details].spacing(10).align_y(Alignment::Center));
 
     container(card)
         .width(Length::Fixed(SYNC_CARD_W))
@@ -531,8 +536,8 @@ fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
         .into()
 }
 
-/// How long ago something was, the way the sync card says it.
-fn ago_words(ago: Duration) -> String {
+/// How long ago something was, the way the sync card and the save sync page say it.
+pub(crate) fn ago_words(ago: Duration) -> String {
     match ago.as_secs() {
         0..60 => "just now".to_string(),
         s @ 60..3600 => format!("{} min ago", s / 60),

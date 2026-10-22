@@ -55,6 +55,7 @@ impl App {
                 crate::focus::BrowseZone::Chips | crate::focus::BrowseZone::Rail => Task::none(),
             },
             Route::Detail { .. } => self.reveal_detail_cursor(),
+            Route::Sync { .. } => self.reveal_sync_cursor(),
             Route::Saves { rom_id, .. } => {
                 let row = self.saves_focus.row(self.saves_rows(*rom_id));
                 // Under the heading and the tabs, the list has most of the page.
@@ -181,6 +182,7 @@ impl App {
                 }
             }
             Route::Detail { .. } => self.navigate_detail(direction),
+            Route::Sync { .. } => self.navigate_sync(direction),
             Route::Search { .. } => {
                 let results = self.search_results().len();
                 if self.search_focus.step(direction, results) {
@@ -305,6 +307,7 @@ impl App {
                 }
             }
             Route::Detail { .. } => self.activate_detail(),
+            Route::Sync { .. } => self.activate_sync(),
             // An in-game save offers to come back; a state says where it is.
             Route::Saves { rom_id, .. } => self.press_save(rom_id),
             Route::Search { .. } => {
@@ -464,6 +467,7 @@ impl App {
                     self.read_hooks(),
                 ])
             }
+            Tab::Sync => self.open_sync(),
             Tab::Downloads => {
                 self.downloads_focus = Default::default();
                 self.screen = Screen::Browsing(Route::Downloads);
@@ -488,13 +492,14 @@ impl App {
             Pad::Erase if matches!(self.screen, Screen::Browsing(Route::Search { .. })) => {
                 Message::SearchKey(crate::search::BACKSPACE)
             }
-            // On Saves in Settings, Sync now: the X its card shows on the button.
+            // On Saves in Settings and on the save sync page, Sync now: the X their buttons show.
             Pad::Erase
                 if matches!(self.screen, Screen::Browsing(Route::Settings))
                     && self.settings_focus.section() == crate::ui::settings::Section::Saves =>
             {
                 Message::SyncNow
             }
+            Pad::Erase if matches!(self.screen, Screen::Browsing(Route::Sync { .. })) => Message::SyncNow,
             Pad::Erase => return Task::none(),
             Pad::PrevTab => Message::CycleTab(-1),
             Pad::NextTab => Message::CycleTab(1),
@@ -549,6 +554,10 @@ impl App {
                 return self.scroll_cursor_into_view();
             }
             return Task::none();
+        }
+        // Nor has the save sync page: they walk what the run did, a kind at a time.
+        if matches!(route, Route::Sync { .. }) {
+            return self.cycle_sync_filter(delta);
         }
         // Nor has Collections: they walk its kinds, the cursor staying in the band it is in.
         if *route == Route::Collections {

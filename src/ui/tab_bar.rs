@@ -26,13 +26,15 @@ pub enum Tab {
     Collections,
     Search,
     Downloads,
+    /// The save sync page, behind the header's cloud.
+    Sync,
     Settings,
 }
 
 impl Tab {
     /// Every destination, in the bar's order — what the shoulder buttons and the pad's Left/Right on
     /// the bar walk through.
-    pub const ALL: [Tab; 6] = [Tab::Home, Tab::Browse, Tab::Collections, Tab::Search, Tab::Downloads, Tab::Settings];
+    pub const ALL: [Tab; 7] = [Tab::Home, Tab::Browse, Tab::Collections, Tab::Search, Tab::Downloads, Tab::Sync, Tab::Settings];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -42,6 +44,7 @@ impl Tab {
             Tab::Collections => "Collections",
             Tab::Search => "Search",
             Tab::Downloads => "Downloads",
+            Tab::Sync => "Save sync",
             Tab::Settings => "Settings",
         }
     }
@@ -58,6 +61,7 @@ impl Tab {
             Tab::Collections => lucide::library_big(),
             Tab::Search => lucide::search(),
             Tab::Downloads => lucide::download(),
+            Tab::Sync => lucide::cloud(),
             Tab::Settings => lucide::settings(),
         }
     }
@@ -101,7 +105,7 @@ pub fn tab_bar<'a>(current: Tab, focused: bool, status: Status) -> Element<'a, M
 
     let pill = container(places).padding(5).style(glass_pill);
 
-    let right = row![downloads_icon(current, focused, status.downloads), saves_icon(status.saves), gear(current, focused)]
+    let right = row![downloads_icon(current, focused, status.downloads), saves_icon(current, focused, status.saves), gear(current, focused)]
         .spacing(10)
         .align_y(Alignment::Center);
 
@@ -198,7 +202,8 @@ fn meter<'a>(progress: f32, selected: bool) -> Element<'a, Message> {
 /// then its colour and shape say how the last sync went, and the tooltip says it in words.
 /// Information, not a destination: there is nothing to press, and the pad's walk along the bar
 /// passes it by.
-fn saves_icon<'a>(saves: Saves) -> Element<'a, Message> {
+fn saves_icon<'a>(current: Tab, focused: bool, saves: Saves) -> Element<'a, Message> {
+    let selected = current == Tab::Sync;
     let (sign, color, words) = match saves {
         Saves::Quiet => (lucide::cloud(), alpha(theme::INK, 0.5), "No saves synced yet"),
         Saves::Syncing => (lucide::refresh_cw(), theme::ACCENT_400, "Syncing saves"),
@@ -206,7 +211,14 @@ fn saves_icon<'a>(saves: Saves) -> Element<'a, Message> {
         Saves::Attention => (lucide::cloud_alert(), theme::WARNING, "Saves need a look"),
         Saves::Failed => (lucide::cloud_off(), theme::ERROR, "Save sync failed"),
     };
-    let icon = container(sign.size(18.0).color(color)).center(Length::Fixed(ICON)).style(glass_pill);
+    // On the ink's fill, the sign goes dark, as the downloads arrow does.
+    let sign = if selected { sign.size(18.0) } else { sign.size(18.0).color(color) };
+    let icon = button(container(sign).center(Length::Fill))
+        .width(Length::Fixed(ICON))
+        .height(Length::Fixed(ICON))
+        .padding(0)
+        .on_press(Message::TabSelected(Tab::Sync))
+        .style(pill_style(selected, selected && focused, true));
     tip(icon, words.into())
 }
 

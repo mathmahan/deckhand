@@ -326,10 +326,11 @@ pub async fn sync(
         run.recall(&mut thread);
         match thread.held() {
             Ok(held) => local.push((thread, held)),
-            Err(e) => run.report.failed.push(format!("{}: {e}", thread.name)),
+            Err(e) => run.report.fail(Some(thread.rom_id), &thread.name, false, e),
         }
     }
 
+    super::progress::begin(local.len());
     let mut roms: Vec<i64> = scope.iter().copied().chain(local.iter().map(|(t, _)| t.rom_id)).collect();
     roms.sort_unstable();
     roms.dedup();
@@ -426,14 +427,16 @@ pub async fn sync(
                             decided.insert(local.len() - 1);
                             todo.push((local.len() - 1, Some(op.clone())));
                         }
-                        Err(e) => run.report.failed.push(format!("{}: {e}", thread.name)),
+                        Err(e) => run.report.fail(Some(thread.rom_id), &thread.name, false, e),
                     },
                     // Nowhere to put it: worth saying when it is this game's kind of save, or the game
                     // has no place here for one at all — not for another client's other files.
                     None => {
                         let mine = local.iter().filter(|(t, _)| t.rom_id == op.rom_id).collect::<Vec<_>>();
                         if op.action == "download" && (mine.is_empty() || mine.iter().any(|(t, _)| same_kind(t, &op.file_name))) {
-                            homeless.push(names::canonical(&op.file_name));
+                            let name = names::canonical(&op.file_name);
+                            run.report.left(Some(op.rom_id), &name, false, super::NOWHERE.into());
+                            homeless.push(name);
                         }
                     }
                 },
@@ -465,6 +468,7 @@ pub async fn sync(
         }
         for (i, op) in todo {
             let (thread, held) = &local[i];
+            super::progress::at(thread.rom_id);
             match (op, &versions) {
                 (Some(op), _) => run.apply(&op, thread, held.as_ref(), false).await,
                 (None, Ok(versions)) => run.apply(&by_name_op(thread, versions), thread, held.as_ref(), true).await,
@@ -474,6 +478,7 @@ pub async fn sync(
                     run.fail(thread, format!("RomM's other saves for it could not be read ({why})"));
                 }
             }
+            super::progress::step();
         }
 
         let (done, failed) = run.counts;
@@ -587,7 +592,7 @@ pub async fn restore(client: &RommClient, conn: &Connection, store: &Path, threa
     };
     match run.push(&op, thread, held.as_ref(), true).await {
         Went::Up => {
-            run.report.pushed.push(thread.name.clone());
+            run.report.up(Some(thread.rom_id), &thread.name, false);
             Ok(run.report)
         }
         _ => Err(failed(&run)),
@@ -983,18 +988,21 @@ impl<'a> Run<'a> {
             Step::Agree { confirm } => self.agree(op, thread, held, baseline.as_ref(), confirm).await,
             Step::Upload => {
                 if self.push(op, thread, held, false).await == Went::Up {
-                    self.report.pushed.push(thread.name.clone());
+                    self.report.up(Some(thread.rom_id), &thread.name, false);
                 }
             }
             Step::Download => {
                 if self.pull(op, thread, held).await {
-                    self.report.pulled.push(thread.name.clone());
+                    self.report.down(Some(thread.rom_id), &thread.name, false);
                 }
             }
             Step::Conflict => self.settle(op, thread, held).await,
             Step::Remove => self.remove(thread),
             Step::Leave("") => {}
-            Step::Leave(why) => self.report.notes.push(format!("{}: {why}", thread.name)),
+            Step::Leave(why) => {
+                self.report.left(Some(thread.rom_id), &thread.name, false, why.to_string());
+                self.report.notes.push(format!("{}: {why}", thread.name));
+            }
         }
     }
 
@@ -1002,7 +1010,7 @@ impl<'a> Run<'a> {
     /// on either side since the last agreement — and acknowledged to RomM when it has not been.
     async fn agree(&mut self, op: &SyncOperation, thread: &Thread, held: Option<&Held>, baseline: Option<&Entry>, confirm: bool) {
         let Some(held) = held else { return };
-        self.report.in_sync += 1;
+        self.report.agreed(Some(thread.rom_id), &thread.name, false);
         let identical = op.server_content_hash.as_deref().is_some_and(|h| held.is(h));
         let version = match (identical, op.save_id, baseline) {
             (true, Some(save_id), _) => {
@@ -1143,7 +1151,7 @@ impl<'a> Run<'a> {
         let version = Version { save_id, synced_at: op.server_updated_at.clone(), server_hash };
         self.remember(thread, hash, version, confirmed, Some(&written));
         if nothing {
-            self.report.in_sync += 1;
+            self.report.agreed(Some(thread.rom_id), &thread.name, false);
         }
         !nothing
     }
@@ -1154,7 +1162,7 @@ impl<'a> Run<'a> {
     async fn settle(&mut self, op: &SyncOperation, thread: &Thread, held: Option<&Held>) {
         let Some(held) = held else {
             if self.pull(op, thread, None).await {
-                self.report.pulled.push(thread.name.clone());
+                self.report.down(Some(thread.rom_id), &thread.name, false);
             }
             return;
         };
@@ -1163,7 +1171,7 @@ impl<'a> Run<'a> {
         // since, say. Its copy is in that history, so nothing is set aside.
         if self.behind(op, thread, held).await {
             if self.pull(op, thread, None).await {
-                self.report.pulled.push(thread.name.clone());
+                self.report.down(Some(thread.rom_id), &thread.name, false);
             }
             return;
         }
@@ -1172,13 +1180,15 @@ impl<'a> Run<'a> {
         match super::choose(&name, held.modified, remote_time, held.bytes).await {
             Choice::Local => {
                 if self.push(op, thread, Some(held), true).await == Went::Up {
-                    self.report.conflicts.push(format!("{name}: kept this device's copy; RomM keeps the other in its history"));
+                    let said = format!("{name}: kept this device's copy; RomM keeps the other in its history");
+                    self.report.settled(Some(thread.rom_id), &name, false, true, None, said);
                 }
             }
             Choice::Remote => {
                 let Some(kept) = self.set_aside(thread) else { return };
                 if self.pull(op, thread, None).await {
-                    self.report.conflicts.push(format!("{name}: kept RomM's copy; this device's is at {}", kept.display()));
+                    let said = format!("{name}: kept RomM's copy; this device's is at {}", kept.display());
+                    self.report.settled(Some(thread.rom_id), &name, false, false, Some(kept), said);
                 }
             }
         }
@@ -1208,10 +1218,11 @@ impl<'a> Run<'a> {
         self.report.written.extend(thread.paths());
         let key = thread.key();
         if let Err(e) = self.index(thread).remove(&key) {
-            self.report.failed.push(format!("{}: removed, but could not record it ({e})", thread.name));
+            self.report.fail(Some(thread.rom_id), &thread.name, false, format!("removed, but could not record it ({e})"));
         }
         self.counts.0 += 1;
-        self.report.removed.push(format!("{}: removed on RomM; this device's copy is at {}", thread.name, kept.display()));
+        let said = format!("{}: removed on RomM; this device's copy is at {}", thread.name, kept.display());
+        self.report.set_aside(Some(thread.rom_id), &thread.name, kept, said);
     }
 
     /// Copy the local save into the backups. None — and so nothing overwritten — when that fails.
@@ -1241,13 +1252,13 @@ impl<'a> Run<'a> {
         };
         let key = thread.key();
         if let Err(e) = self.index(thread).set(&key, entry) {
-            self.report.failed.push(format!("{}: synced, but could not record it ({e})", thread.name));
+            self.report.fail(Some(thread.rom_id), &thread.name, false, format!("synced, but could not record it ({e})"));
         }
     }
 
     fn fail(&mut self, thread: &Thread, why: impl std::fmt::Display) -> Went {
         self.counts.1 += 1;
-        self.report.failed.push(format!("{}: {why}", thread.name));
+        self.report.fail(Some(thread.rom_id), &thread.name, false, why);
         Went::Not
     }
 
