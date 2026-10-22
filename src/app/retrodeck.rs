@@ -33,12 +33,7 @@ impl App {
             return Task::none();
         }
         self.retrodeck = look.presence == Presence::Ready;
-        let later = Row {
-            label: "Not now".into(),
-            detail: "Settings ▸ Playing ▸ Default emulator offers it again".into(),
-            aside: String::new(),
-            mark: None,
-        };
+        let later = Row::new("Not now", "Settings ▸ Playing ▸ Default emulator offers it again");
         let (title, note, yes) = match (look.presence, look.scope) {
             (Presence::Ready, _) => {
                 if offering == Offering::Asked {
@@ -51,7 +46,7 @@ impl App {
                 "RetroDECK is installed, but hasn't been set up yet. It opens for its first-run setup, where \
                  you choose where it keeps its files. Close it once that's done, and Deckhand takes it from there."
                     .to_string(),
-                Row { label: "Open RetroDECK".into(), detail: "Its first-run setup".into(), aside: String::new(), mark: None },
+                Row::new("Open RetroDECK", "Its first-run setup"),
             ),
             (Presence::Missing, None) => {
                 if offering != Offering::Pairing {
@@ -93,7 +88,7 @@ impl App {
             picker: crate::ui::picker::Picker { title: title.into(), note, rows: vec![yes, later], cursor: 0 },
             then: Then::RetroDeck(look.scope),
         });
-        iced::widget::operation::scroll_to(crate::ui::picker::list_id(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 })
+        crate::ui::picker::scroll_to(0)
     }
 
     /// Install RetroDECK into `scope`, then open it for its first-run setup. Its progress shows in
@@ -188,12 +183,11 @@ impl App {
     /// Ask whether to stop RetroDECK's install, which a press on its row in Settings does.
     pub(super) fn ask_to_stop_retrodeck(&mut self) -> Task<Message> {
         use crate::ui::picker::Row;
-        let row = |label: &str, detail: &str| Row { label: label.into(), detail: detail.into(), aside: String::new(), mark: None };
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
                 title: "Stop installing RetroDECK?".into(),
                 note: "What it has downloaded so far is kept by Flatpak, so installing it again carries on from there.".into(),
-                rows: vec![row("Stop the install", ""), row("Keep installing", "")],
+                rows: vec![Row::new("Stop the install", ""), Row::new("Keep installing", "")],
                 cursor: 1,
             },
             then: Then::StopRetroDeck,
@@ -217,8 +211,8 @@ impl App {
                        saves with RomM all the same, and sends their play time."
                     .into(),
                 rows: vec![
-                    Row { label: "Install ES-DE's hooks".into(), detail: "Settings ▸ Saves ▸ ES-DE launches takes them off again".into(), aside: String::new(), mark: None },
-                    Row { label: "Not now".into(), detail: String::new(), aside: String::new(), mark: None },
+                    Row::new("Install ES-DE's hooks", "Settings ▸ Saves ▸ ES-DE launches takes them off again"),
+                    Row::new("Not now", ""),
                 ],
                 cursor: 0,
             },

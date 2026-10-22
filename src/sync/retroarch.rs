@@ -554,7 +554,7 @@ pub fn turn_on_state_pictures(config: &Path, running: impl Fn() -> bool) -> Resu
 /// Whether RetroArch is up, a Flatpak's included. Unknown reads as yes: the caller then leaves its
 /// config alone, which loses a setting rather than the user's.
 pub fn retroarch_running() -> bool {
-    std::process::Command::new("pgrep").args(["-x", "retroarch"]).output().map_or(true, |o| o.status.success())
+    crate::processes::running("retroarch").unwrap_or(true)
 }
 
 /// What the config at `config` sets `key` to, read now. None when it says nothing of it, or cannot be

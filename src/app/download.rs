@@ -137,7 +137,7 @@ impl App {
             },
             then: Then::Download { tile, choices },
         });
-        iced::widget::operation::scroll_to(crate::ui::picker::list_id(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: crate::ui::picker::scroll_offset(cursor) })
+        crate::ui::picker::scroll_to(cursor)
     }
 
     /// Queue one of the choices Download offered for `game`.
@@ -209,7 +209,7 @@ impl App {
                 let title = self.title_of(rom_id);
                 let rows = builds
                     .iter()
-                    .map(|(_, name)| crate::ui::picker::Row { label: name.clone(), detail: String::new(), aside: String::new(), mark: None })
+                    .map(|(_, name)| crate::ui::picker::Row::new(name.clone(), ""))
                     .collect();
                 self.pick = Some(PendingPick {
                     picker: crate::ui::picker::Picker {
@@ -272,5 +272,36 @@ impl App {
             format!("\"{title}\" is unpinned.")
         });
         Task::none()
+    }
+
+    /// A button on the game page on screen: done, or the reason it cannot be.
+    pub(super) fn detail_action(&mut self, action: crate::ui::detail::Action) -> Task<Message> {
+        use crate::ui::detail::Action;
+        let Screen::Browsing(Route::Detail { rom_id, .. }) = &self.screen else {
+            return Task::none();
+        };
+        let rom_id = *rom_id;
+        let state = self.game_state(rom_id);
+        let missing = self.game_of(rom_id).is_some_and(Game::missing);
+        // What the button says it will do is what it does — including saying why it
+        // cannot, which is the honest half of an action row this build only half has.
+        if let Some(reason) = action.pending_reason(&state, missing) {
+            let title = self.title_of(rom_id);
+            self.say(format!("\"{title}\" {reason}."));
+            return Task::none();
+        }
+        match action {
+            Action::Download if state == crate::downloads::SyncState::UpdateAvailable => self.update_game(rom_id),
+            Action::Download if state.is_here() => self.play_game(rom_id),
+            Action::Download => self.download_game(rom_id),
+            Action::Remove => self.remove_game(rom_id),
+            Action::Pin => self.toggle_pin(rom_id),
+            Action::Steam => self.press_steam(rom_id),
+            Action::Saves => self.update(Message::OpenSaves(rom_id)),
+            Action::Extras => self.press_extras(rom_id),
+            Action::Favourite => self.toggle_favourite(rom_id),
+            // This returned a reason above.
+            Action::LaunchWith => Task::none(),
+        }
     }
 }

@@ -91,7 +91,7 @@ impl App {
             },
             then: Then::Extras { rom_id: build, extras },
         });
-        iced::widget::operation::scroll_to(crate::ui::picker::list_id(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 })
+        crate::ui::picker::scroll_to(0)
     }
 
     /// The extra picked: fetched into the build here, or taken off this device when it is here.

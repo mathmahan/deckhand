@@ -1,6 +1,7 @@
 //! Collections, and what Browse shows.
 
 use super::*;
+use crate::ui::picker::Row;
 
 impl App {
     /// Open a system's or a collection's grid.
@@ -323,7 +324,6 @@ impl App {
             [rom_id] => format!("\"{}\"", self.title_of(*rom_id)),
             many => format!("{} games", many.len()),
         };
-        let row = |label: &str, detail: &str| crate::ui::picker::Row { label: label.into(), detail: detail.into(), aside: String::new(), mark: None };
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
                 title: if !add {
@@ -336,7 +336,7 @@ impl App {
                 note: "Steam keeps its library in memory and writes it out as it closes, so it has to close for this — \
                        it opens again straight after."
                     .into(),
-                rows: vec![row("Close Steam and go on", "It opens again by itself"), row("Not now", "Steam stays as it is")],
+                rows: vec![Row::new("Close Steam and go on", "It opens again by itself"), Row::new("Not now", "Steam stays as it is")],
                 cursor: 0,
             },
             then: Then::Steam { games, add },
@@ -463,7 +463,6 @@ impl App {
             .as_deref()
             .map(|t| t.replace('T', " ").chars().take(16).collect::<String>())
             .unwrap_or_else(|| "an unknown time".into());
-        let row = |label: &str, detail: &str| crate::ui::picker::Row { label: label.into(), detail: detail.into(), aside: String::new(), mark: None };
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
                 title: "Restore this save?".into(),
@@ -473,8 +472,8 @@ impl App {
                     record.file_name
                 ),
                 rows: vec![
-                    row("Restore it", "Play on from this version"),
-                    row("Keep the one here", "Change nothing"),
+                    Row::new("Restore it", "Play on from this version"),
+                    Row::new("Keep the one here", "Change nothing"),
                 ],
                 // The safe answer first under the cursor: this replaces progress.
                 cursor: 1,
@@ -519,7 +518,6 @@ impl App {
             .as_deref()
             .map(|t| t.replace('T', " ").chars().take(16).collect::<String>())
             .unwrap_or_else(|| "an unknown time".into());
-        let row = |label: &str, detail: &str| crate::ui::picker::Row { label: label.into(), detail: detail.into(), aside: String::new(), mark: None };
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
                 title: "Put this state into a slot?".into(),
@@ -529,10 +527,10 @@ impl App {
                     record.file_name
                 ),
                 rows: vec![
-                    row("The next free slot", "Past every slot here and on RomM: nothing is replaced"),
-                    row("Slot 0", "Takes the place of what's in it"),
-                    row("The auto slot", "What RetroArch loads by itself on start, with that turned on"),
-                    row("Leave it", "Change nothing"),
+                    Row::new("The next free slot", "Past every slot here and on RomM: nothing is replaced"),
+                    Row::new("Slot 0", "Takes the place of what's in it"),
+                    Row::new("The auto slot", "What RetroArch loads by itself on start, with that turned on"),
+                    Row::new("Leave it", "Change nothing"),
                 ],
                 // The one that replaces nothing.
                 cursor: 0,
@@ -638,6 +636,168 @@ impl App {
                 changed,
             ),
             Message::SavesSynced,
+        )
+    }
+
+    /// RomM's answer about the user's own collections, and their favourites among them.
+    pub(super) fn own_collections_loaded(&mut self, edits: u64, result: Result<(Vec<Collection>, Option<Vec<Collection>>), String>) -> Task<Message> {
+        // A failure leaves the ones on screen, which the library load read a while ago.
+        let Ok((own, smart)) = result else { return Task::none() };
+        // A favourite pressed since the question went out, or still on its way, is ahead of
+        // this answer: the favourites held here stay, and only the rest is taken.
+        let behind = edits != self.favourite_edits || !self.favouriting.is_empty();
+        let own: Vec<Collection> = if behind {
+            let held = self.collections.iter().filter(|c| c.is_favorite).cloned();
+            own.into_iter().filter(|c| !c.is_favorite).chain(held).collect()
+        } else {
+            own
+        };
+        let mut changed = false;
+        if own != self.collections {
+            if !behind {
+                self.favourites = favourites_of(&own);
+            }
+            self.collections = own;
+            // Home has a shelf per collection of the player's.
+            self.rebuild_shelves();
+            changed = true;
+        }
+        if let (Some(smart), Some(Ok((held, _)))) = (smart, &mut self.collection_sources)
+            && smart != *held
+        {
+            *held = smart;
+            changed = true;
+        }
+        if !changed {
+            return Task::none();
+        }
+        self.rebuild_collections();
+        self.fetch_art()
+    }
+
+    /// RomM's answer to a favourite being set or cleared.
+    pub(super) fn favourite_changed(&mut self, tile: i64, adding: bool, ids: Vec<i64>, result: Result<Collection, String>) -> Task<Message> {
+        self.favouriting.remove(&tile);
+        // A list of collections asked for while this was on its way may predate it.
+        self.favourite_edits += 1;
+        match result {
+            // RomM's collection as it now is: whatever else changed in it meanwhile, from
+            // another device or the web app, comes with it.
+            Ok(mut collection) => {
+                collection.is_favorite = true;
+                match self.collections.iter_mut().find(|c| c.id == collection.id) {
+                    Some(held) => *held = collection,
+                    None => self.collections.push(collection),
+                }
+                self.favourites = favourites_of(&self.collections);
+            }
+            Err(why) => {
+                for id in ids {
+                    if adding {
+                        self.favourites.remove(&id);
+                    } else {
+                        self.favourites.insert(id);
+                    }
+                }
+                let title = self.title_of(tile);
+                self.say(format!("\"{title}\" could not be {} favourites: {why}", if adding { "added to" } else { "taken out of" }));
+            }
+        }
+        self.rebuild_collections();
+        Task::none()
+    }
+
+    /// Games put in Steam's library or taken out of it, and how that went.
+    pub(super) fn steam_changed(&mut self, add: bool, games: Vec<(i64, u32)>, restarted: bool, result: Result<crate::steam::Gaps, String>) -> Task<Message> {
+        match result {
+            Ok(gaps) => {
+                let host = self.host().to_string();
+                for (rom_id, appid) in &games {
+                    if add {
+                        self.steam_bindings.bind(&host, *rom_id, *appid);
+                    } else {
+                        self.steam_bindings.unbind(&host, *rom_id);
+                    }
+                }
+                if self.writes_settings {
+                    self.steam_bindings.save();
+                }
+                let what = match games.as_slice() {
+                    [(rom_id, _)] => format!("\"{}\" is", self.title_of(*rom_id)),
+                    many => format!("{} games are", many.len()),
+                };
+                let restart = if restarted { " Steam is starting again." } else { "" };
+                self.say(if add {
+                    let gaps = gaps.sentence(games.len()).map(|s| format!(" {s}")).unwrap_or_default();
+                    format!("{what} in Steam's library, with RomM's art, and start through Deckhand.{gaps}{restart}")
+                } else {
+                    format!("{what} out of Steam's library.{restart}")
+                });
+            }
+            Err(why) => self.say(format!("Steam's library was not changed: {why}")),
+        }
+        Task::none()
+    }
+
+    /// A save sync from the window is over: what it did, or why it could not run.
+    pub(super) fn saves_synced(&mut self, result: Result<crate::sync::Report, String>) -> Task<Message> {
+        let failed = result.is_err();
+        let mut pictureless = false;
+        self.save_sync = match result {
+            Ok(report) => {
+                // What the sync wrote is where things stand now, not a change to sync again.
+                // Only what it wrote: a game running outside Deckhand may have written its
+                // own save while this ran, and that is still news.
+                self.watcher.wrote(&report.written);
+                self.save_folder = Some(Ok(report.folder.clone()));
+                pictureless = report.pictureless > 0;
+                SaveSync::Done(Box::new(report))
+            }
+            Err(why) => {
+                // Nothing came back to say what it wrote, so the next look starts afresh.
+                self.watcher.rebase();
+                SaveSync::Failed(why)
+            }
+        };
+        // A sync RomM turned away because it no longer knows this device registers it again
+        // here — see [`crate::sync::device`]. Without this the window would go on failing the
+        // same way until it was restarted, since it only registers as it opens.
+        let offer = if pictureless { self.offer_state_pictures() } else { Task::none() };
+        Task::batch([if failed { self.ensure_device() } else { Task::none() }, offer])
+    }
+
+    /// The save watcher's tick: look over the save folders for changes, unless a look, a game or a
+    /// sync is under way.
+    pub(super) fn watch_tick(&mut self) -> Task<Message> {
+        if self.looking || self.playing.is_some() || matches!(self.save_sync, SaveSync::Running) {
+            return Task::none();
+        }
+        self.looking = true;
+        // Which folders to look over is worked out from RetroArch's config and the download
+        // records — read off the disk, so kept for a minute rather than read every tick, and
+        // read again sooner when the config chosen or the games here change.
+        let fingerprint = (self.settings.retroarch_config.clone(), self.downloads.installed_fingerprint());
+        let known = self
+            .watch_folders
+            .as_ref()
+            .filter(|(_, at, of)| at.elapsed() < WATCH_FOLDERS_FOR && *of == fingerprint)
+            .map(|(folders, _, _)| folders.clone());
+        let (chosen, store) = (self.settings.retroarch_config.clone(), Settings::config_dir());
+        Task::perform(
+            async move {
+                off_thread(move || {
+                    let found = known.is_none().then(|| {
+                        crate::sync::retroarch::locate(chosen.as_deref())
+                            .map(|install| install.with_content_dirs(crate::downloads::content_dirs(&store)).watched())
+                            .unwrap_or_default()
+                    });
+                    let seen = crate::watch::snapshot(known.as_deref().or(found.as_deref()).unwrap_or_default());
+                    (found.map(|folders| (folders, fingerprint)), seen)
+                })
+                .await
+                .unwrap_or_default()
+            },
+            |(found, seen)| Message::WatchScanned(found, seen),
         )
     }
 }

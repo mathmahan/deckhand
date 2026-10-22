@@ -150,40 +150,7 @@ impl App {
                 // The cards' covers are known now.
                 self.fetch_art()
             }
-            Message::OwnCollectionsLoaded { edits, result } => {
-                // A failure leaves the ones on screen, which the library load read a while ago.
-                let Ok((own, smart)) = result else { return Task::none() };
-                // A favourite pressed since the question went out, or still on its way, is ahead of
-                // this answer: the favourites held here stay, and only the rest is taken.
-                let behind = edits != self.favourite_edits || !self.favouriting.is_empty();
-                let own: Vec<Collection> = if behind {
-                    let held = self.collections.iter().filter(|c| c.is_favorite).cloned();
-                    own.into_iter().filter(|c| !c.is_favorite).chain(held).collect()
-                } else {
-                    own
-                };
-                let mut changed = false;
-                if own != self.collections {
-                    if !behind {
-                        self.favourites = favourites_of(&own);
-                    }
-                    self.collections = own;
-                    // Home has a shelf per collection of the player's.
-                    self.rebuild_shelves();
-                    changed = true;
-                }
-                if let (Some(smart), Some(Ok((held, _)))) = (smart, &mut self.collection_sources)
-                    && smart != *held
-                {
-                    *held = smart;
-                    changed = true;
-                }
-                if !changed {
-                    return Task::none();
-                }
-                self.rebuild_collections();
-                self.fetch_art()
-            }
+            Message::OwnCollectionsLoaded { edits, result } => self.own_collections_loaded(edits, result),
             Message::CollectionsScrolled(offset) => {
                 self.scrolls = self.scrolls.wrapping_add(1);
                 let offset = offset.max(0.0);
@@ -215,35 +182,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::Pad(pad) => {
-                use crate::gamepad::Pad;
-                // A game has the pad while it runs, and RetroDECK while it is open for its setup.
-                // Without this every button pressed there would also walk the grid behind it.
-                if self.playing.is_some() || self.retrodeck_setup == RetroDeckSetup::SettingUp {
-                    return Task::none();
-                }
-                let message = match pad {
-                    Pad::Nav(direction) => Message::Nav(direction),
-                    Pad::Confirm => Message::Activate,
-                    Pad::Back => Message::Dismiss,
-                    Pad::Search => Message::OpenSearch,
-                    Pad::Erase if matches!(self.screen, Screen::Browsing(Route::Search { .. })) => {
-                        Message::SearchKey(crate::search::BACKSPACE)
-                    }
-                    // On Home, the spotlit game's saves and states: the X the spotlight shows beside
-                    // the button.
-                    Pad::Erase => return Task::none(),
-                    Pad::PrevTab => Message::CycleTab(-1),
-                    Pad::NextTab => Message::CycleTab(1),
-                    Pad::PrevSystem => Message::CycleSystem(-1),
-                    Pad::NextSystem => Message::CycleSystem(1),
-                    // Settings and Downloads in one press, wherever the cursor is — the shoulders
-                    // reach them too, a few tabs along.
-                    Pad::Start => Message::TabSelected(Tab::Settings),
-                    Pad::Select => Message::TabSelected(Tab::Downloads),
-                };
-                self.update(message)
-            }
+            Message::Pad(pad) => self.on_pad(pad),
             Message::OpenSaves(rom_id) => {
                 let from = match &self.screen {
                     Screen::Browsing(route) => route.clone(),
@@ -282,36 +221,7 @@ impl App {
                 self.saves_focus.focus(row);
                 Task::none()
             }
-            Message::SteamChanged { add, games, restarted, result } => {
-                match result {
-                    Ok(gaps) => {
-                        let host = self.host().to_string();
-                        for (rom_id, appid) in &games {
-                            if add {
-                                self.steam_bindings.bind(&host, *rom_id, *appid);
-                            } else {
-                                self.steam_bindings.unbind(&host, *rom_id);
-                            }
-                        }
-                        if self.writes_settings {
-                            self.steam_bindings.save();
-                        }
-                        let what = match games.as_slice() {
-                            [(rom_id, _)] => format!("\"{}\" is", self.title_of(*rom_id)),
-                            many => format!("{} games are", many.len()),
-                        };
-                        let restart = if restarted { " Steam is starting again." } else { "" };
-                        self.say(if add {
-                            let gaps = gaps.sentence(games.len()).map(|s| format!(" {s}")).unwrap_or_default();
-                            format!("{what} in Steam's library, with RomM's art, and start through Deckhand.{gaps}{restart}")
-                        } else {
-                            format!("{what} out of Steam's library.{restart}")
-                        });
-                    }
-                    Err(why) => self.say(format!("Steam's library was not changed: {why}")),
-                }
-                Task::none()
-            }
+            Message::SteamChanged { add, games, restarted, result } => self.steam_changed(add, games, restarted, result),
             Message::SaveRestored(tile, result) => {
                 match &result {
                     Ok(report) => self.watcher.wrote(&report.written),
@@ -413,178 +323,10 @@ impl App {
                     self.fetch_art(),
                 ])
             }
-            Message::DetailAction(action) => {
-                use crate::ui::detail::Action;
-                let Screen::Browsing(Route::Detail { rom_id, .. }) = &self.screen else {
-                    return Task::none();
-                };
-                let rom_id = *rom_id;
-                let state = self.game_state(rom_id);
-                let missing = self.game_of(rom_id).is_some_and(Game::missing);
-                // What the button says it will do is what it does — including saying why it
-                // cannot, which is the honest half of an action row this build only half has.
-                if let Some(reason) = action.pending_reason(&state, missing) {
-                    let title = self.title_of(rom_id);
-                    self.say(format!("\"{title}\" {reason}."));
-                    return Task::none();
-                }
-                match action {
-                    Action::Download if state == crate::downloads::SyncState::UpdateAvailable => self.update_game(rom_id),
-                    Action::Download if state.is_here() => self.play_game(rom_id),
-                    Action::Download => self.download_game(rom_id),
-                    Action::Remove => self.remove_game(rom_id),
-                    Action::Pin => self.toggle_pin(rom_id),
-                    Action::Steam => self.press_steam(rom_id),
-                    Action::Saves => self.update(Message::OpenSaves(rom_id)),
-                    Action::Extras => self.press_extras(rom_id),
-                    Action::Favourite => self.toggle_favourite(rom_id),
-                    // This returned a reason above.
-                    Action::LaunchWith => Task::none(),
-                }
-            }
-            Message::TabSelected(tab) => {
-                self.chrome = None;
-                let current = match &self.screen {
-                    Screen::Browsing(route) => route.tab(),
-                    _ => return Task::none(),
-                };
-                // Pressing the tab you are already on takes you back to the top of it — the same
-                // thing a tab bar does everywhere else, and the fastest way back from deep in a
-                // page.
-                //
-                // Except from a detail or search page, each a pushed destination showing under the tab
-                // it was opened from: there the press has to *leave* it for that tab's own page,
-                // which is what the bar looks like it is offering. Scrolling a page you are not
-                // on is the one thing it cannot mean.
-                // A collection's grid sits under the Collections tab the same way: pressing it goes
-                // back to the page of collections.
-                let on_detail = matches!(
-                    self.screen,
-                    Screen::Browsing(
-                        Route::Detail { .. } | Route::Search { .. } | Route::Saves { .. } | Route::Browse { scope: Scope::Collection(_) }
-                    )
-                );
-                if tab == current && !on_detail {
-                    match tab {
-                        Tab::Home => self.focus.reset_to_top(&self.shelves),
-                        Tab::Downloads => self.downloads_focus = Default::default(),
-                        Tab::Settings => self.settings_focus = Default::default(),
-                        _ => {}
-                    }
-                    return Task::batch([self.scroll_page_to_top(), self.scroll_cursor_into_view()]);
-                }
-                match tab {
-                    Tab::Home => {
-                        self.screen = Screen::Browsing(Route::Home);
-                        Task::batch([self.scroll_page_to_top(), self.scroll_cursor_into_view()])
-                    }
-                    // Back to the search a game was opened from, query and all; on the search
-                    // itself, back up to its keyboard; anywhere else, a new search.
-                    Tab::Search => {
-                        fn search_behind(route: &Route) -> Option<Route> {
-                            match route {
-                                Route::Search { .. } => Some(route.clone()),
-                                Route::Detail { from, .. } | Route::Saves { from, .. } => search_behind(from),
-                                _ => None,
-                            }
-                        }
-                        let behind = match &self.screen {
-                            Screen::Browsing(route) => search_behind(route),
-                            _ => None,
-                        };
-                        match behind {
-                            Some(search) => {
-                                if matches!(self.screen, Screen::Browsing(Route::Search { .. })) {
-                                    self.search_focus.in_results = false;
-                                }
-                                self.screen = Screen::Browsing(search);
-                                Task::none()
-                            }
-                            None => self.update(Message::OpenSearch),
-                        }
-                    }
-                    Tab::Collections => {
-                        // The page keeps its kind and card between visits: coming back from a
-                        // collection's grid should land where you left, not on the first chip.
-                        self.screen = Screen::Browsing(Route::Collections);
-                        // Scrolled to the card it was left on, which is also what the cover window
-                        // is cut from — so the art asked for is the art on screen.
-                        let scroll = self.scroll_cursor_into_view();
-                        Task::batch([scroll, self.load_collections(), self.refresh_own_collections(), self.fetch_art()])
-                    }
-                    Tab::Browse => {
-                        // Browse needs a system. Carry the one you were in, else the first that has
-                        // any games — an empty grid would be a dead end.
-                        let system = match &self.screen {
-                            Screen::Browsing(route) => self.current_system(route),
-                            _ => None,
-                        }
-                        .or_else(|| {
-                            self.library
-                                .systems
-                                .iter()
-                                .find(|s| !self.library.games_for(&s.id).is_empty())
-                                .map(|s| s.id.clone())
-                        });
-                        match system {
-                            Some(system) => self.update(Message::OpenSystem(system)),
-                            None => Task::none(),
-                        }
-                    }
-                    Tab::Settings => {
-                        self.settings_focus = Default::default();
-                        self.connection_check = Check::default();
-                        // A finished sync's counts carry no time either, so they go the same way. A
-                        // sync still running keeps saying so: its answer has not arrived yet.
-                        if !matches!(self.save_sync, SaveSync::Running) {
-                            self.save_sync = SaveSync::Idle;
-                        }
-                        self.screen = Screen::Browsing(Route::Settings);
-                        self.retrodeck = crate::launch::RetroDeck::detect().is_some();
-                        self.steam_found = crate::steam::Steam::find().is_some();
-                        Task::batch([
-                            self.scroll_page_to_top(),
-                            self.measure_image_cache(),
-                            self.locate_saves(),
-                            self.read_hooks(),
-                        ])
-                    }
-                    Tab::Downloads => {
-                        self.downloads_focus = Default::default();
-                        self.screen = Screen::Browsing(Route::Downloads);
-                        self.scroll_page_to_top()
-                    }
-                }
-            }
+            Message::DetailAction(action) => self.detail_action(action),
+            Message::TabSelected(tab) => self.select_tab(tab),
             Message::Nav(direction) => self.navigate(direction),
-            Message::Resized(width, height) => {
-                // iced divides a window's size by every scale it applies — the system's and this
-                // app's — so the size is in layout units already: what the page has to lay out in.
-                // Multiplied back by the scale iced applied, it is the window in the system's own
-                // pixels, which the screen is fitted against.
-                let applied = self.applied_scale.get();
-                let before = self.layout_scale();
-                self.window = (width * applied, height * applied);
-                let scale = self.layout_scale();
-                self.content_width = self.window.0 / scale;
-                self.content_height = self.window.1 / scale;
-                // A size reported under one scale and read under another is the one way that can
-                // be wrong: the screen's own resize and the size asked for at launch can cross. So
-                // when the scale moves, the size is asked again — iced applies the new scale before
-                // it answers — and that answer settles it.
-                let confirm = if (scale - before).abs() > before * 1e-3 { self.ask_window_size() } else { Task::none() };
-                // A resize changes the column count, which moves every row: the art window has to
-                // be recomputed against the new geometry rather than kept from the old one. The
-                // density is re-read with it because a window dragged to another monitor reports
-                // the move as a resize and nothing else.
-                Task::batch([
-                    iced::window::latest()
-                        .and_then(iced::window::scale_factor)
-                        .map(Message::PanelDensity),
-                    self.fetch_art(),
-                    confirm,
-                ])
-            }
+            Message::Resized(width, height) => self.resized(width, height),
             Message::Rescaled => self.ask_window_size(),
             Message::PanelDensity(density) => {
                 let density = density.max(0.1);
@@ -659,30 +401,7 @@ impl App {
                 let next = (here as isize + delta).rem_euclid(Tab::ALL.len() as isize) as usize;
                 self.update(Message::TabSelected(Tab::ALL[next]))
             }
-            Message::CycleSystem(delta) => {
-                let Screen::Browsing(route) = &self.screen else { return Task::none() };
-                // Settings has no system to step; the same keys walk its sections instead, which is
-                // what the Kotlin app's shoulder buttons do there.
-                if *route == Route::Settings {
-                    if self.settings_focus.jump_section(delta) {
-                        return self.scroll_cursor_into_view();
-                    }
-                    return Task::none();
-                }
-                // A collection's grid steps through its kind's collections; anything else through
-                // the systems, from the one it is showing.
-                let scope = match route {
-                    Route::Browse { scope } => scope.clone(),
-                    route => match self.current_system(route) {
-                        Some(system) => Scope::System(system),
-                        None => return Task::none(),
-                    },
-                };
-                let places = self.places(&scope);
-                let Some(here) = places.iter().position(|p| p.scope == scope) else { return Task::none() };
-                let next = (here as isize + delta).rem_euclid(places.len() as isize) as usize;
-                self.open_scope(places[next].scope.clone())
-            }
+            Message::CycleSystem(delta) => self.cycle_system(delta),
             // Not a reason to take the cursor out of the bar: a card reports the pointer entering it
             // whenever the page moves under a pointer that is resting there — see `PointerUsed`.
             Message::Hovered(card) => {
@@ -697,36 +416,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::FavouriteChanged { tile, adding, ids, result } => {
-                self.favouriting.remove(&tile);
-                // A list of collections asked for while this was on its way may predate it.
-                self.favourite_edits += 1;
-                match result {
-                    // RomM's collection as it now is: whatever else changed in it meanwhile, from
-                    // another device or the web app, comes with it.
-                    Ok(mut collection) => {
-                        collection.is_favorite = true;
-                        match self.collections.iter_mut().find(|c| c.id == collection.id) {
-                            Some(held) => *held = collection,
-                            None => self.collections.push(collection),
-                        }
-                        self.favourites = favourites_of(&self.collections);
-                    }
-                    Err(why) => {
-                        for id in ids {
-                            if adding {
-                                self.favourites.remove(&id);
-                            } else {
-                                self.favourites.insert(id);
-                            }
-                        }
-                        let title = self.title_of(tile);
-                        self.say(format!("\"{title}\" could not be {} favourites: {why}", if adding { "added to" } else { "taken out of" }));
-                    }
-                }
-                self.rebuild_collections();
-                Task::none()
-            }
+            Message::FavouriteChanged { tile, adding, ids, result } => self.favourite_changed(tile, adding, ids, result),
             Message::HomeCardClicked(shelf, card) => {
                 if !matches!(self.screen, Screen::Browsing(Route::Home)) {
                     return Task::none();
@@ -740,34 +430,7 @@ impl App {
                 self.focus.focus_card(&self.shelves, shelf, card);
                 self.scroll_cursor_into_view()
             }
-            Message::HomeWheel(delta) => {
-                use iced::mouse::ScrollDelta;
-                if !matches!(self.screen, Screen::Browsing(Route::Home)) {
-                    return Task::none();
-                }
-                // A notch is a shelf. A touchpad's pixels are saved up until they come to one.
-                let steps = match delta {
-                    ScrollDelta::Lines { y, .. } => y.round(),
-                    ScrollDelta::Pixels { y, .. } => {
-                        self.wheel += y;
-                        let steps = (self.wheel / 60.0).trunc();
-                        self.wheel -= steps * 60.0;
-                        steps
-                    }
-                };
-                // Up the wheel is up the page. It walks the shelves only: it does not climb out of
-                // them into the bar.
-                let direction = if steps > 0.0 { Direction::Up } else { Direction::Down };
-                let mut tasks = Vec::new();
-                for _ in 0..(steps.abs() as usize).min(3) {
-                    if direction == Direction::Up && self.focus.shelf_pos() == 0 {
-                        break;
-                    }
-                    tasks.push(self.navigate_page(Route::Home, direction));
-                }
-                self.up_stopped = false;
-                Task::batch(tasks)
-            }
+            Message::HomeWheel(delta) => self.home_wheel(delta),
             Message::AwardedLoaded(result) => {
                 // A record that cannot be read leaves the spotlight saying only how many there are.
                 if let Ok(awarded) = result {
@@ -794,35 +457,7 @@ impl App {
                 self.banner = None;
                 Task::none()
             }
-            Message::SignOut => {
-                // Local only: the token is dropped here, not revoked on the server. Revoking is a
-                // remote, irreversible act that needs its own confirmation, and this build has no
-                // screen to host that conversation.
-                self.settings.connection = None;
-                // The downloads stop being this session's: every queue item and every record is
-                // keyed to the server it belongs to, so they are hidden rather than thrown away —
-                // the files are real, and signing back in has to find them again.
-                self.downloads.set_host("");
-                let _ = self.save_settings();
-                // The cached library belongs to the pairing being dropped. Leaving it would hand
-                // the next sign-in someone else's shelves for the frame before the sync lands.
-                cache::clear();
-                self.system_counts.clear();
-                self.library_read_at = None;
-                self.installs = Installs::Unknown;
-                self.install_requests.clear();
-                self.library = Arc::new(Library::default());
-                self.collections.clear();
-                self.collection_sources = None;
-                self.rebuild_collections();
-                self.shelves.clear();
-                self.covers = Covers::default();
-                self.backdrop = Default::default();
-                self.awarded = None;
-                self.say("Signed out locally. The token is still valid in RomM — revoke it there. Downloaded games are left on disk.".into());
-                self.screen = Screen::Login(LoginState::new("https://".into()));
-                Task::none()
-            }
+            Message::SignOut => self.sign_out(),
             Message::SettingsClicked(index) => {
                 // No scroll: the row is already under the pointer, and moving the page would slide
                 // it out from there.
@@ -953,31 +588,7 @@ impl App {
                 }
                 self.remove_download(rom_id)
             }
-            Message::SavesSynced(result) => {
-                let failed = result.is_err();
-                let mut pictureless = false;
-                self.save_sync = match result {
-                    Ok(report) => {
-                        // What the sync wrote is where things stand now, not a change to sync again.
-                        // Only what it wrote: a game running outside Deckhand may have written its
-                        // own save while this ran, and that is still news.
-                        self.watcher.wrote(&report.written);
-                        self.save_folder = Some(Ok(report.folder.clone()));
-                        pictureless = report.pictureless > 0;
-                        SaveSync::Done(Box::new(report))
-                    }
-                    Err(why) => {
-                        // Nothing came back to say what it wrote, so the next look starts afresh.
-                        self.watcher.rebase();
-                        SaveSync::Failed(why)
-                    }
-                };
-                // A sync RomM turned away because it no longer knows this device registers it again
-                // here — see [`crate::sync::device`]. Without this the window would go on failing the
-                // same way until it was restarted, since it only registers as it opens.
-                let offer = if pictureless { self.offer_state_pictures() } else { Task::none() };
-                Task::batch([if failed { self.ensure_device() } else { Task::none() }, offer])
-            }
+            Message::SavesSynced(result) => self.saves_synced(result),
             Message::CheckRelease => self.check_release(),
             Message::GamesFound(found) => {
                 let added = self.downloads.adopt(found);
@@ -993,38 +604,7 @@ impl App {
                 }
                 Task::none()
             }
-            Message::WatchTick => {
-                if self.looking || self.playing.is_some() || matches!(self.save_sync, SaveSync::Running) {
-                    return Task::none();
-                }
-                self.looking = true;
-                // Which folders to look over is worked out from RetroArch's config and the download
-                // records — read off the disk, so kept for a minute rather than read every tick, and
-                // read again sooner when the config chosen or the games here change.
-                let fingerprint = (self.settings.retroarch_config.clone(), self.downloads.installed_fingerprint());
-                let known = self
-                    .watch_folders
-                    .as_ref()
-                    .filter(|(_, at, of)| at.elapsed() < WATCH_FOLDERS_FOR && *of == fingerprint)
-                    .map(|(folders, _, _)| folders.clone());
-                let (chosen, store) = (self.settings.retroarch_config.clone(), Settings::config_dir());
-                Task::perform(
-                    async move {
-                        off_thread(move || {
-                            let found = known.is_none().then(|| {
-                                crate::sync::retroarch::locate(chosen.as_deref())
-                                    .map(|install| install.with_content_dirs(crate::downloads::content_dirs(&store)).watched())
-                                    .unwrap_or_default()
-                            });
-                            let seen = crate::watch::snapshot(known.as_deref().or(found.as_deref()).unwrap_or_default());
-                            (found.map(|folders| (folders, fingerprint)), seen)
-                        })
-                        .await
-                        .unwrap_or_default()
-                    },
-                    |(found, seen)| Message::WatchScanned(found, seen),
-                )
-            }
+            Message::WatchTick => self.watch_tick(),
             Message::WatchScanned(found, seen) => {
                 self.looking = false;
                 if let Some((folders, fingerprint)) = found {
