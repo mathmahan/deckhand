@@ -559,6 +559,8 @@ pub struct App {
     retrodeck_setup: RetroDeckSetup,
     /// How to stop RetroDECK's install while it runs.
     retrodeck_cancel: Option<crate::retrodeck::Cancel>,
+    /// Every save has been synced once since the window opened — see [`App::sweep_once`].
+    swept: bool,
     /// Paired just now: once the library is in, RetroDECK is offered if it is not here.
     offer_retrodeck: bool,
     /// Which of this device's games are in Steam's library — see [`crate::steam`].
@@ -713,6 +715,7 @@ impl App {
             retrodeck_setup: RetroDeckSetup::Idle,
             retrodeck_cancel: None,
             offer_retrodeck: false,
+            swept: false,
             steam_bindings: crate::steam::Bindings::load(),
             steam_found: false,
             watcher: crate::watch::Watcher::default(),
@@ -835,7 +838,8 @@ impl App {
             let detect = app.detect_games();
             let awarded = app.load_awarded();
             let installs = Task::done(Message::ClaimInstalls);
-            return (app, Task::batch([measure, resume, Task::done(Message::SyncLibrary), device, detect, awarded, installs]));
+            let sweep = app.sweep_once();
+            return (app, Task::batch([measure, resume, Task::done(Message::SyncLibrary), device, detect, awarded, installs, sweep]));
         }
 
         (app, Task::batch([measure, resume, Task::done(Message::LoadLibrary)]))

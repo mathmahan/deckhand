@@ -1100,6 +1100,9 @@ impl<'a> Run<'a> {
     /// goes to `save-backups/` first when they may not be. Two ways they may not: a version only of
     /// this save's kind can be another save of a slot several share — each disc of a set keeps its own
     /// `.srm` — and a flat set's pull takes away the set's files RomM's copy of it does not name.
+    ///
+    /// Answers whether a save came down: not for a failure, which the report says, nor for a copy of
+    /// RomM's that held none of this save.
     async fn pull(&mut self, op: &SyncOperation, thread: &Thread, keep: Option<&Held>) -> bool {
         let replaced = keep.is_some_and(|held| op.server_content_hash.as_deref().is_none_or(|h| !held.is(h)));
         // A unit that is more than one file of its own can take files away, or sit on a card every
@@ -1125,7 +1128,12 @@ impl<'a> Run<'a> {
             Ok(put) => put,
             Err(e) => return self.failed(thread, e),
         };
-        let confirmed = self.client.confirm_downloaded(self.conn, save_id, &self.device, Some(&hash)).await.is_ok();
+        // RomM's copy held none of this save — a memory card another client formatted and wrote out
+        // for a game that never saved, say — so nothing was put here. It is still this device's
+        // version of the slot from now on, recorded as such, so the next sync leaves it be rather than
+        // taking it again; and not news.
+        let nothing = hash.is_empty() && written.is_empty();
+        let confirmed = self.client.confirm_downloaded(self.conn, save_id, &self.device, Some(hash.as_str()).filter(|h| !h.is_empty())).await.is_ok();
         self.counts.0 += 1;
         // What the pull wrote, and what it replaced: a flat set's pull takes files away, and the
         // watcher has to know about those as well as the ones now there.
@@ -1134,7 +1142,10 @@ impl<'a> Run<'a> {
         let server_hash = op.server_content_hash.clone().filter(|h| *h != hash);
         let version = Version { save_id, synced_at: op.server_updated_at.clone(), server_hash };
         self.remember(thread, hash, version, confirmed, Some(&written));
-        true
+        if nothing {
+            self.report.in_sync += 1;
+        }
+        !nothing
     }
 
     /// Both sides hold progress the other lacks. A person decides when one is there to ask, the newer

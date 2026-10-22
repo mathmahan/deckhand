@@ -490,11 +490,7 @@ impl App {
             Tab::Settings => {
                 self.settings_focus = Default::default();
                 self.connection_check = Check::default();
-                // A finished sync's counts carry no time either, so they go the same way. A
-                // sync still running keeps saying so: its answer has not arrived yet.
-                if !matches!(self.save_sync, SaveSync::Running) {
-                    self.save_sync = SaveSync::Idle;
-                }
+                // The last sync's outcome stays: it is where the header's saves icon stands.
                 self.screen = Screen::Browsing(Route::Settings);
                 self.retrodeck = crate::launch::RetroDeck::detect().is_some();
                 self.steam_found = crate::steam::Steam::find().is_some();
