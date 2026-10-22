@@ -26,15 +26,25 @@ pub const GRID_PADDING: f32 = 16.0;
 /// are already at the three-column floor and draw their covers smaller instead.
 pub const SYSTEM_LIST_W: f32 = 240.0;
 
-/// Everything beside the tiles: the system list, the page padding on both sides, and the alphabet
-/// rail.
+/// Left of the system list: the header's margin, so the list lines up under the wordmark.
+pub const LIST_LEFT: f32 = crate::ui::tab_bar::MARGIN;
+
+/// Between the system list and the grid's own padding.
+pub const LIST_GAP: f32 = 16.0;
+
+/// Right of the alphabet rail: what is left of the header's margin once the grid's padding and the
+/// rail have had theirs, so the page's right edge lines up under the header's icons.
+pub const RAIL_RIGHT: f32 = crate::ui::tab_bar::MARGIN - GRID_PADDING - ALPHA_RAIL_W;
+
+/// Everything beside the tiles: the margin and the system list, the page padding on both sides of
+/// the grid, and the alphabet rail with the margin after it.
 ///
 /// This is measured from *this* app's layout, not inherited. The Kotlin source's equivalent
 /// reserves ~264 units because its figure predates the left rail being removed — that app moved
 /// navigation to a top tab bar and handed the rail's 200 units back to the covers, but the grid
 /// constant still spends them. Carried over unexamined it left a rail-shaped hole down the right of
 /// every grid: tiles sized to fill a width ~200 units narrower than the container they sit in.
-pub const CHROME_W: f32 = SYSTEM_LIST_W + GRID_PADDING * 2.0 + ALPHA_RAIL_W;
+pub const CHROME_W: f32 = LIST_LEFT + SYSTEM_LIST_W + LIST_GAP + GRID_PADDING * 2.0 + ALPHA_RAIL_W + RAIL_RIGHT;
 
 /// Gap between tiles, horizontally and vertically.
 pub const GAP: f32 = 24.0;
@@ -43,7 +53,11 @@ pub const GAP: f32 = 24.0;
 pub const LABEL_H: f32 = 28.0;
 
 /// The tile height the column count aims at before the ratio is applied.
-pub const TARGET_H: f32 = 235.0;
+///
+/// Set against what the grid has of the page's height: under the spotlight and the chips, about
+/// 460 units on the reference panel. A row and a bit of the next show there, as they did at 235
+/// with the whole page under the chips.
+pub const TARGET_H: f32 = 190.0;
 
 /// The content width the layout is authored against (the Deck's own panel).
 pub const REFERENCE_CONTENT_W: f32 = 1280.0;
@@ -91,10 +105,13 @@ pub mod density {
 /// `cols_adjust` is the separate density knob: positive adds columns (more, smaller covers),
 /// negative removes them. It stays orthogonal to text scale, so a large-type user can still ask for
 /// a denser grid.
+///
+/// Capped at nine columns, ten with the density raised: past that a wide window's covers grow
+/// instead, as they have to somewhere.
 pub fn grid_for(ratio: f32, usable_w: f32, ui_scale: f32, cols_adjust: i32) -> GridSpec {
     let base_cols = (usable_w / (TARGET_H * ui_scale * ratio + GAP)).round() as i32;
-    let base_cols = base_cols.clamp(3, 7);
-    let cols = (base_cols + cols_adjust).clamp(2, 8) as usize;
+    let base_cols = base_cols.clamp(3, 9);
+    let cols = (base_cols + cols_adjust).clamp(2, 10) as usize;
     // Fill the actual width exactly, rather than leaving a ragged right edge.
     let tile_w = (usable_w - (cols as f32 - 1.0) * GAP) / cols as f32;
     let tile_h = tile_w / ratio;

@@ -44,6 +44,30 @@ impl App {
         }
     }
 
+    /// Whether the Library has the room for its spotlight — see [`crate::ui::browse::HERO_BELOW`].
+    pub(super) fn library_hero_fits(&self) -> bool {
+        self.content_height - crate::ui::tab_bar::TAB_BAR_HEIGHT >= crate::ui::browse::HERO_BELOW
+    }
+
+    /// The games the Library's spotlight draws from: the one under the grid's cursor first, then
+    /// the ones either side of it, whose pictures are fetched ahead as Home's neighbours' are. None
+    /// off the Library, in a window too short for the spotlight, and for an empty grid.
+    pub(super) fn library_spotlit(&self) -> Vec<&Game> {
+        let Screen::Browsing(Route::Browse { scope }) = &self.screen else { return Vec::new() };
+        if !self.library_hero_fits() {
+            return Vec::new();
+        }
+        // From the kept view, not a fresh one: this is asked several times a frame.
+        let entry = self.browse_entry(scope);
+        let at = self.browse_focus.index();
+        [Some(at), at.checked_sub(1), Some(at + 1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|i| entry.games.get(i))
+            .map(|&index| self.library.at(index))
+            .collect()
+    }
+
     /// RomM's icon for a platform — the one its own interface shows beside the name.
     pub(super) fn platform_logo(&self, slug: &str) -> String {
         self.asset_url(&format!("/assets/platforms/{slug}.ico"))

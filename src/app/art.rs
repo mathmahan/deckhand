@@ -33,6 +33,10 @@ impl App {
                         wanted.push((url.clone(), tile, covers::Kind::Art));
                     }
                 }
+                // The spotlight's picture, and its neighbours' ahead of a step.
+                for game in self.library_spotlit() {
+                    wanted.extend(pictures_of(game, &px));
+                }
                 // The system list's icons: a few dozen, and small.
                 if matches!(scope, Scope::System(_)) {
                     for system in &self.library.systems {
@@ -114,24 +118,12 @@ impl App {
     ///
     /// The game under the cursor first, which is the order the fetches are started in.
     fn spotlight_art(&self, px: &dyn Fn(f32) -> f32) -> Vec<(String, covers::Target, covers::Kind)> {
-        use crate::ui::home::{self, Picture};
         let mut wanted = Vec::new();
         let Some(shelf) = self.shelves.get(self.focus.shelf_pos()) else { return wanted };
         let at = self.focus.index_of(shelf);
         let around = [Some(at), at.checked_sub(1), Some(at + 1)];
         for game in around.into_iter().flatten().filter_map(|i| shelf.games.get(i)) {
-            match home::picture_of(game) {
-                Some(Picture::Shot(url)) => {
-                    let (w, h) = home::PICTURE;
-                    wanted.push((url.to_string(), covers::Target { height_px: px(h), box_ratio: Some(w / h) }, covers::Kind::Spotlight));
-                    wanted.push((url.to_string(), covers::Target::tall(px(40.0)), covers::Kind::Ambient));
-                }
-                Some(Picture::Cover(url)) => {
-                    wanted.push((url.to_string(), covers::Target::tall(px(home::CARD_H)), covers::Kind::Feature));
-                    wanted.push((url.to_string(), covers::Target::tall(px(40.0)), covers::Kind::Ambient));
-                }
-                None => {}
-            }
+            wanted.extend(pictures_of(game, px));
             if let Some(path) = &game.logo_path {
                 wanted.push((self.asset_url(path), covers::Target::tall(px(100.0)), covers::Kind::Art));
             }
@@ -246,4 +238,24 @@ async fn original(client: &RommClient, connection: &Connection, source: &str) ->
     let bytes = client.fetch_asset(connection, source).await.ok()?;
     covers::write_cached(source, &bytes);
     Some(bytes)
+}
+
+/// What a spotlight draws of `game` behind it: its picture — a screenshot, or its cover as a card —
+/// and the light that casts.
+fn pictures_of(game: &Game, px: &dyn Fn(f32) -> f32) -> Vec<(String, covers::Target, covers::Kind)> {
+    use crate::ui::home::{self, Picture};
+    match home::picture_of(game) {
+        Some(Picture::Shot(url)) => {
+            let (w, h) = home::PICTURE;
+            vec![
+                (url.to_string(), covers::Target { height_px: px(h), box_ratio: Some(w / h) }, covers::Kind::Spotlight),
+                (url.to_string(), covers::Target::tall(px(40.0)), covers::Kind::Ambient),
+            ]
+        }
+        Some(Picture::Cover(url)) => vec![
+            (url.to_string(), covers::Target::tall(px(home::CARD_H)), covers::Kind::Feature),
+            (url.to_string(), covers::Target::tall(px(40.0)), covers::Kind::Ambient),
+        ],
+        None => Vec::new(),
+    }
 }

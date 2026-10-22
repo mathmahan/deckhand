@@ -1,19 +1,25 @@
-//! The Browse page — a port of `browse/ui/SystemView.kt`: one system's library as a cover grid.
+//! The Browse page — one system's library as a cover grid, drawn in Home's look.
 //!
-//! The system list down the left edge, and beside it the filter and sort chips above the grid, with
-//! the A-Z rail pinned to the grid's right edge. The list and the rail are part of the width budget
-//! rather than overlays, because the grid geometry in [`crate::grid`] is only meaningful if the
-//! width it divides up is the width tiles actually get.
+//! The system list down the left edge on a glass panel, and beside it, top to bottom: the game under
+//! the cursor in a spotlight as on Home's, over its screenshot; the filter and sort pills; and the
+//! grid, with the A-Z rail pinned to its right edge. The list and the rail are part of the width
+//! budget rather than overlays, because the grid geometry in [`crate::grid`] is only meaningful if
+//! the width it divides up is the width tiles actually get.
 
+use iced::widget::text::LineHeight;
 use iced::widget::{self as widget, button, column, container, image, mouse_area, row, scrollable, text, Space};
-use iced::{Alignment, Background, Border, ContentFit, Element, Length, Padding, Shadow};
+use iced::{alignment, Alignment, Background, Border, Color, ContentFit, Element, Length, Padding, Shadow, Vector};
+
+use iced_fonts::lucide;
 
 use crate::app::Message;
 use crate::covers::Covers;
 use crate::focus::{BrowseFocus, BrowseZone};
 use crate::grid::{self, GridSpec};
 use crate::collections::Scope;
-use crate::theme;
+use crate::library::Game;
+use crate::theme::{self, alpha, glass};
+use crate::ui::home;
 use crate::view_model::{Filter, Sort, SystemView};
 
 /// How far an unfocused tile is dimmed.
@@ -44,23 +50,53 @@ pub fn system_list_id() -> widget::Id {
 /// A row of the system list, and the gap under it. Fixed, so where a row sits in the list is
 /// computed rather than measured — see [`system_row_span`].
 const SYSTEM_ROW_H: f32 = 38.0;
-const SYSTEM_ROW_GAP: f32 = 4.0;
+const SYSTEM_ROW_GAP: f32 = 2.0;
 
 /// Distance between the tops of two list rows.
 pub const SYSTEM_ROW_PITCH: f32 = SYSTEM_ROW_H + SYSTEM_ROW_GAP;
 
-/// The space above the list's first row, which lines it up with the chips beside it.
-const LIST_TOP: f32 = 12.0;
+/// The space above the list's first row, under its heading.
+const LIST_TOP: f32 = 2.0;
 
-/// How wide a system's name may run: the list, less its scrollbar strip (8), its padding (18), a
-/// row's own padding (24), the platform icon and the gaps either side of the name (40), and the game
-/// count (24).
+/// The list's heading, above the rows and outside their scroll.
+const LIST_HEADING_H: f32 = 44.0;
+
+/// The panel the list stands on: under the header, and short of the window's bottom edge.
+const PANEL_TOP: f32 = 12.0;
+const PANEL_BOTTOM: f32 = 24.0;
+
+/// How wide a system's name may run: the panel, less its scrollbar strip (8), the list's padding
+/// (18), a row's own padding (24), the platform icon and the gaps either side of the name (40), and
+/// the game count (24).
 const SYSTEM_NAME_W: f32 = grid::SYSTEM_LIST_W - 114.0;
 
 /// The platform icon's box in the system list: as tall as the text beside it reads well against,
 /// and as wide as the widest icons RomM ships (a console drawn side on).
 pub const LOGO_H: f32 = 22.0;
 const LOGO_W: f32 = 24.0;
+
+/// The spotlight over the grid, from under the header to the chips. Everything in it has a fixed
+/// height, so walking the grid changes what it says without moving the grid under it.
+pub const HERO_H: f32 = 196.0;
+
+/// The page's height, under the header, below which the spotlight is left out: in a short window
+/// the grid keeps the room.
+pub const HERO_BELOW: f32 = 560.0;
+
+/// The spotlight's one-line name.
+pub const HERO_TITLE_SIZE: f32 = 40.0;
+pub const HERO_TITLE_LINE: f32 = 44.0;
+
+/// The filter and sort pills' row, with the room above and below it.
+pub const CHIPS_H: f32 = 72.0;
+
+/// How wide the spotlight's name may run. Short of Home's, since the text starts right of the
+/// system list and so further over the picture.
+pub const HERO_TITLE_W: f32 = 520.0;
+
+/// How the page darkens left to right behind the spotlight's text — see [`home::SHADE`]. Further
+/// across than Home's, since the text starts right of the system list.
+pub const SHADE: [(f32, f32); 4] = [(0.0, 1.0), (0.42, 0.94), (0.62, 0.6), (0.86, 0.0)];
 
 /// Where system `index`'s row sits in the list, top and bottom, for scrolling it into view.
 pub fn system_row_span(index: usize) -> (f32, f32) {
@@ -73,6 +109,12 @@ pub fn row_top(spec: &GridSpec, row: usize) -> f32 {
     row as f32 * spec.pitch
 }
 
+/// Where the grid starts, from the top of the window: under the header, the spotlight and the
+/// chips. What the picture behind the spotlight fades out before.
+pub fn grid_top() -> f32 {
+    crate::ui::tab_bar::TAB_BAR_HEIGHT + HERO_H + CHIPS_H
+}
+
 /// One entry of the list down Browse's left edge: a system, or — on a collection's grid — another
 /// collection of the same kind, so the list steps between collections the way it does systems.
 pub struct Place {
@@ -83,14 +125,32 @@ pub struct Place {
     pub logo: Option<String>,
 }
 
+/// The game under the grid's cursor, as the spotlight shows it.
+pub struct Hero<'a> {
+    pub game: &'a Game,
+    /// Its name, cut to the spotlight's one line — measured by the app, which keeps the answer.
+    pub title: String,
+    /// How many of its achievements this user has earned, when RomM said.
+    pub earned: Option<usize>,
+    /// Its system, named where the grid holds more than one: a collection's.
+    pub system: Option<&'a str>,
+    /// For dates: a game played this year says "1 Oct", one played before says the year too.
+    pub this_year: i64,
+}
+
 pub struct BrowseContext<'a> {
     /// The list's entries, and which of them the grid is showing.
     pub places: Vec<Place>,
+    /// What the list holds, over it: the systems, or a collection's kind.
+    pub heading: String,
     pub scope: &'a Scope,
     /// Owned rather than borrowed: the view is built per frame from the library, and the elements
     /// below borrow the `&'a Game`s *inside* it. Holding it by reference would tie the returned
     /// element to a local that dies at the end of the call.
     pub view: SystemView<'a>,
+    /// The spotlight, unless the window is too short for it — see [`HERO_BELOW`] — or the grid is
+    /// empty.
+    pub hero: Option<Hero<'a>>,
     pub focus: &'a BrowseFocus,
     pub covers: &'a Covers,
     /// What this device has of each game, for the tiles' corner badges — see
@@ -138,6 +198,7 @@ pub fn browse_view<'a>(ctx: BrowseContext<'a>) -> Element<'a, Message> {
 
     let empty = ctx.view.is_empty();
     let systems = system_list(&ctx);
+    let hero = ctx.hero.as_ref().map(|hero| spotlight(hero, ctx.downloads));
     let chips = chips_row(&ctx);
     let rail = letter_rail(&ctx);
     // Consumes the context, so the tiles can hold the `&'a Game`s out of its view.
@@ -145,13 +206,21 @@ pub fn browse_view<'a>(ctx: BrowseContext<'a>) -> Element<'a, Message> {
 
     // The rail is pointless beside an empty grid — there is nothing to jump to.
     let body = if empty { row![grid] } else { row![grid, rail] };
-    row![systems, column![chips, body].width(Length::Fill).height(Length::Fill)]
+    let page = match hero {
+        Some(hero) => column![hero, chips, body],
+        None => column![chips, body],
+    };
+    let page = page.width(Length::Fill).height(Length::Fill);
+    row![systems, page]
+        .spacing(grid::LIST_GAP)
+        .padding(Padding { left: grid::LIST_LEFT, right: grid::RAIL_RIGHT, ..Padding::ZERO })
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
-/// The system list: every system down the left edge, each with how many games it holds.
+/// The system list: every system down the left edge, each with how many games it holds, on a
+/// panel of the glass the header's pills are cut from.
 ///
 /// A column rather than a row of pills across the top, because it has to hold anything from a
 /// handful of systems to the 200-odd RomM supports: a column shows three times as many at once,
@@ -165,24 +234,54 @@ fn system_list<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
         list = list.push(system_row(place, logo, place.scope == *ctx.scope, cursor == Some(i)));
     }
 
-    container(
-        scrollable(list.padding(Padding { top: LIST_TOP, right: 6.0, bottom: 16.0, left: 12.0 }))
-            .id(system_list_id())
-            .on_scroll(|_| Message::Scrolled)
-            // Given a strip of its own beside the rows, rather than drawn over their right edge
-            // where the game counts are.
-            .direction(scrollable::Direction::Vertical(
-                scrollable::Scrollbar::new().width(4).scroller_width(4).spacing(4),
-            ))
-            .height(Length::Fill),
-    )
-    .width(Length::Fixed(grid::SYSTEM_LIST_W))
-    .height(Length::Fill)
-    .into()
+    // The triggers step through the list from anywhere on the page: said beside its name.
+    let heading = row![
+        text(ctx.heading.clone()).size(12.0).font(theme::BOLD).color(theme::TEXT_SECONDARY).width(Length::Fill),
+        key("L2"),
+        key("R2"),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .height(Length::Fixed(LIST_HEADING_H))
+    .padding(Padding { top: 0.0, right: 14.0, bottom: 0.0, left: 22.0 });
+
+    let rows = scrollable(list.padding(Padding { top: LIST_TOP, right: 6.0, bottom: 14.0, left: 12.0 }))
+        .id(system_list_id())
+        .on_scroll(|_| Message::Scrolled)
+        // Given a strip of its own beside the rows, rather than drawn over their right edge
+        // where the game counts are.
+        .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4).scroller_width(4).spacing(4)))
+        .height(Length::Fill);
+
+    let panel = container(column![heading, rows]).width(Length::Fill).height(Length::Fill).style(|_| container::Style {
+        background: Some(Background::Color(glass(0.05))),
+        border: Border { color: glass(0.10), width: 1.0, radius: 20.0.into() },
+        ..Default::default()
+    });
+    container(panel)
+        .width(Length::Fixed(grid::SYSTEM_LIST_W))
+        .height(Length::Fill)
+        .padding(Padding { top: PANEL_TOP, bottom: PANEL_BOTTOM, ..Padding::ZERO })
+        .into()
+}
+
+/// A pad button with a name longer than a letter — a trigger — in a rounded box, set beside what it
+/// does.
+fn key<'a>(name: &'a str) -> Element<'a, Message> {
+    container(text(name).size(10.0).font(theme::BOLD).color(alpha(theme::INK, 0.7)))
+        .padding([2.0, 5.0])
+        .style(|_| container::Style {
+            border: Border { color: alpha(theme::INK, 0.55), width: 1.5, radius: 5.0.into() },
+            ..Default::default()
+        })
+        .into()
 }
 
 /// One place in the list. `current` is the one open in the grid; `under_cursor` is where the list's
 /// own cursor is while you walk it, which is a different place until you press Right or Enter.
+///
+/// The open one is filled with the brightest ink, as the header's current destination is; the
+/// cursor is a ring of its own, so both show at once while you walk the list.
 fn system_row<'a>(place: &Place, logo: Option<iced::widget::image::Handle>, current: bool, under_cursor: bool) -> Element<'a, Message> {
     let (key, open) = match &place.scope {
         Scope::System(id) => (id.as_str(), Message::OpenSystem(id.clone())),
@@ -194,7 +293,7 @@ fn system_row<'a>(place: &Place, logo: Option<iced::widget::image::Handle>, curr
     let mark: Element<Message> = match logo {
         Some(handle) => image(handle).content_fit(ContentFit::Contain).width(Length::Fixed(LOGO_W)).height(Length::Fixed(LOGO_H)).into(),
         None => container(
-            container(Space::new().width(Length::Fixed(7.0)).height(Length::Fixed(7.0))).style(move |_| container::Style {
+            container(Space::new().width(Length::Fixed(8.0)).height(Length::Fixed(8.0))).style(move |_| container::Style {
                 background: Some(Background::Color(hue)),
                 border: Border { radius: 4.0.into(), ..Default::default() },
                 ..Default::default()
@@ -204,19 +303,17 @@ fn system_row<'a>(place: &Place, logo: Option<iced::widget::image::Handle>, curr
         .center_x(Length::Fixed(LOGO_W))
         .into(),
     };
-    let name_chars = crate::ui::home::chars_across(SYSTEM_NAME_W, theme::text_size::LABEL_LARGE);
+    let name_chars = home::chars_across(SYSTEM_NAME_W, theme::text_size::LABEL_LARGE);
 
     button(
         row![
             mark,
-            text(crate::ui::home::truncate(&place.name, name_chars))
+            text(home::truncate(&place.name, name_chars))
                 .size(theme::text_size::LABEL_LARGE)
                 .font(if current { theme::SEMIBOLD } else { theme::MEDIUM })
                 .wrapping(iced::widget::text::Wrapping::None)
                 .width(Length::Fill),
-            text(place.count.to_string())
-                .size(theme::text_size::LABEL_MEDIUM)
-                .color(theme::TEXT_MUTED),
+            text(place.count.to_string()).size(13.0).color(if current { theme::NEUTRAL_700 } else { theme::NEUTRAL_500 }),
         ]
         .spacing(8)
         .height(Length::Fill)
@@ -228,27 +325,33 @@ fn system_row<'a>(place: &Place, logo: Option<iced::widget::image::Handle>, curr
     .on_press(open)
     .style(move |_, status| {
         let hovered = matches!(status, button::Status::Hovered);
+        let fill = if current {
+            Some(theme::INK)
+        } else if under_cursor {
+            Some(glass(0.08))
+        } else if hovered {
+            Some(glass(0.06))
+        } else {
+            None
+        };
         button::Style {
-            background: Some(Background::Color(if current {
-                theme::FOCUS_FILL
-            } else if under_cursor || hovered {
-                theme::SURFACE
+            background: fill.map(Background::Color),
+            text_color: if current {
+                theme::GROUND
+            } else if under_cursor {
+                theme::INK
             } else {
-                iced::Color::TRANSPARENT
-            })),
-            text_color: if current || under_cursor { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY },
+                alpha(theme::INK, 0.82)
+            },
             border: Border {
-                // The cursor takes the accent; the open system keeps a quieter ring of its own, so
-                // both show at once while you walk the list.
-                color: if under_cursor {
-                    theme::ACCENT
-                } else if current {
-                    theme::FOCUS_RING
-                } else {
-                    iced::Color::TRANSPARENT
+                // A ring of ink would vanish into the open row's fill; there the accent rings it.
+                color: match (under_cursor, current) {
+                    (true, true) => theme::ACCENT_400,
+                    (true, false) => theme::INK,
+                    (false, _) => Color::TRANSPARENT,
                 },
-                width: if under_cursor { 2.0 } else { 1.0 },
-                radius: 10.0.into(),
+                width: if under_cursor { 2.0 } else { 0.0 },
+                radius: 12.0.into(),
             },
             shadow: Shadow::default(),
             snap: true,
@@ -257,13 +360,59 @@ fn system_row<'a>(place: &Place, logo: Option<iced::widget::image::Handle>, curr
     .into()
 }
 
-/// The filter chips, then the sort chips. One row, because they answer one question together:
-/// which games, in what order.
+// ---------------------------------------------------------------------------------------------
+// The spotlight
+// ---------------------------------------------------------------------------------------------
+
+/// The game under the grid's cursor, as Home's spotlight shows its own: where it is and when it was
+/// played, its name, what it is, the way to its page, and what is worth knowing before pressing.
+/// Over its screenshot, which the page under it draws — see [`home::stage`].
+///
+/// One line of name and no description: the grid needs the room more than the spotlight does.
+fn spotlight<'a>(hero: &Hero<'a>, downloads: &crate::downloads::Downloads) -> Element<'a, Message> {
+    let game = hero.game;
+    let state = downloads.state_of(game.builds());
+    let tag = if state.is_here() {
+        home::tag("ON THIS DEVICE".into(), true)
+    } else if state.is_busy() {
+        home::tag("DOWNLOADING".into(), true)
+    } else {
+        home::tag("ON ROMM".into(), false)
+    };
+    let info = column![
+        home::eyebrow_of(tag, hero.system, game, hero.this_year),
+        Space::new().height(Length::Fixed(12.0)),
+        text(hero.title.clone())
+            .size(HERO_TITLE_SIZE)
+            .font(theme::DISPLAY)
+            .line_height(LineHeight::Absolute(HERO_TITLE_LINE.into()))
+            .wrapping(iced::widget::text::Wrapping::None)
+            .color(theme::INK)
+            .height(Length::Fixed(HERO_TITLE_LINE)),
+        Space::new().height(Length::Fixed(8.0)),
+        home::meta_line(game),
+        Space::new().height(Length::Fixed(16.0)),
+        row![home::view_button(game), home::facts(game, &state, hero.earned)].spacing(24).align_y(Alignment::Center),
+    ];
+    container(info)
+        .width(Length::Fill)
+        .height(Length::Fixed(HERO_H))
+        .padding([0.0, grid::GRID_PADDING])
+        .align_y(alignment::Vertical::Bottom)
+        .into()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The chips
+// ---------------------------------------------------------------------------------------------
+
+/// The filter pills, then the sort pills, each a glass strip as the header's destinations are. One
+/// row, because they answer one question together: which games, in what order.
 fn chips_row<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
     let zone_lit = ctx.focus.zone() == BrowseZone::Chips;
     let cursor = ctx.focus.chip;
-    let mut chips = row![].spacing(10).align_y(Alignment::Center);
 
+    let mut filters = row![].spacing(4).align_y(Alignment::Center);
     for (i, filter) in Filter::ALL.iter().enumerate() {
         // "all" carries no count: it is the absence of a filter, and "all 374" beside the 374 the
         // system list shows for this system is the same number twice.
@@ -271,18 +420,14 @@ fn chips_row<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
             Filter::All => filter.label().to_string(),
             other => format!("{} {}", other.label(), ctx.counts.of(*other)),
         };
-        chips = chips.push(chip(
-            label,
-            ctx.filter == *filter,
-            zone_lit && cursor == i,
-            Message::FilterSelected(*filter),
-        ));
+        filters = filters.push(chip(label, ctx.filter == *filter, zone_lit && cursor == i, Message::FilterSelected(*filter)));
     }
 
-    chips = chips.push(Space::new().width(Length::Fixed(18.0)));
-
+    let mut sorts = row![container(lucide::arrow_up_down().size(14.0).color(theme::TEXT_SECONDARY)).padding([0.0, 6.0])]
+        .spacing(4)
+        .align_y(Alignment::Center);
     for (i, sort) in Sort::ALL.iter().enumerate() {
-        chips = chips.push(chip(
+        sorts = sorts.push(chip(
             sort.label().to_string(),
             ctx.sort == *sort,
             zone_lit && cursor == Filter::ALL.len() + i,
@@ -290,23 +435,60 @@ fn chips_row<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
         ));
     }
 
-    container(chips.padding([0, 16]))
-        .width(Length::Fill)
-        .padding(Padding::ZERO.top(LIST_TOP).bottom(10.0))
+    row![strip(filters), Space::new().width(Length::Fill), strip(sorts)]
+        .align_y(Alignment::Center)
+        .height(Length::Fixed(CHIPS_H))
+        // Lined up with the grid's tiles, both ends: the rail stands to the right of them.
+        .padding(Padding { top: 4.0, right: grid::GRID_PADDING + grid::ALPHA_RAIL_W, bottom: 0.0, left: grid::GRID_PADDING })
         .into()
 }
 
-fn chip<'a>(label: String, selected: bool, lit: bool, message: Message) -> Element<'a, Message> {
-    button(text(label).size(theme::text_size::LABEL_LARGE).font(if selected {
-        theme::SEMIBOLD
-    } else {
-        theme::MEDIUM
-    }))
-    .padding([6, 14])
-    .on_press(message)
-    .style(crate::ui::style::chip(selected, lit))
-    .into()
+/// A row of pills on the glass the header's pill is cut from.
+fn strip<'a>(pills: iced::widget::Row<'a, Message>) -> Element<'a, Message> {
+    container(pills)
+        .padding(4)
+        .style(|_| container::Style {
+            background: Some(Background::Color(glass(0.05))),
+            border: Border { color: glass(0.10), width: 1.0, radius: 999.0.into() },
+            ..Default::default()
+        })
+        .into()
 }
+
+/// One pill: the chosen one filled with the brightest ink and its words gone dark, as the header's
+/// current destination is. Under the pad's cursor a ring of the ink — or, on the ink's own fill,
+/// of the accent.
+fn chip<'a>(label: String, selected: bool, lit: bool, message: Message) -> Element<'a, Message> {
+    button(container(text(label).size(14.0).font(if selected { theme::SEMIBOLD } else { theme::MEDIUM })).center_y(Length::Fill))
+        .height(Length::Fixed(32.0))
+        .padding([0, 14])
+        .on_press(message)
+        .style(move |_, status| {
+            let hovered = matches!(status, button::Status::Hovered);
+            let fill = match (selected, lit || hovered) {
+                (true, _) => Some(theme::INK),
+                (false, true) => Some(glass(0.12)),
+                (false, false) => None,
+            };
+            let ring = match (lit, selected) {
+                (true, true) => theme::ACCENT_400,
+                (true, false) => theme::INK,
+                (false, _) => Color::TRANSPARENT,
+            };
+            button::Style {
+                background: fill.map(Background::Color),
+                text_color: if selected { theme::GROUND } else { alpha(theme::INK, 0.82) },
+                border: Border { color: ring, width: if lit { 2.0 } else { 0.0 }, radius: 999.0.into() },
+                shadow: Shadow::default(),
+                snap: true,
+            }
+        })
+        .into()
+}
+
+// ---------------------------------------------------------------------------------------------
+// The grid
+// ---------------------------------------------------------------------------------------------
 
 fn grid_column<'a>(ctx: BrowseContext<'a>, grid_focused: bool) -> Element<'a, Message> {
     let (spec, focus_index, filter) = (ctx.spec, ctx.focus.index(), ctx.filter);
@@ -418,7 +600,7 @@ fn tile<'a>(
 ) -> Element<'a, Message> {
     use crate::animation::{lerp, mix};
 
-    let (bright, rest) = crate::ui::home::hover_look(lit, hovered);
+    let (bright, rest) = home::hover_look(lit, hovered);
 
     // A tile is its game's *system's* cover shape — the packing gives a PS1 game a wider tile than a
     // PS2 one beside it — so a cover nearly always fills it, cropped by a hair at most. A scan of
@@ -435,11 +617,11 @@ fn tile<'a>(
     let art: Element<Message> = match game.cover_url.as_deref().and_then(|u| covers.handle(u)) {
         Some(handle) => image(handle.clone())
             .content_fit(if stray { ContentFit::Contain } else { ContentFit::Cover })
-            .width(Length::Fixed(w - 2.0 * crate::ui::home::RING))
-            .height(Length::Fixed(h - 2.0 * crate::ui::home::RING))
+            .width(Length::Fixed(w - 2.0 * home::RING))
+            .height(Length::Fixed(h - 2.0 * home::RING))
             .opacity(lerp(UNFOCUSED_DIM, 1.0, bright))
-            // Inside its ring, as on Home's shelves — see `home::ringed`.
-            .border_radius(8.0 - crate::ui::home::RING)
+            // Inside its ring, as on Home's shelves — see `home::ring_of`.
+            .border_radius(8.0 - home::RING)
             .into(),
         None => container(
             text(crate::ui::home::truncate(&game.title, 48))
@@ -454,21 +636,33 @@ fn tile<'a>(
         .into(),
     };
 
-    let cover = container(crate::ui::home::ringed(crate::ui::home::badged(art, &downloads.state_of(game.builds())), backdrop, rest, lit))
+    // Ringed in the brightest ink under the cursor, as Home's card is, and stood off the page by a
+    // shadow that comes up with it.
+    let ring = mix(rest, theme::INK, lit);
+    let cover = container(home::ring_of(home::badged(art, &downloads.state_of(game.builds())), backdrop, ring))
         .width(Length::Fixed(w))
         .height(Length::Fixed(h))
-        .clip(true);
+        .clip(true)
+        .style(move |_| container::Style {
+            shadow: Shadow {
+                color: alpha(Color::BLACK, 0.55 * lit),
+                offset: Vector::new(0.0, lerp(4.0, 14.0, lit)),
+                blur_radius: lerp(8.0, 32.0, lit),
+            },
+            border: Border { radius: 8.0.into(), ..Default::default() },
+            ..Default::default()
+        });
 
     let card = button(
         column![
             cover,
             Space::new().height(Length::Fixed(6.0)),
-            text(crate::ui::home::truncate(&game.title, 22))
+            text(home::truncate(&game.title, 22))
                 .size(theme::text_size::BODY_MEDIUM)
                 // Weight cannot be half a step, so it flips at the half-way point rather than
                 // interpolating. The colour underneath it is what carries the fade.
                 .font(if lit > 0.5 { theme::SEMIBOLD } else { theme::MEDIUM })
-                .color(mix(theme::TEXT_BODY, theme::TEXT_PRIMARY, bright)),
+                .color(mix(theme::TEXT_BODY, theme::INK, bright)),
         ]
         .width(Length::Fixed(w)),
     )
@@ -491,18 +685,28 @@ fn letter_rail<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
     for (i, (letter, target)) in ctx.view.letters.iter().enumerate() {
         let lit = lit_zone && ctx.focus.letter == i;
         rail = rail.push(
-            button(text(letter.to_string()).size(11.0).font(theme::BOLD))
-                .padding([1, 5])
+            button(container(text(letter.to_string()).size(11.0).font(theme::BOLD)).center_x(Length::Fill))
+                .width(Length::Fixed(20.0))
+                .padding([1, 0])
                 .on_press(Message::JumpToLetter(*target))
                 .style(move |_, status| {
                     let hovered = matches!(status, button::Status::Hovered);
+                    let fill = if lit {
+                        Some(theme::INK)
+                    } else if hovered {
+                        Some(glass(0.12))
+                    } else {
+                        None
+                    };
                     button::Style {
-                        background: Some(Background::Color(if lit || hovered {
-                            theme::ACCENT
+                        background: fill.map(Background::Color),
+                        text_color: if lit {
+                            theme::GROUND
+                        } else if hovered {
+                            theme::INK
                         } else {
-                            iced::Color::TRANSPARENT
-                        })),
-                        text_color: if lit || hovered { iced::Color::WHITE } else { theme::TEXT_MUTED },
+                            alpha(theme::INK, 0.62)
+                        },
                         border: Border { radius: 5.0.into(), ..Default::default() },
                         shadow: Shadow::default(),
                         snap: true,
@@ -511,7 +715,13 @@ fn letter_rail<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
         );
     }
 
-    container(scrollable(rail).on_scroll(|_| Message::Scrolled).height(Length::Fill))
+    // On a strip of glass as tall as its letters, rather than the whole height beside the grid.
+    let strip = container(rail).width(Length::Fixed(26.0)).padding([6, 0]).style(|_| container::Style {
+        background: Some(Background::Color(glass(0.05))),
+        border: Border { color: glass(0.10), width: 1.0, radius: 13.0.into() },
+        ..Default::default()
+    });
+    container(scrollable(strip).on_scroll(|_| Message::Scrolled).height(Length::Fill))
         .width(Length::Fixed(grid::ALPHA_RAIL_W))
         .height(Length::Fill)
         .padding([0, 4])

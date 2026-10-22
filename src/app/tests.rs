@@ -678,6 +678,60 @@ mod render {
         snapshot_sized(&app, "home-compact", (1280.0, 600.0));
     }
 
+    /// The Library in Home's look: the spotlight over a stand-in screenshot, the system list on its
+    /// panel, the pills and the grid — then with the cursor in the list, and up on the pills.
+    #[test]
+    #[ignore = "draws pages to PNGs for a person to look at"]
+    fn render_library() {
+        let mut app = paired_fixtures(90);
+        app.banner = None;
+        let host = app.host().to_string();
+        let mut games = app.library.all_games().to_vec();
+        let hues = [[90, 140, 220], [220, 120, 70], [80, 190, 120], [190, 90, 200], [220, 200, 80]];
+        for (i, game) in games.iter_mut().enumerate() {
+            let url = format!("{host}/cover/{}.png", game.rom_id);
+            let ratio = app.library.cover_ratio(&game.system_id);
+            let meta = covers::CoverMeta { ratio, dominant: Color::BLACK };
+            app.covers.insert(url.clone(), covers::Cover::Ready(picture_sized((300.0 * ratio) as u32, 300, hues[i % hues.len()]), meta));
+            game.cover_url = Some(url);
+            game.screenshots = vec![format!("{host}/shot/{}.jpg", game.rom_id)];
+            game.achievements = 40;
+        }
+        app.library = Arc::new(Library::new(app.library.systems.clone(), games));
+        let _ = app.update(Message::OpenSystem("snes".into()));
+        let shot = app.library_spotlit()[0].screenshots[0].clone();
+        let bytes = {
+            let iced::widget::image::Handle::Rgba { width, height, pixels, .. } = picture_sized(320, 240, [70, 130, 210]) else { unreachable!() };
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_raw(width, height, pixels.to_vec()).unwrap().write_to(&mut png, image::ImageFormat::Png).unwrap();
+            png.into_inner()
+        };
+        for (kind, target) in [
+            (covers::Kind::Spotlight, covers::Target { height_px: crate::ui::home::PICTURE.1, box_ratio: Some(crate::ui::home::PICTURE.0 / crate::ui::home::PICTURE.1) }),
+            (covers::Kind::Ambient, covers::Target::tall(40.0)),
+        ] {
+            let (handle, meta) = covers::prepare(&bytes, target, kind).unwrap();
+            app.covers.insert(covers::key(&shot, kind), covers::Cover::Ready(handle, meta));
+        }
+        app.backdrop = Default::default();
+        app.follow_spotlight();
+        app.backdrop = settled(std::mem::take(&mut app.backdrop));
+        app.fade = Default::default();
+        snapshot(&app, "library");
+
+        let _ = app.update(Message::Nav(Direction::Left));
+        let _ = app.update(Message::Nav(Direction::Down));
+        app.fade = Default::default();
+        snapshot(&app, "library-list");
+
+        let _ = app.update(Message::Nav(Direction::Up));
+        let _ = app.update(Message::Nav(Direction::Right));
+        let _ = app.update(Message::Nav(Direction::Up));
+        let _ = app.update(Message::Nav(Direction::Right));
+        app.fade = Default::default();
+        snapshot(&app, "library-chips");
+    }
+
     /// The header's right with a download coming and the saves in each state, and on the Downloads
     /// page, whose icon is then filled in.
     #[test]
@@ -1647,6 +1701,28 @@ fn search_is_typed_walked_into_and_left_back_where_it_was_opened() {
     assert!(!app.search_focus.query.is_empty());
     let _ = app.update(Message::Dismiss);
     assert!(matches!(app.screen, Screen::Browsing(Route::Home)));
+}
+
+#[test]
+fn the_library_spotlight_follows_the_grid_cursor_and_makes_way_in_a_short_window() {
+    let mut app = paired_fixtures(30);
+    let _ = app.update(Message::OpenSystem("snes".into()));
+    let grid: Vec<i64> = app.scope_view(&Scope::System("snes".into())).0.games.iter().map(|g| g.rom_id).collect();
+    assert_eq!(app.spotlit_id(), Some(grid[0]), "on the first tile");
+    let _ = app.update(Message::Nav(Direction::Right));
+    assert_eq!(app.spotlit_id(), Some(grid[1]), "and on the next");
+    assert_eq!(app.backdrop.waiting().or_else(|| app.backdrop.layers(std::time::Instant::now()).last().map(|(id, _)| id)), Some(grid[1]), "its picture with it");
+    let _ = app.view();
+
+    // Up on the chips, it stays on the game the grid's cursor rests on.
+    while app.browse_focus.zone() != crate::focus::BrowseZone::Chips {
+        let _ = app.update(Message::Nav(Direction::Up));
+    }
+    assert_eq!(app.spotlit_id(), Some(grid[1]));
+
+    app.content_height = crate::ui::tab_bar::TAB_BAR_HEIGHT + crate::ui::browse::HERO_BELOW - 1.0;
+    assert_eq!(app.spotlit_id(), None, "a short window gives the grid the room");
+    let _ = app.view();
 }
 
 #[test]
