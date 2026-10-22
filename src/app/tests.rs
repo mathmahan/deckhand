@@ -1955,7 +1955,7 @@ fn the_header_says_what_is_coming_and_where_the_saves_stand() {
 }
 
 #[test]
-fn a_cover_opened_from_its_grid_is_drawn_from_romms_big_copy_not_the_tiles() {
+fn a_cover_opened_from_its_grid_is_a_copy_of_its_own_not_the_tiles() {
     let (mut app, _) = App::new(Some(60));
     let mut games = app.library.all_games().to_vec();
     let url = format!("https://romm.lan/assets/romm/resources/roms/{}/cover/big.png", games[0].rom_id);
@@ -1971,7 +1971,13 @@ fn a_cover_opened_from_its_grid_is_drawn_from_romms_big_copy_not_the_tiles() {
     let wanted = app.wanted_art();
     let (_, target, kind) = wanted.iter().find(|(u, _, _)| *u == url).expect("the cover is asked for");
     assert_eq!(*kind, covers::Kind::Feature, "under a key of its own, so the grid's copy does not answer for it");
-    assert_eq!(covers::source_url(&url, *target), url, "from RomM's big copy");
+    // Drawn as tall as the facts beside it: RomM's small copy has the rows for that on a 1x panel,
+    // and only its big copy on a 2x one.
+    assert_eq!(covers::source_url(&url, *target), url.replace("big.png", "small.png"), "from RomM's small copy at 1x");
+    app.panel_density = 2.0;
+    let wanted = app.wanted_art();
+    let (_, target, _) = wanted.iter().find(|(u, _, _)| *u == url).expect("the cover is asked for");
+    assert_eq!(covers::source_url(&url, *target), url, "from RomM's big copy at 2x");
 
     // The tile's copy until the page's own has come, then that.
     assert_eq!(app.covers.feature(&url).map(|(h, _)| h), Some(tile));

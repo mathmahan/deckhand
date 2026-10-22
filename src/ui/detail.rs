@@ -1,7 +1,6 @@
 //! The game detail page — a port of `browse/ui/DetailView.kt`.
 //!
-//! Full-bleed art behind a legibility scrim, the cover beside the game's own transparent title art
-//! and its facts, the actions in a row under them, then the screenshots, the description and the
+//! Full-bleed art behind a legibility scrim, the cover beside the game's name and its facts, the actions in a row under them, then the screenshots, the description and the
 //! achievements. Every fact here comes off the library snapshot: the RomM list response already
 //! carries the summary, the metadata, the size and the screenshot paths, so opening a game costs no
 //! fetch and the page draws in the first frame.
@@ -19,11 +18,9 @@ use crate::downloads::{Downloads, SyncState};
 use crate::library::Game;
 use crate::theme::{self, alpha};
 
-/// How tall the art panel down the left is.
-pub const COVER_H: f32 = 380.0;
-
-/// The band the title art is fitted into, so a wide wordmark cannot shove the facts down the page.
-const LOGO_H: f32 = 96.0;
+/// How tall the cover down the left is: about as tall as the facts beside it, so a wide box's
+/// cover does not take half the page.
+pub const COVER_H: f32 = 190.0;
 
 /// How tall the screenshots are drawn in their row.
 pub const SCREENSHOT_H: f32 = 128.0;
@@ -410,28 +407,14 @@ fn facts<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     .into()
 }
 
-/// RomM's transparent title art where the game has one, the plain title otherwise.
+/// The game's name, as text: RomM's title art beside the cover was the name a second time, in the
+/// box's own lettering.
 fn title<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
-    let logo = ctx
-        .game
-        .logo_path
-        .as_deref()
-        .map(|p| ctx.asset(p))
-        .and_then(|url| ctx.covers.handle(&url).cloned());
-
-    match logo {
-        Some(handle) => container(
-            image(handle).content_fit(ContentFit::Contain).height(Length::Fixed(LOGO_H)),
-        )
-        .height(Length::Fixed(LOGO_H))
-        .align_left(Length::Fill)
-        .into(),
-        None => text(ctx.game.title.as_str())
-            .size(theme::text_size::DISPLAY_MEDIUM)
-            .font(theme::EXTRABOLD)
-            .color(theme::TEXT_PRIMARY)
-            .into(),
-    }
+    text(ctx.game.title.as_str())
+        .size(theme::text_size::DISPLAY_MEDIUM)
+        .font(theme::EXTRABOLD)
+        .color(theme::TEXT_PRIMARY)
+        .into()
 }
 
 /// Stars, the numeric rating, and when it was last played.

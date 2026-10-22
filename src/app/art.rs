@@ -49,9 +49,6 @@ impl App {
                     if let Some(url) = &game.cover_url {
                         wanted.push((url.clone(), covers::Target::tall(px(crate::ui::detail::COVER_H)), covers::Kind::Feature));
                     }
-                    if let Some(path) = &game.logo_path {
-                        wanted.push((self.asset_url(path), covers::Target::tall(px(96.0)), covers::Kind::Art));
-                    }
                     if let Some(path) = &game.marquee_path {
                         wanted.push((self.asset_url(path), covers::Target::tall(px(420.0)), covers::Kind::Backdrop));
                     }
