@@ -12,38 +12,48 @@
 //! from the pad: a path is walked to, folder by folder, and the two things that are text — a token,
 //! a command line — open a field over an on-screen keyboard.
 //!
-//! The shape is the original's: one flat list of card rows under section headers, a breadcrumb of
-//! pips naming the section the cursor is in, and every change written straight through — there is
-//! no apply step to forget.
+//! Drawn as Home and the Library are: the sections on a glass strip under the header, walked with the
+//! triggers as the Library's systems are, and one section at a time below it — its heading where
+//! Home has its spotlight, then its rows. On Saves the sync is a card beside the heading rather than
+//! a row. Every change is written straight through; there is no apply step to forget.
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Duration;
 
-use iced::alignment::Vertical;
-use iced::border;
 use iced::widget::text::Wrapping;
-use iced::widget::{self as widget, button, column, container, row, scrollable, text, Space};
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow};
+use iced::widget::{self as widget, button, column, container, image, row, scrollable, stack, text, Space};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding, Shadow, Vector};
+use iced_fonts::lucide;
 
 use crate::app::Message;
 use crate::config::{Connection, Settings};
 use crate::downloads::human_bytes;
-use crate::theme;
+use crate::theme::{self, alpha, glass};
 use crate::ui::home::truncated;
 
-/// A card's height, and the gap under it. Fixed, like every other scrolled page here, so the
-/// cursor's scroll offset is computed rather than measured.
-const CARD_H: f32 = 58.0;
-const CARD_GAP: f32 = 8.0;
+/// A row's height, and the gap under it.
+const ROW_H: f32 = 60.0;
+const ROW_GAP: f32 = 8.0;
 
-/// A section header: its title and one-line description, and the space above them.
-const HEADER_H: f32 = 72.0;
+/// The label's column: wide enough for the longest, so every value starts at one line down the page.
+const LABEL_W: f32 = 260.0;
 
-/// The longest value a card shows before it is cut. A card is one line tall, and an error message
-/// or a path that wrapped would spill out of it.
+/// The longest value a row shows before it is cut. A row is one line tall, and an error message or
+/// a path that wrapped would spill out of it.
 const VALUE_CHARS: usize = 72;
+
+/// The section's heading, beside the Saves section's sync card.
+const HEADING_W: f32 = 560.0;
+const SYNC_CARD_W: f32 = 420.0;
 
 pub fn settings_id() -> widget::Id {
     widget::Id::new("settings-page")
+}
+
+/// The row under the cursor, as the part of the page scrolled to it.
+pub fn cursor_id() -> widget::Id {
+    widget::Id::new("settings-cursor")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,19 +81,25 @@ impl Section {
         }
     }
 
+    /// What the section is for, under its name.
     fn description(self) -> &'static str {
         match self {
-            Section::Server => "Where your library lives.",
-            Section::Playing => "Which emulator starts your games.",
-            Section::Saves => "Battery saves kept in step with RomM.",
-            Section::Display => "How the library looks on this screen.",
-            Section::Storage => "What's kept on this device.",
-            Section::About => "Version, updates and paths.",
+            Section::Server => "The RomM server your library lives on, and this device's place on it.",
+            Section::Playing => "Which emulator starts a game, and how it picks up where you left off.",
+            Section::Saves => "Battery saves and states are kept in sync with RomM, so a game picks up where it was left on any device.",
+            Section::Display => "How large the page is drawn, and how many covers a row holds.",
+            Section::Storage => "Where downloads go, how much room they may take, and what is kept on this device.",
+            Section::About => "This build of Deckhand, its updates, and where its settings are kept.",
         }
     }
 
     fn position(self) -> usize {
         Section::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    /// Its rows, in page order.
+    pub fn rows(self) -> impl Iterator<Item = (usize, Row)> {
+        Row::ALL.into_iter().enumerate().filter(move |(_, row)| row.section() == self)
     }
 }
 
@@ -101,7 +117,6 @@ pub enum Row {
     SteamLibrary,
     RetroArchConfig,
     SaveFolder,
-    SyncSaves,
     WatchSaves,
     EsDeHooks,
     StatePictures,
@@ -118,7 +133,7 @@ pub enum Row {
 }
 
 impl Row {
-    pub const ALL: [Row; 25] = [
+    pub const ALL: [Row; 24] = [
         Row::ServerAddress,
         Row::Connection,
         Row::Certificate,
@@ -130,7 +145,6 @@ impl Row {
         Row::SteamLibrary,
         Row::RetroArchConfig,
         Row::SaveFolder,
-        Row::SyncSaves,
         Row::WatchSaves,
         Row::EsDeHooks,
         Row::StatePictures,
@@ -159,7 +173,6 @@ impl Row {
             Row::Resume => "Resume from the newest state",
             Row::RetroArchConfig => "RetroArch config",
             Row::SaveFolder => "RetroArch saves",
-            Row::SyncSaves => "Sync",
             Row::WatchSaves => "Sync as saves change",
             Row::EsDeHooks => "ES-DE launches",
             Row::StatePictures => "State pictures",
@@ -180,7 +193,7 @@ impl Row {
         match self {
             Row::ServerAddress | Row::Connection | Row::Certificate | Row::Device | Row::SignOut => Section::Server,
             Row::Launcher | Row::SystemEmulators | Row::Resume | Row::SteamLibrary => Section::Playing,
-            Row::RetroArchConfig | Row::SaveFolder | Row::SyncSaves | Row::WatchSaves | Row::EsDeHooks | Row::StatePictures => {
+            Row::RetroArchConfig | Row::SaveFolder | Row::WatchSaves | Row::EsDeHooks | Row::StatePictures => {
                 Section::Saves
             }
             Row::UiScale | Row::GridDensity => Section::Display,
@@ -226,7 +239,7 @@ impl Row {
     }
 }
 
-/// The page's cursor. One flat list, so one index.
+/// The page's cursor: a row, which says the section shown as well.
 #[derive(Debug, Default)]
 pub struct SettingsFocus {
     index: usize,
@@ -241,16 +254,34 @@ impl SettingsFocus {
         Row::ALL[self.index]
     }
 
+    pub fn section(&self) -> Section {
+        self.row().section()
+    }
+
     /// Put the cursor on a row — where a click landed.
     pub fn focus(&mut self, index: usize) {
         self.index = index.min(Row::ALL.len() - 1);
     }
 
-    /// Up/Down. The ends clamp: there is nothing above the first row or below the last to hand to.
+    /// Up/Down, inside the section shown. Its ends clamp: the next section is the triggers' to
+    /// show, and Up off its first row is Up into the bar.
     pub fn step(&mut self, delta: isize) -> bool {
-        let before = self.index;
-        self.index = self.index.saturating_add_signed(delta).min(Row::ALL.len() - 1);
-        self.index != before
+        let to = self.index.saturating_add_signed(delta).min(Row::ALL.len() - 1);
+        if to == self.index || Row::ALL[to].section() != self.section() {
+            return false;
+        }
+        self.index = to;
+        true
+    }
+
+    /// Show `section`, the cursor on its first row — where a click on the strip lands.
+    pub fn show(&mut self, section: Section) {
+        self.index = section.rows().next().map_or(0, |(index, _)| index);
+    }
+
+    /// The cursor's row is the first of its section, with the section's heading above it.
+    pub fn at_top(&self) -> bool {
+        self.section().rows().next().map(|(index, _)| index) == Some(self.index)
     }
 
     /// To the first row of the previous or next section — the keys that step systems everywhere
@@ -268,22 +299,6 @@ impl SettingsFocus {
             .unwrap_or(0);
         true
     }
-}
-
-/// How far down the list row `index`'s card starts: every section header up to and including its
-/// own, and every card before it.
-fn row_top(index: usize) -> f32 {
-    let headers = Row::ALL[index].section().position() + 1;
-    headers as f32 * HEADER_H + index as f32 * (CARD_H + CARD_GAP)
-}
-
-/// Where the list scrolls to for the cursor on row `index`: the card a quarter of the window down.
-///
-/// A quarter of the *window* is about a third of the list's own viewport once the tab bar, the
-/// header strip and the title are taken off it — the original's anchor, which keeps the rows after
-/// the cursor in view as well as the ones before it. The scrollable clamps the far end.
-pub fn scroll_offset(index: usize, window_h: f32) -> f32 {
-    (row_top(index) - window_h / 4.0).max(0.0)
 }
 
 /// What the last connection test found.
@@ -339,6 +354,10 @@ pub struct SettingsContext<'a> {
     /// while it is being looked for.
     pub retroarch_found: Option<&'a Option<PathBuf>>,
     pub save_sync: &'a SaveSync,
+    /// How the sync before a running one ended — what the sync card shows while one runs.
+    pub sync_before: &'a SaveSync,
+    /// How long ago the last sync finished, if one has this session.
+    pub synced_ago: Option<Duration>,
     /// Where Deckhand's own update stands — see [`crate::release`].
     pub release: &'a crate::release::Status,
     /// Whether this runs as an AppImage, the one build that installs an update itself.
@@ -366,136 +385,286 @@ pub struct SettingsContext<'a> {
 }
 
 pub fn settings_view<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
-    let title = column![
-        text("Settings")
-            .size(theme::text_size::HEADLINE_SMALL)
-            .font(theme::MEDIUM)
-            .color(theme::TEXT_PRIMARY),
-        pips(ctx.focus.row().section()),
-    ]
-    .spacing(10)
-    .padding(Padding { top: 20.0, right: 28.0, bottom: 4.0, left: 28.0 });
+    let section = ctx.focus.section();
+    let margin = crate::ui::tab_bar::MARGIN;
 
-    let mut list = column![];
-    for (i, setting) in Row::ALL.into_iter().enumerate() {
-        if i == 0 || Row::ALL[i - 1].section() != setting.section() {
-            list = list.push(section_header(setting.section()));
-        }
-        list = list.push(card(i, setting, ctx));
-        list = list.push(Space::new().height(Length::Fixed(CARD_GAP)));
+    let mut top = row![heading(section)].align_y(Alignment::Start);
+    if section == Section::Saves {
+        top = top.push(Space::new().width(Length::Fill)).push(sync_card(ctx));
     }
-    // Room under the last card, so it can scroll up to the same anchor as the rest instead of
-    // stopping pinned to the bottom edge.
-    list = list.push(Space::new().height(Length::Fixed(160.0)));
+    let mut rows = column![].spacing(ROW_GAP);
+    for (index, setting) in section.rows() {
+        rows = rows.push(setting_row(index, setting, ctx));
+    }
+    // Spaced so the tallest section, Saves with its card, fits a 1280x800 window at the Normal
+    // scale. Larger scales scroll, the cursor's row kept in view.
+    let body = column![top, Space::new().height(Length::Fixed(24.0)), rows, Space::new().height(Length::Fixed(16.0))]
+        .padding(Padding { top: 22.0, right: margin, bottom: 0.0, left: margin });
 
     column![
-        title,
-        scrollable(list.padding([0, 28]))
+        container(sections(section)).padding(Padding { top: 8.0, right: margin, bottom: 0.0, left: margin }),
+        scrollable(body)
             .id(settings_id())
             .on_scroll(|_| Message::Scrolled)
+            .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4).scroller_width(4).margin(4)))
             .width(Length::Fill)
             .height(Length::Fill),
+        hints(ctx),
     ]
     .into()
 }
 
-/// The breadcrumb under the title: one pip per section, the cursor's filled and named.
-fn pips<'a>(current: Section) -> Element<'a, Message> {
-    let mut bar = row![].align_y(Alignment::Center);
-    for (i, section) in Section::ALL.into_iter().enumerate() {
-        if i > 0 {
-            bar = bar.push(
-                container(Space::new().width(Length::Fixed(34.0)).height(Length::Fixed(2.0))).style(
-                    |_| container::Style {
-                        background: Some(Background::Color(theme::alpha(theme::NEUTRAL_100, 0.10))),
-                        ..Default::default()
-                    },
-                ),
-            );
-        }
-        let on = section == current;
-        let size = if on { 12.0 } else { 9.0 };
-        bar = bar.push(
-            container(Space::new().width(Length::Fixed(size)).height(Length::Fixed(size))).style(
-                move |_| container::Style {
-                    background: on.then_some(Background::Color(theme::ACCENT)),
-                    border: Border {
-                        color: if on { theme::ACCENT } else { theme::alpha(theme::NEUTRAL_100, 0.28) },
-                        width: 2.0,
-                        radius: (size / 2.0).into(),
-                    },
-                    ..Default::default()
-                },
-            ),
-        );
-        if on {
-            bar = bar.push(
-                text(section.title())
-                    .size(theme::text_size::LABEL_LARGE)
-                    .font(theme::SEMIBOLD)
-                    .color(theme::ACCENT)
-                    .wrapping(Wrapping::None),
-            );
-        }
-    }
-    bar.spacing(8).into()
+/// Under the page and the header: the ground Home's page stands on, and a wash of the accent at the
+/// top right where Home has its picture.
+pub fn backdrop<'a>() -> Element<'a, Message> {
+    let (w, h) = WASH_BOX;
+    stack![
+        crate::ui::home::ground(),
+        container(image(wash().clone()).content_fit(ContentFit::Fill).width(Length::Fixed(w)).height(Length::Fixed(h)))
+            .width(Length::Fill)
+            .align_right(Length::Fill),
+    ]
+    .into()
 }
 
-fn section_header<'a>(section: Section) -> Element<'a, Message> {
-    container(
-        column![
-            text(section.title())
-                .size(theme::text_size::TITLE_MEDIUM)
+/// The wash's box, at the window's top right.
+const WASH_BOX: (f32, f32) = (740.0, 400.0);
+
+/// The accent fading out from a little in from the window's top right corner: an ellipse's worth,
+/// of which the box shows the part inside the window. Drawn once, small — it has no edge to keep
+/// sharp — and stretched to the box.
+fn wash() -> &'static image::Handle {
+    static WASH: OnceLock<image::Handle> = OnceLock::new();
+    WASH.get_or_init(|| {
+        const SCALE: f32 = 5.0;
+        let (w, h) = ((WASH_BOX.0 / SCALE) as u32, (WASH_BOX.1 / SCALE) as u32);
+        // In the box's own units: the middle, and how far the light reaches across and down.
+        let (cx, cy, rx, ry) = (450.0, 90.0, 450.0, 310.0);
+        let [r, g, b, _] = theme::ACCENT_600.into_rgba8();
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let dx = ((x as f32 + 0.5) * SCALE - cx) / rx;
+                let dy = ((y as f32 + 0.5) * SCALE - cy) / ry;
+                let reach = (1.0 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+                rgba.extend([r, g, b, (0.30 * reach * 255.0).round() as u8]);
+            }
+        }
+        image::Handle::from_rgba(w, h, rgba)
+    })
+}
+
+/// The sections, on the glass the Library's filters stand in, with the triggers that walk them.
+fn sections<'a>(current: Section) -> Element<'a, Message> {
+    use crate::ui::browse::{chip, key, strip};
+    let mut pills = row![container(key("L2")).padding([0, 4])].spacing(4).align_y(Alignment::Center);
+    for section in Section::ALL {
+        pills = pills.push(chip(section.title().to_string(), section == current, false, Message::SettingsSection(section)));
+    }
+    strip(pills.push(container(key("R2")).padding([0, 4])))
+}
+
+/// The section's heading, where Home has its spotlight: where it is among the sections, its name,
+/// and what it is for.
+fn heading<'a>(section: Section) -> Element<'a, Message> {
+    column![
+        row![
+            crate::ui::home::tag("SETTINGS".into(), true),
+            text(format!("{} OF {}", section.position() + 1, Section::ALL.len()))
+                .size(13.0)
                 .font(theme::SEMIBOLD)
-                .color(theme::TEXT_PRIMARY),
-            text(section.description())
-                .size(theme::text_size::LABEL_LARGE)
                 .color(theme::TEXT_SECONDARY),
         ]
-        .spacing(2),
-    )
-    .height(Length::Fixed(HEADER_H))
-    .align_y(Vertical::Bottom)
-    .padding(Padding { bottom: 10.0, ..Padding::ZERO })
+        .spacing(12)
+        .align_y(Alignment::Center),
+        text(section.title()).size(theme::text_size::DISPLAY_MEDIUM).font(theme::DISPLAY).color(theme::INK),
+        text(section.description()).size(17.0).color(alpha(theme::INK, 0.86)),
+    ]
+    .spacing(12)
+    .width(Length::Fixed(HEADING_W))
     .into()
 }
 
-/// One card: the label on the left, the row's value and its control on the right.
-fn card<'a>(index: usize, setting: Row, ctx: &SettingsContext<'_>) -> Element<'a, Message> {
-    let lit = index == ctx.focus.index();
+/// The last sync, as a card beside the Saves heading: how it went and when, what it moved, and the
+/// button that runs it again — which X presses from anywhere in the section.
+///
+/// A sync running changes the icon alone: the card goes on saying how the one before it went until
+/// this one has something new to say, rather than emptying for the seconds it takes.
+fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
+    let when = |prefix: &str| ctx.synced_ago.map(|ago| format!("{prefix} {}", ago_words(ago))).unwrap_or_default();
+    let running = matches!(ctx.save_sync, SaveSync::Running);
+    let shown = if running { ctx.sync_before } else { ctx.save_sync };
+    let (icon, tone, headline, under) = match shown {
+        SaveSync::Idle | SaveSync::Running => (
+            lucide::cloud(),
+            theme::TEXT_SECONDARY,
+            "Not synced yet".to_string(),
+            "Sync now sends this device's saves up and brings RomM's down".to_string(),
+        ),
+        SaveSync::Done(report) if !report.failed.is_empty() => {
+            let n = report.failed.len();
+            (lucide::cloud_alert(), theme::WARNING, format!("{n} save{} didn't sync", if n == 1 { "" } else { "s" }), when("Last tried"))
+        }
+        SaveSync::Done(_) => (lucide::cloud(), theme::IN_SYNC, "Everything is in sync".to_string(), when("Last synced")),
+        // Why it could not start — no RomM to sync with, say — is the one thing to say about it.
+        SaveSync::Failed(why) => (lucide::cloud_off(), theme::WARNING, "The sync didn't run".to_string(), truncated(why.clone(), 60)),
+    };
+    let (icon, tone) = if running { (lucide::refresh_cw(), theme::ACCENT_400) } else { (icon, tone) };
+    let badge = container(icon.size(17.0).color(tone)).center(Length::Fixed(34.0)).style(move |_| container::Style {
+        background: Some(Background::Color(alpha(tone, 0.16))),
+        border: Border { radius: 17.0.into(), ..Default::default() },
+        ..Default::default()
+    });
+    let mut top = column![text(headline).size(18.0).font(theme::BOLD).color(theme::INK)].spacing(2);
+    if !under.is_empty() {
+        top = top.push(text(under).size(13.0).color(theme::TEXT_SECONDARY));
+    }
+    let mut card = column![row![badge, top].spacing(12).align_y(Alignment::Center)].spacing(14);
 
-    // The glowing left edge — the original's unambiguous "the cursor is here". Drawn clear on every
-    // other card rather than left out, so labels do not shift sideways as the cursor passes.
-    let edge = container(Space::new().width(Length::Fixed(4.0)).height(Length::Fixed(30.0))).style(
-        move |_| container::Style {
-            background: lit.then_some(Background::Color(theme::ACCENT)),
-            border: Border { radius: border::right(4.0), ..Default::default() },
-            ..Default::default()
-        },
-    );
-
-    let mut line = row![
-        edge,
-        text(setting.label())
-            .size(theme::text_size::BODY_LARGE)
-            .color(if lit { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY })
-            .wrapping(Wrapping::None)
-            .width(Length::Fill),
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center)
-    .height(Length::Fixed(CARD_H))
-    .padding(Padding { right: 18.0, ..Padding::ZERO });
-    for part in value(setting, ctx, lit) {
-        line = line.push(part);
+    // What the run moved, as counts. What each save went through is more than a line here can say.
+    if let SaveSync::Done(report) = shown {
+        let last = match report.failed.len() {
+            0 => (report.in_sync.to_string(), "already in sync", theme::IN_SYNC),
+            n => (n.to_string(), "failed", theme::WARNING),
+        };
+        let counts = [(report.pushed.len().to_string(), "went up", theme::INK), (report.pulled.len().to_string(), "came down", theme::INK), last];
+        let mut boxes = row![].spacing(8);
+        for (value, label, ink) in counts {
+            boxes = boxes.push(
+                container(column![text(value).size(22.0).font(theme::DISPLAY).color(ink), text(label).size(12.0).color(theme::TEXT_SECONDARY)].spacing(2))
+                    .width(Length::Fill)
+                    .padding([10, 12])
+                    .style(|_| container::Style {
+                        background: Some(Background::Color(glass(0.05))),
+                        border: Border { radius: 12.0.into(), ..Default::default() },
+                        ..Default::default()
+                    }),
+            );
+        }
+        card = card.push(boxes);
     }
 
-    button(line)
-        .width(Length::Fill)
-        .padding(0)
-        .on_press(Message::SettingsClicked(index))
-        .style(crate::ui::style::row(lit, 14.0))
+    // Pressable while one runs as well: a second press is let go — see `App::sync_saves`.
+    let press = button(
+        row![crate::ui::tab_bar::glyph("X", true), text("Sync now").size(15.0).font(theme::BOLD)]
+            .spacing(9)
+            .align_y(Alignment::Center),
+    )
+    .padding(Padding { top: 8.0, right: 18.0, bottom: 8.0, left: 10.0 })
+    .style(|_, status| button::Style {
+        background: Some(Background::Color(if matches!(status, button::Status::Hovered) { theme::ACCENT } else { theme::ACCENT_600 })),
+        text_color: Color::WHITE,
+        border: Border { radius: 12.0.into(), ..Default::default() },
+        shadow: Shadow::default(),
+        snap: true,
+    })
+    .on_press(Message::SyncNow);
+    card = card.push(press);
+
+    container(card)
+        .width(Length::Fixed(SYNC_CARD_W))
+        .padding([18, 22])
+        .style(|_| container::Style {
+            background: Some(Background::Color(glass(0.07))),
+            border: Border { color: glass(0.12), width: 1.0, radius: 20.0.into() },
+            ..Default::default()
+        })
         .into()
+}
+
+/// How long ago something was, the way the sync card says it.
+fn ago_words(ago: Duration) -> String {
+    match ago.as_secs() {
+        0..60 => "just now".to_string(),
+        s @ 60..3600 => format!("{} min ago", s / 60),
+        s @ 3600..86400 => format!("{} h ago", s / 3600),
+        s => format!("{} days ago", s / 86400),
+    }
+}
+
+/// One row: the label, the value beside it, and at the right what pressing it does — a chip, or the
+/// options of a stepped row. The cursor's is lifted on a ring of the brightest ink.
+fn setting_row<'a>(index: usize, setting: Row, ctx: &SettingsContext<'_>) -> Element<'a, Message> {
+    let lit = index == ctx.focus.index();
+    let parts = parts(setting, ctx);
+    let mut line = row![
+        text(setting.label())
+            .size(16.0)
+            .font(theme::SEMIBOLD)
+            .color(theme::INK)
+            .wrapping(Wrapping::None)
+            .width(Length::Fixed(LABEL_W)),
+    ]
+    .spacing(16)
+    .align_y(Alignment::Center)
+    .height(Length::Fill);
+    // The value takes the room between; without one, the room still goes between, so whatever is
+    // at the right stays there.
+    if !parts.iter().any(|part| matches!(part, Part::Words(..))) {
+        line = line.push(Space::new().width(Length::Fill));
+    }
+    for part in parts {
+        line = line.push(match part {
+            Part::Words(words, tone) => value_text(words, tone),
+            Part::Dot(ok) => status_dot(ok),
+            Part::Act(label, danger) => action_chip(label, lit, danger),
+            Part::Steps(options, selected) => segmented(setting, options, selected),
+        });
+    }
+
+    let row = button(line)
+        .width(Length::Fill)
+        .height(Length::Fixed(ROW_H))
+        .padding([0, 20])
+        .on_press(Message::SettingsClicked(index))
+        .style(move |_, status| {
+            let hovered = matches!(status, button::Status::Hovered);
+            button::Style {
+                background: Some(Background::Color(glass(if lit { 0.10 } else if hovered { 0.08 } else { 0.05 }))),
+                text_color: theme::INK,
+                border: Border { color: if lit { theme::INK } else { glass(0.10) }, width: if lit { 3.0 } else { 1.0 }, radius: 16.0.into() },
+                shadow: if lit {
+                    Shadow { color: alpha(Color::BLACK, 0.45), offset: Vector::new(0.0, 14.0), blur_radius: 32.0 }
+                } else {
+                    Shadow::default()
+                },
+                snap: true,
+            }
+        });
+    let row = container(row);
+    if lit { row.id(cursor_id()).into() } else { row.into() }
+}
+
+/// What A and X do where the cursor is, said quietly at the foot of the page.
+fn hints<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
+    let hint = |button: &'a str, words: &'a str| {
+        row![crate::ui::tab_bar::glyph(button, false), text(words).size(13.0).color(theme::TEXT_SECONDARY)].spacing(8).align_y(Alignment::Center)
+    };
+    let press = parts(ctx.focus.row(), ctx).into_iter().find_map(|part| match part {
+        Part::Act(label, _) => Some(label),
+        Part::Steps(..) => Some("Change"),
+        _ => None,
+    });
+    let mut line = row![Space::new().width(Length::Fill)].spacing(22).align_y(Alignment::Center);
+    if let Some(label) = press {
+        line = line.push(hint("A", label));
+    }
+    if ctx.focus.section() == Section::Saves {
+        line = line.push(hint("X", "Sync now"));
+    }
+    container(line).padding([0.0, crate::ui::tab_bar::MARGIN]).center_y(Length::Fixed(44.0)).into()
+}
+
+/// A piece of a row, right of its label.
+enum Part {
+    /// What the row says: its value, or where it stands.
+    Words(String, Tone),
+    /// Fine, wrong, or not known yet.
+    Dot(Option<bool>),
+    /// What pressing the row does, and whether it takes something away.
+    Act(&'static str, bool),
+    /// A stepped row's options, and which is set.
+    Steps(&'static [&'static str], usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -516,12 +685,12 @@ fn retroarch_note(chosen: Option<&PathBuf>, found: Option<&Option<PathBuf>>) -> 
     }
 }
 
-/// The right side of a card, by row.
-fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<'a, Message>> {
+/// The right side of a row, by row.
+fn parts(setting: Row, ctx: &SettingsContext<'_>) -> Vec<Part> {
     let connection = ctx.settings.connection.as_ref();
     match setting {
         // Read-only: pairing is what sets the address, together with a token that works for it.
-        Row::ServerAddress => vec![value_text(
+        Row::ServerAddress => vec![Part::Words(
             connection.map_or_else(|| "not paired".to_string(), |c| c.host.clone()),
             Tone::Accent,
         )],
@@ -534,7 +703,7 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
                 }
                 Check::Failed(error) => (Some(false), error.clone(), Tone::Warn),
             };
-            vec![status_dot(ok), value_text(note, tone), action_chip("Test", lit, false)]
+            vec![Part::Dot(ok), Part::Words(note, tone), Part::Act("Test", false)]
         }
         // Reachability and encryption are different facts, so they get different rows: a working
         // plaintext server is reachable, and the thing worth saying is where its token travels.
@@ -547,7 +716,7 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
                 Some(c) if c.insecure => ("self-signed · accepted at pairing", Tone::Plain),
                 Some(_) => ("verified", Tone::Plain),
             };
-            vec![value_text(note.to_string(), tone)]
+            vec![Part::Words(note.to_string(), tone)]
         }
         // Named so it can be found in RomM's token list: signing out here does not revoke it, and
         // revoking is done there.
@@ -565,24 +734,24 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
                 Installs::NotTied => " · pair by QR to take installs from RomM",
                 Installs::Unknown | Installs::Unavailable => "",
             };
-            vec![value_text(format!("{note}{installs}"), Tone::Plain)]
+            vec![Part::Words(format!("{note}{installs}"), Tone::Plain)]
         }
         // Local: the token stays valid in RomM, and revoking it is done there.
         Row::SignOut => vec![
-            value_text("downloaded games and saves stay on this device".to_string(), Tone::Plain),
-            action_chip("Sign out", lit, true),
+            Part::Words("downloaded games and saves stay on this device".to_string(), Tone::Plain),
+            Part::Act("Sign out", true),
         ],
         Row::Launcher => match ctx.settings.launch_command.as_deref().filter(|c| !c.is_empty()) {
-            Some(words) => vec![value_text(crate::launch::join_command(words), Tone::Plain), action_chip("Change", lit, false)],
+            Some(words) => vec![Part::Words(crate::launch::join_command(words), Tone::Plain), Part::Act("Change", false)],
             None if let Some((words, stops)) = &ctx.retrodeck_setup => {
-                let mut row = vec![value_text(words.clone(), Tone::Accent)];
+                let mut row = vec![Part::Words(words.clone(), Tone::Accent)];
                 if *stops {
-                    row.push(action_chip("Stop", lit, true));
+                    row.push(Part::Act("Stop", true));
                 }
                 row
             }
-            None if ctx.retrodeck => vec![value_text("RetroDECK".to_string(), Tone::Plain), action_chip("Change", lit, false)],
-            None => vec![value_text("RetroDECK · not installed".to_string(), Tone::Warn), action_chip("Change", lit, false)],
+            None if ctx.retrodeck => vec![Part::Words("RetroDECK".to_string(), Tone::Plain), Part::Act("Change", false)],
+            None => vec![Part::Words("RetroDECK · not installed".to_string(), Tone::Warn), Part::Act("Change", false)],
         },
         Row::SystemEmulators => {
             let note = match ctx.system_emulators.as_slice() {
@@ -591,57 +760,37 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
                 [first @ .., last] if first.len() < 3 => format!("set for {} and {last}", first.join(", ")),
                 many => format!("set for {} systems", many.len()),
             };
-            vec![value_text(note, Tone::Plain), action_chip("Change", lit, false)]
+            vec![Part::Words(note, Tone::Plain), Part::Act("Change", false)]
         }
         Row::SteamLibrary => match ctx.steam {
-            None => vec![value_text("Steam not found on this device".to_string(), Tone::Plain)],
-            Some((_, 0)) => vec![value_text("nothing downloaded yet".to_string(), Tone::Plain)],
+            None => vec![Part::Words("Steam not found on this device".to_string(), Tone::Plain)],
+            Some((_, 0)) => vec![Part::Words("nothing downloaded yet".to_string(), Tone::Plain)],
             Some((added, all)) if added >= all => vec![
-                value_text(format!("all {all} downloaded games"), Tone::Plain),
-                action_chip("Refresh", lit, false),
+                Part::Words(format!("all {all} downloaded games"), Tone::Plain),
+                Part::Act("Refresh", false),
             ],
             Some((added, all)) => vec![
-                value_text(format!("{added} of {all} downloaded games"), Tone::Plain),
-                action_chip("Add all", lit, false),
+                Part::Words(format!("{added} of {all} downloaded games"), Tone::Plain),
+                Part::Act("Add all", false),
             ],
         },
         Row::RetroArchConfig => {
             let (note, tone) = retroarch_note(ctx.settings.retroarch_config.as_ref(), ctx.retroarch_found);
-            vec![value_text(note, tone), action_chip("Change", lit, false)]
+            vec![Part::Words(note, tone), Part::Act("Change", false)]
         }
         Row::SaveFolder => vec![match ctx.save_folder {
-            None => value_text("looking…".to_string(), Tone::Plain),
-            Some(Ok(folder)) => value_text(folder.display().to_string(), Tone::Plain),
-            Some(Err(why)) => value_text(why.clone(), Tone::Warn),
+            None => Part::Words("looking…".to_string(), Tone::Plain),
+            Some(Ok(folder)) => Part::Words(folder.display().to_string(), Tone::Plain),
+            Some(Err(why)) => Part::Words(why.clone(), Tone::Warn),
         }],
-        Row::SyncSaves => {
-            let (ok, note, tone) = match ctx.save_sync {
-                SaveSync::Idle => (None, "not synced yet".to_string(), Tone::Plain),
-                SaveSync::Running => (None, "syncing…".to_string(), Tone::Plain),
-                // A failure leads, with its reason, since the counts alone do not say which save.
-                // Then a save set aside, which names where its copy went: the one line that tells
-                // anyone the backups folder is there, said when there is something in it to want.
-                SaveSync::Done(report) => {
-                    let said = report.conflicts.first().or(report.removed.first()).or(report.notes.first());
-                    match (report.failed.first(), said) {
-                        (Some(first), _) => (Some(false), format!("{} · {first}", report.summary()), Tone::Warn),
-                        // Something said about a run that moved nothing is the reason it moved nothing.
-                        (None, Some(note)) => (Some(true), format!("{} · {note}", report.summary()), Tone::Plain),
-                        (None, None) => (Some(true), report.summary(), Tone::Plain),
-                    }
-                }
-                SaveSync::Failed(why) => (Some(false), why.clone(), Tone::Warn),
-            };
-            vec![status_dot(ok), value_text(note, tone), action_chip("Sync now", lit, false)]
-        }
         Row::EsDeHooks => match ctx.hooks {
-            None => vec![value_text("looking…".to_string(), Tone::Plain)],
+            None => vec![Part::Words("looking…".to_string(), Tone::Plain)],
             Some(status) => {
                 let (ok, note) = status.describe();
                 let chip = if ok { "Remove" } else if status.installed { "Reinstall" } else { "Install" };
-                let mut row = vec![status_dot(Some(ok)), value_text(note, if ok { Tone::Plain } else { Tone::Warn })];
+                let mut row = vec![Part::Dot(Some(ok)), Part::Words(note, if ok { Tone::Plain } else { Tone::Warn })];
                 if status.retrodeck {
-                    row.push(action_chip(chip, lit, false));
+                    row.push(Part::Act(chip, false));
                 }
                 row
             }
@@ -649,25 +798,33 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
         // RetroArch's own setting, which save sync sends the pictures of: on, off, or on but turned off
         // again by an override, which is named rather than edited.
         Row::StatePictures => match ctx.state_pictures {
-            None => vec![value_text("looking…".to_string(), Tone::Plain)],
-            Some(Err(_)) => vec![value_text("no RetroArch config found".to_string(), Tone::Plain)],
+            None => vec![Part::Words("looking…".to_string(), Tone::Plain)],
+            Some(Err(_)) => vec![Part::Words("no RetroArch config found".to_string(), Tone::Plain)],
             Some(Ok(pictures)) if !pictures.on => vec![
-                status_dot(Some(false)),
-                value_text("off · states reach RomM without a picture".to_string(), Tone::Warn),
-                action_chip("Turn on", lit, false),
+                Part::Dot(Some(false)),
+                Part::Words("off · states reach RomM without a picture".to_string(), Tone::Warn),
+                Part::Act("Turn on", false),
             ],
             Some(Ok(pictures)) if !pictures.off_in.is_empty() => {
                 let count = pictures.off_in.len();
                 let note = format!("on · off again in {count} override{}", if count == 1 { "" } else { "s" });
-                vec![status_dot(Some(false)), value_text(note, Tone::Warn), action_chip("Show", lit, false)]
+                vec![Part::Dot(Some(false)), Part::Words(note, Tone::Warn), Part::Act("Show", false)]
             }
-            Some(Ok(_)) => vec![status_dot(Some(true)), value_text("on · each state keeps a picture".to_string(), Tone::Plain)],
+            Some(Ok(_)) => vec![Part::Dot(Some(true)), Part::Words("on · each state keeps a picture".to_string(), Tone::Plain)],
         },
-        Row::UiScale | Row::GridDensity | Row::Budget | Row::Resume | Row::WatchSaves => setting
-            .stepped(ctx.settings)
-            .map(|(options, selected)| segmented(setting, options, selected, lit))
-            .into_iter()
-            .collect(),
+        // What the row decides, beside its options.
+        Row::UiScale | Row::GridDensity | Row::Budget | Row::Resume | Row::WatchSaves => {
+            let what = match setting {
+                Row::UiScale => "How large everything is drawn",
+                Row::GridDensity => "How many covers a row of the Library holds",
+                Row::Budget => "The longest unplayed games make room when a download would pass it",
+                Row::Resume => "A game starts from its newest save state",
+                _ => "A save goes up a few seconds after the game writes it",
+            };
+            let mut parts = vec![Part::Words(what.to_string(), Tone::Plain)];
+            parts.extend(setting.stepped(ctx.settings).map(|(options, selected)| Part::Steps(options, selected)));
+            parts
+        }
         // Picked from a list of the drives here rather than typed: a path is not something a D-pad
         // can type.
         Row::RomsFolder => {
@@ -675,7 +832,7 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
             let free = crate::downloads::storage::available(&dir)
                 .map(|f| format!(" · {} free", human_bytes(f)))
                 .unwrap_or_default();
-            vec![value_text(format!("{}{free}", dir.display()), Tone::Plain), action_chip("Change", lit, false)]
+            vec![Part::Words(format!("{}{free}", dir.display()), Tone::Plain), Part::Act("Change", false)]
         }
         Row::Downloaded => {
             let count = ctx.downloads.installed_count();
@@ -693,7 +850,7 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
             };
             // The removing is done on the Downloads page, where each game's own size is beside it —
             // a total is the wrong place to decide which one goes.
-            vec![value_text(note, Tone::Plain), action_chip("Manage", lit, false)]
+            vec![Part::Words(note, Tone::Plain), Part::Act("Manage", false)]
         }
         Row::ImageCache => {
             let note = match ctx.image_cache {
@@ -701,148 +858,135 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
                 Some(0) => "empty".to_string(),
                 Some(bytes) => format!("{} on disk", human_bytes(bytes)),
             };
-            vec![value_text(note, Tone::Plain), action_chip("Clear", lit, true)]
+            vec![Part::Words(note, Tone::Plain), Part::Act("Clear", true)]
         }
         Row::LibraryCache => vec![
-            value_text(format!("{} games · {} systems", ctx.games, ctx.systems), Tone::Plain),
-            action_chip("Refresh", lit, false),
+            Part::Words(format!("{} games · {} systems", ctx.games, ctx.systems), Tone::Plain),
+            Part::Act("Refresh", false),
         ],
-        Row::Version => vec![value_text(env!("CARGO_PKG_VERSION").to_string(), Tone::Plain)],
+        Row::Version => vec![Part::Words(env!("CARGO_PKG_VERSION").to_string(), Tone::Plain)],
         Row::Updates => {
             use crate::release::Status;
             match ctx.release {
-                Status::Unasked => vec![value_text("not asked yet".to_string(), Tone::Plain), action_chip("Check", lit, false)],
-                Status::Checking => vec![value_text("asking…".to_string(), Tone::Plain)],
+                Status::Unasked => vec![Part::Words("not asked yet".to_string(), Tone::Plain), Part::Act("Check", false)],
+                Status::Checking => vec![Part::Words("asking…".to_string(), Tone::Plain)],
                 Status::Current => vec![
-                    status_dot(Some(true)),
-                    value_text("this is the newest".to_string(), Tone::Plain),
-                    action_chip("Check", lit, false),
+                    Part::Dot(Some(true)),
+                    Part::Words("this is the newest".to_string(), Tone::Plain),
+                    Part::Act("Check", false),
                 ],
                 Status::Out(release) => {
                     let about = release.headline.as_ref().map(|h| format!(" · {h}")).unwrap_or_default();
-                    let mut row = vec![value_text(format!("{} is out{about}", release.version), Tone::Accent)];
+                    let mut row = vec![Part::Words(format!("{} is out{about}", release.version), Tone::Accent)];
                     // Anything but an AppImage is updated by hand; pressing the row says where from.
                     if ctx.appimage && release.appimage.is_some() {
-                        row.push(action_chip("Install", lit, false));
+                        row.push(Part::Act("Install", false));
                     }
                     row
                 }
-                Status::Installing(release, fraction) => vec![value_text(
+                Status::Installing(release, fraction) => vec![Part::Words(
                     format!("downloading {} · {}%", release.version, (fraction * 100.0).round() as u32),
                     Tone::Plain,
                 )],
                 Status::Installed(release) => vec![
-                    status_dot(Some(true)),
-                    value_text(format!("{} is in place · restart to use it", release.version), Tone::Plain),
-                    action_chip("Restart", lit, false),
+                    Part::Dot(Some(true)),
+                    Part::Words(format!("{} is in place · restart to use it", release.version), Tone::Plain),
+                    Part::Act("Restart", false),
                 ],
                 Status::Failed(why, release) => vec![
-                    status_dot(Some(false)),
-                    value_text(why.clone(), Tone::Warn),
-                    action_chip(if release.is_some() { "Retry" } else { "Check" }, lit, false),
+                    Part::Dot(Some(false)),
+                    Part::Words(why.clone(), Tone::Warn),
+                    Part::Act(if release.is_some() { "Retry" } else { "Check" }, false),
                 ],
             }
         }
-        Row::ConfigFile => vec![value_text(Settings::file().display().to_string(), Tone::Plain)],
+        Row::ConfigFile => vec![Part::Words(Settings::file().display().to_string(), Tone::Plain)],
     }
 }
 
 fn value_text<'a>(value: String, tone: Tone) -> Element<'a, Message> {
     text(truncated(value, VALUE_CHARS))
-        .size(theme::text_size::BODY_MEDIUM)
+        .size(theme::text_size::LABEL_LARGE)
         .color(match tone {
             Tone::Plain => theme::TEXT_SECONDARY,
-            Tone::Accent => theme::ACCENT,
-            Tone::Warn => theme::ERROR,
+            Tone::Accent => theme::ACCENT_400,
+            Tone::Warn => theme::WARNING,
         })
         .wrapping(Wrapping::None)
+        .width(Length::Fill)
         .into()
 }
 
-/// Reachable, failed, or not known yet.
+/// Fine, wrong, or not known yet.
 fn status_dot<'a>(ok: Option<bool>) -> Element<'a, Message> {
     let color = match ok {
-        Some(true) => theme::ACCENT,
-        Some(false) => theme::ERROR,
-        None => theme::alpha(theme::NEUTRAL_100, 0.25),
+        Some(true) => theme::IN_SYNC,
+        Some(false) => theme::WARNING,
+        None => alpha(theme::INK, 0.25),
     };
-    container(Space::new().width(Length::Fixed(9.0)).height(Length::Fixed(9.0)))
+    container(Space::new().width(Length::Fixed(8.0)).height(Length::Fixed(8.0)))
         .style(move |_| container::Style {
             background: Some(Background::Color(color)),
-            border: Border { radius: 4.5.into(), ..Default::default() },
+            border: Border { radius: 4.0.into(), ..Default::default() },
             ..Default::default()
         })
         .into()
 }
 
-/// The chip naming what pressing the row does. Drawn rather than a button of its own: the whole
-/// card is the button, so the pointer and the pad do the same thing wherever they land on it.
+/// The pill naming what pressing the row does — filled with the ink under the cursor, as the
+/// button A presses. Drawn rather than a button of its own: the whole row is the button, so the
+/// pointer and the pad do the same thing wherever they land on it.
 fn action_chip<'a>(label: &'a str, lit: bool, danger: bool) -> Element<'a, Message> {
-    let ink = match (lit, danger) {
-        (false, _) => theme::TEXT_SECONDARY,
-        (true, true) => theme::ERROR,
-        (true, false) => theme::ACCENT,
+    let (fill, ink) = match (lit, danger) {
+        (false, _) => (glass(0.08), theme::INK),
+        (true, false) => (theme::INK, theme::GROUND),
+        (true, true) => (theme::ERROR, Color::WHITE),
     };
-    container(
-        text(label)
-            .size(theme::text_size::LABEL_LARGE)
-            .font(theme::MEDIUM)
-            .color(ink),
-    )
-    .padding([6, 14])
-    .style(move |_| container::Style {
-        border: Border {
-            color: if lit { theme::FOCUS_RING } else { theme::BORDER },
-            width: 1.0,
-            radius: 9.0.into(),
-        },
-        ..Default::default()
-    })
-    .into()
+    container(text(label).size(13.0).font(theme::SEMIBOLD).color(ink))
+        .height(Length::Fixed(30.0))
+        .padding([0, 14])
+        .center_y(Length::Fixed(30.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(fill)),
+            border: Border { color: if lit { Color::TRANSPARENT } else { glass(0.14) }, width: 1.0, radius: 15.0.into() },
+            ..Default::default()
+        })
+        .into()
 }
 
-/// The original's segmented control. Each option is a button of its own, so a click picks it
-/// directly; the pad walks it with Left/Right, and Confirm on the card cycles it.
-fn segmented<'a>(
-    setting: Row,
-    options: &'static [&'static str],
-    selected: usize,
-    lit: bool,
-) -> Element<'a, Message> {
-    let mut bar = row![].spacing(2);
+/// A stepped row's options, on the glass strip the Library's filters stand in, the one set filled
+/// with the ink. Each is a button of its own, so a click picks it directly; the pad walks them with
+/// Left/Right, and Confirm on the row steps on to the next.
+fn segmented<'a>(setting: Row, options: &'static [&'static str], selected: usize) -> Element<'a, Message> {
+    let mut pills = row![].spacing(3).align_y(Alignment::Center);
     for (i, option) in options.iter().enumerate() {
         let on = i == selected;
-        bar = bar.push(
-            button(
-                text(*option)
-                    .size(theme::text_size::LABEL_LARGE)
-                    .font(if on { theme::SEMIBOLD } else { theme::REGULAR }),
-            )
-            .padding([5, 12])
-            .on_press(Message::SettingsPick(setting, i))
-            .style(move |_, status| {
-                let hovered = matches!(status, button::Status::Hovered);
-                let (fill, ink) = match (on, lit) {
-                    (true, true) => (Some(theme::ACCENT), Color::WHITE),
-                    (true, false) => (Some(theme::NEUTRAL_800), theme::TEXT_PRIMARY),
-                    (false, _) if hovered => (Some(theme::ACCENT_800), theme::TEXT_PRIMARY),
-                    (false, _) => (None, theme::TEXT_SECONDARY),
-                };
-                button::Style {
-                    background: fill.map(Background::Color),
-                    text_color: ink,
-                    border: Border { radius: 8.0.into(), ..Default::default() },
-                    shadow: Shadow::default(),
-                    snap: true,
-                }
-            }),
+        pills = pills.push(
+            button(container(text(*option).size(13.0).font(if on { theme::SEMIBOLD } else { theme::MEDIUM })).center_y(Length::Fill))
+                .height(Length::Fixed(28.0))
+                .padding([0, 16])
+                .on_press(Message::SettingsPick(setting, i))
+                .style(move |_, status| {
+                    let hovered = matches!(status, button::Status::Hovered);
+                    button::Style {
+                        background: match (on, hovered) {
+                            (true, _) => Some(Background::Color(theme::INK)),
+                            (false, true) => Some(Background::Color(glass(0.12))),
+                            (false, false) => None,
+                        },
+                        text_color: if on { theme::GROUND } else { alpha(theme::INK, 0.82) },
+                        border: Border { radius: 999.0.into(), ..Default::default() },
+                        shadow: Shadow::default(),
+                        snap: true,
+                    }
+                }),
         );
     }
-    container(bar)
+    container(pills)
         .padding(3)
         .style(|_| container::Style {
-            background: Some(Background::Color(theme::alpha(Color::BLACK, 0.25))),
-            border: Border { radius: 10.0.into(), ..Default::default() },
+            background: Some(Background::Color(glass(0.06))),
+            border: Border { color: glass(0.12), width: 1.0, radius: 999.0.into() },
             ..Default::default()
         })
         .into()
@@ -853,14 +997,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_cursor_clamps_at_both_ends_of_the_list() {
+    fn the_cursor_clamps_at_both_ends_of_its_section() {
         let mut focus = SettingsFocus::default();
         assert!(!focus.step(-1), "nothing above the first row");
-        for _ in 0..Row::ALL.len() * 2 {
+        for _ in 0..Row::ALL.len() {
+            focus.step(1);
+        }
+        assert_eq!(focus.row(), Row::SignOut, "the last of the server's rows: the next section is the triggers'");
+        assert!(!focus.step(1));
+        focus.show(Section::About);
+        assert!(focus.at_top());
+        for _ in 0..Row::ALL.len() {
             focus.step(1);
         }
         assert_eq!(focus.row(), *Row::ALL.last().unwrap());
-        assert!(!focus.step(1), "nothing below the last row");
+        assert!(!focus.at_top());
     }
 
     #[test]
@@ -886,19 +1037,11 @@ mod tests {
     }
 
     #[test]
-    fn every_row_starts_below_its_own_section_header() {
-        // Headers and cards are fixed height, so each row's first card sits exactly one header
-        // below where the previous section's last card ended.
-        for (i, setting) in Row::ALL.iter().enumerate().skip(1) {
-            let step = row_top(i) - row_top(i - 1);
-            let expected = if Row::ALL[i - 1].section() != setting.section() {
-                CARD_H + CARD_GAP + HEADER_H
-            } else {
-                CARD_H + CARD_GAP
-            };
-            assert_eq!(step, expected, "row {i} ({setting:?})");
-        }
-        assert_eq!(scroll_offset(0, 800.0), 0.0, "the first row never scrolls the page");
+    fn a_sync_says_how_long_ago_in_the_largest_whole_unit() {
+        assert_eq!(ago_words(Duration::from_secs(12)), "just now");
+        assert_eq!(ago_words(Duration::from_secs(150)), "2 min ago");
+        assert_eq!(ago_words(Duration::from_secs(7300)), "2 h ago");
+        assert_eq!(ago_words(Duration::from_secs(3 * 86400 + 5)), "3 days ago");
     }
 
     #[test]

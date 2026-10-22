@@ -469,6 +469,11 @@ impl App {
                 self.activate()
             }
             Message::SettingsPick(setting, option) => self.pick_setting(setting, option),
+            Message::SettingsSection(section) => {
+                self.settings_focus.show(section);
+                self.scroll_cursor_into_view()
+            }
+            Message::SyncNow => self.sync_saves(),
             Message::ConnectionTested(result) => {
                 self.connection_check = match result {
                     Ok(user) => Check::Reachable(user),
