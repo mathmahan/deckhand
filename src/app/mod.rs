@@ -53,6 +53,7 @@ mod playing;
 mod queue;
 mod release;
 mod retrodeck;
+mod save_sync;
 mod settings;
 mod view;
 #[cfg(test)]
@@ -194,8 +195,11 @@ pub enum Message {
     SettingsClicked(usize),
     /// A section on the strip was clicked: show it, the cursor on its first row.
     SettingsSection(crate::ui::settings::Section),
-    /// Sync every save now: the sync card's button, and X on the Saves section.
+    /// Sync every save now: the sync card's button, and X on the Saves section and the save sync
+    /// page.
     SyncNow,
+    /// Show what the last sync did of one kind — see [`crate::ui::save_sync::Filter`].
+    SyncFilter(crate::ui::save_sync::Filter),
     /// Set a stepped setting — UI scale, grid density — to one of its options, by index.
     SettingsPick(SettingRow, usize),
     /// The connection test's answer: the account the token reads as, or why it could not.
@@ -412,6 +416,9 @@ enum Route {
     Search { from: Box<Route> },
     /// One game's saves and states, pushed over its detail page — see [`crate::game_saves`].
     Saves { rom_id: i64, from: Box<Route> },
+    /// What the last sync of every save did, game by game, over the page it was opened from — see
+    /// [`crate::ui::save_sync`].
+    Sync { from: Box<Route> },
 }
 
 impl Route {
@@ -426,6 +433,7 @@ impl Route {
             Route::Detail { from, .. } | Route::Saves { from, .. } => from.tab(),
             Route::Downloads => Tab::Downloads,
             Route::Settings => Tab::Settings,
+            Route::Sync { .. } => Tab::Sync,
         }
     }
 }
@@ -465,6 +473,7 @@ pub struct App {
     collections_scroll: f32,
     browse_focus: crate::focus::BrowseFocus,
     detail_focus: crate::ui::detail::DetailFocus,
+    sync_focus: crate::ui::save_sync::SyncFocus,
     /// The achievements' list is open on game pages. For the session, across games: someone who
     /// opens it on one is reading them, and finds it open on the next.
     achievements_open: bool,
@@ -698,6 +707,7 @@ impl App {
             collections_scroll: 0.0,
             browse_focus: Default::default(),
             detail_focus: Default::default(),
+            sync_focus: Default::default(),
             achievements_open: false,
             filter: Default::default(),
             sort: Default::default(),
@@ -1040,6 +1050,11 @@ impl App {
             || self.glide.is_animating(now)
         {
             subscriptions.push(iced::window::frames().map(|_| Message::Redraw));
+        }
+        // How far a running sync has got, said on the save sync page as it goes — only while one runs
+        // and the page is open; the sync itself says nothing until it is over.
+        if matches!(self.save_sync, SaveSync::Running) && matches!(self.screen, Screen::Browsing(Route::Sync { .. })) {
+            subscriptions.push(iced::time::every(std::time::Duration::from_millis(400)).map(|_| Message::Redraw));
         }
 
         // Saves synced as they change — see `watch`. Only for the Deckhand on the device that holds

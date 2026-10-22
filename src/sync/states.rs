@@ -469,7 +469,7 @@ impl Run<'_> {
     pub(super) async fn states(&mut self, dir: &Path, stem: &str, rom_id: i64, core: &Core) {
         let (server, foreign) = match self.fetch_states(rom_id, core).await {
             Ok(states) => states,
-            Err(why) => return self.report.failed.push(format!("{stem}.state: {why}")),
+            Err(why) => return self.report.fail(Some(rom_id), &format!("{stem}.state"), true, why),
         };
         let tag = core.tag();
         let here = on_disk(dir, stem);
@@ -485,6 +485,7 @@ impl Run<'_> {
         {
             let maker = made_by(other).unwrap_or("another core");
             let here = core.name().unwrap_or("this core");
+            self.report.left(Some(rom_id), &other.file_name, true, format!("Made with {maker}, which {here} can't load, so it stays on RomM"));
             self.report.other_cores.push(format!("a newer save state made with {maker} stays on RomM — {here} can't load it"));
         }
 
@@ -576,13 +577,13 @@ impl Run<'_> {
         };
         let bytes = match fs::read(&live) {
             Ok(bytes) => bytes,
-            Err(e) => return self.report.failed.push(format!("{name}: {e}")),
+            Err(e) => return self.report.fail(Some(rom_id), &name, true, e),
         };
         let hash = md5_hex(&bytes);
         let local_changed = agreed.as_ref().is_none_or(|e| e.hash != hash);
         let server_changed = pair.remote.is_some_and(|r| agreed.as_ref().is_none_or(|e| !same_version(e, r)));
         match (local_changed, server_changed, pair.remote) {
-            (false, false, _) => self.report.in_sync += 1,
+            (false, false, _) => self.report.agreed(Some(rom_id), &name, true),
             (true, false, remote) => {
                 // A slot new to the index that holds one of the old history's states as it came: RomM
                 // has it, and this slot sends its own up the next time it changes.
@@ -591,7 +592,7 @@ impl Run<'_> {
                     && let Some(old) = held.iter().find(|e| e.hash == hash)
                 {
                     if self.remember_state(&pair.key, rom_id, hash, old.save_id, old.synced_at.clone(), &name) {
-                        self.report.in_sync += 1;
+                        self.report.agreed(Some(rom_id), &name, true);
                     }
                     return;
                 }
@@ -599,10 +600,10 @@ impl Run<'_> {
             }
             (false, true, Some(remote)) => self.pull_state(&pair, rom_id, remote, &name, Some(&hash)).await,
             (true, true, Some(remote)) => {
-                let Some(theirs) = self.download_state(remote, &name).await else { return };
+                let Some(theirs) = self.download_state(remote, rom_id, &name).await else { return };
                 if md5_hex(&theirs) == hash {
                     if self.remember_state(&pair.key, rom_id, hash, remote.id, remote.updated_at.clone(), &name) {
-                        self.report.in_sync += 1;
+                        self.report.agreed(Some(rom_id), &name, true);
                     }
                     return;
                 }
@@ -611,16 +612,18 @@ impl Run<'_> {
                 if super::choose(&name, local_time, remote_time, bytes.len() as u64).await == super::Choice::Remote {
                     let Some(kept) = self.back_up(&live, &bytes, &name) else { return };
                     if self.write_state(&pair, rom_id, remote, &theirs, &name) {
-                        self.report.conflicts.push(format!("{name}: kept RomM's state; this device's is at {}", kept.display()));
+                        let said = format!("{name}: kept RomM's state; this device's is at {}", kept.display());
+                        self.report.settled(Some(rom_id), &name, true, false, Some(kept), said);
                     }
                 } else if remote.file_name.eq_ignore_ascii_case(&pair.upload_as) {
                     // The push replaces RomM's where it is, so its copy is kept here first.
                     let Some(kept) = self.back_up(&live, &theirs, &name) else { return };
                     if self.push_state(&pair, rom_id, emulator, bytes, hash, &name).await {
-                        self.report.conflicts.push(format!("{name}: kept this device's state; RomM's is at {}", kept.display()));
+                        let said = format!("{name}: kept this device's state; RomM's is at {}", kept.display());
+                        self.report.settled(Some(rom_id), &name, true, true, None, said);
                     }
                 } else if self.push_state(&pair, rom_id, emulator, bytes, hash, &name).await {
-                    self.report.conflicts.push(format!("{name}: kept this device's state; RomM keeps the other"));
+                    self.report.settled(Some(rom_id), &name, true, true, None, format!("{name}: kept this device's state; RomM keeps the other"));
                 }
             }
             (_, true, None) => unreachable!("a server change with no server state"),
@@ -637,7 +640,7 @@ impl Run<'_> {
         let created = match self.client.upload_state(self.connection, rom_id, emulator, &pair.upload_as, bytes, shot).await {
             Ok(created) => created,
             Err(e) => {
-                self.report.failed.push(format!("{name}: {}", describe(&e)));
+                self.report.fail(Some(rom_id), name, true, describe(&e));
                 return false;
             }
         };
@@ -645,7 +648,7 @@ impl Run<'_> {
             self.report.pictureless += 1;
         }
         if self.remember_state(&pair.key, rom_id, hash, created.id, created.updated_at.clone(), name) {
-            self.report.pushed.push(name.to_string());
+            self.report.up(Some(rom_id), name, true);
             return true;
         }
         false
@@ -655,25 +658,25 @@ impl Run<'_> {
     /// holds something: the same content come back under a newer time — sent up again elsewhere — is
     /// agreed on, and not written over itself.
     async fn pull_state(&mut self, pair: &Pair<'_>, rom_id: i64, remote: &SaveAsset, name: &str, here: Option<&str>) {
-        let Some(bytes) = self.download_state(remote, name).await else { return };
+        let Some(bytes) = self.download_state(remote, rom_id, name).await else { return };
         let hash = md5_hex(&bytes);
         if here == Some(hash.as_str()) {
             if self.remember_state(&pair.key, rom_id, hash, remote.id, remote.updated_at.clone(), name) {
-                self.report.in_sync += 1;
+                self.report.agreed(Some(rom_id), name, true);
             }
             return;
         }
         if self.write_state(pair, rom_id, remote, &bytes, name) {
-            self.report.pulled.push(name.to_string());
+            self.report.down(Some(rom_id), name, true);
             self.pull_thumbnail(&pair.key, remote).await;
         }
     }
 
-    async fn download_state(&mut self, remote: &SaveAsset, name: &str) -> Option<Vec<u8>> {
+    async fn download_state(&mut self, remote: &SaveAsset, rom_id: i64, name: &str) -> Option<Vec<u8>> {
         match self.client.download_state(self.connection, remote).await {
             Ok(bytes) => Some(bytes),
             Err(e) => {
-                self.report.failed.push(format!("{name}: {}", describe(&e)));
+                self.report.fail(Some(rom_id), name, true, describe(&e));
                 None
             }
         }
@@ -682,7 +685,7 @@ impl Run<'_> {
     /// `remote`'s content into the slot, dated as RomM dates it.
     fn write_state(&mut self, pair: &Pair<'_>, rom_id: i64, remote: &SaveAsset, bytes: &[u8], name: &str) -> bool {
         if let Err(e) = write_atomic(&pair.key, bytes) {
-            self.report.failed.push(format!("{name}: {e}"));
+            self.report.fail(Some(rom_id), name, true, e);
             return false;
         }
         if let Some(time) = remote.updated_at.as_deref().and_then(names::parse_timestamp)
@@ -721,7 +724,7 @@ impl Run<'_> {
         match self.index.set(key, Entry { rom_id, hash, save_id, synced_at, stamp: self.stamp.clone(), ..Default::default() }) {
             Ok(()) => true,
             Err(e) => {
-                self.report.failed.push(format!("{name}: synced, but could not record it ({e})"));
+                self.report.fail(Some(rom_id), name, true, format!("synced, but could not record it ({e})"));
                 false
             }
         }

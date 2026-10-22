@@ -484,7 +484,7 @@ impl Run<'_> {
             .max_by_key(|s| (s.updated_at.as_deref().and_then(names::parse_timestamp), s.id));
         let local = match read_set(&bundle.files) {
             Ok(set) => set,
-            Err(e) => return self.report.failed.push(format!("{name}: {e}")),
+            Err(e) => return self.report.fail(Some(rom_id), &name, false, e),
         };
         if local.is_empty() {
             // Nothing here: a fresh device takes RomM's. Nothing on either side is not news.
@@ -495,7 +495,7 @@ impl Run<'_> {
         }
         let hash = set_hash(&local);
         match (plan(&hash, self.index.agreed(&bundle.key, rom_id, self.stamp.as_ref()), remote.map(|r| r.id)), remote) {
-            (Plan::InSync, _) => self.report.in_sync += 1,
+            (Plan::InSync, _) => self.report.agreed(Some(rom_id), &name, false),
             (Plan::Push, _) => {
                 self.push_bundle(bundle, rom_id, tag, &local, hash, &name).await;
             }
@@ -507,13 +507,14 @@ impl Run<'_> {
                 let remote_time = remote.updated_at.as_deref().and_then(names::parse_timestamp);
                 let bytes = local.iter().map(|(_, b)| b.len() as u64).sum();
                 if super::choose(&name, local_time, remote_time, bytes).await == super::Choice::Remote {
-                    let Ok(zipped) = pack(&local) else { return self.report.failed.push(format!("{name}: could not zip a copy")) };
+                    let Ok(zipped) = pack(&local) else { return self.report.fail(Some(rom_id), &name, false, "could not zip a copy") };
                     let Some(kept) = self.back_up(&bundle.target, &zipped, &name) else { return };
                     if self.pull_bundle(bundle, rom_id, remote, &name).await {
-                        self.report.conflicts.push(format!("{name}: kept RomM's saves; this device's are at {}", kept.display()));
+                        let said = format!("{name}: kept RomM's saves; this device's are at {}", kept.display());
+                        self.report.settled(Some(rom_id), &name, false, false, Some(kept), said);
                     }
                 } else if self.push_bundle(bundle, rom_id, tag, &local, hash, &name).await {
-                    self.report.conflicts.push(format!("{name}: kept this device's saves; RomM keeps the other"));
+                    self.report.settled(Some(rom_id), &name, false, true, None, format!("{name}: kept this device's saves; RomM keeps the other"));
                 }
             }
             (Plan::Pull | Plan::Conflict, None) => unreachable!("a server change with no server save"),
@@ -524,7 +525,7 @@ impl Run<'_> {
         let zipped = match pack(set) {
             Ok(zipped) => zipped,
             Err(e) => {
-                self.report.failed.push(format!("{name}: could not zip it ({e})"));
+                self.report.fail(Some(rom_id), name, false, format!("could not zip it ({e})"));
                 return false;
             }
         };
@@ -532,16 +533,16 @@ impl Run<'_> {
             Ok(Some(created)) => {
                 let ok = self.remember_bundle(bundle, rom_id, hash, created.id, name, None);
                 if ok {
-                    self.report.pushed.push(name.to_string());
+                    self.report.up(Some(rom_id), name, false);
                 }
                 ok
             }
             Ok(None) => {
-                self.report.deferred.push(name.to_string());
+                self.report.put_off(Some(rom_id), name, false);
                 false
             }
             Err(e) => {
-                self.report.failed.push(format!("{name}: {}", describe(&e)));
+                self.report.fail(Some(rom_id), name, false, describe(&e));
                 false
             }
         }
@@ -551,14 +552,14 @@ impl Run<'_> {
         let bytes = match self.client.download_save(self.connection, remote).await {
             Ok(bytes) => bytes,
             Err(e) => {
-                self.report.failed.push(format!("{name}: {}", describe(&e)));
+                self.report.fail(Some(rom_id), name, false, describe(&e));
                 return false;
             }
         };
         let set = match unpack(&bytes, &bundle.target, bundle.folder, &bundle.files) {
             Ok(set) => set,
             Err(e) => {
-                self.report.failed.push(format!("{name}: {e}"));
+                self.report.fail(Some(rom_id), name, false, e);
                 return false;
             }
         };
@@ -567,7 +568,7 @@ impl Run<'_> {
         let written: Vec<PathBuf> = set.iter().map(|(relative, _)| bundle.target.join(relative)).collect();
         let ok = self.remember_bundle(bundle, rom_id, set_hash(&set), remote.id, name, Some(&written));
         if ok {
-            self.report.pulled.push(name.to_string());
+            self.report.down(Some(rom_id), name, false);
             self.report.written.extend(bundle.files.iter().map(|(_, path)| path.clone()));
             self.report.written.extend(written);
             self.acks.push(remote.id);
@@ -594,7 +595,7 @@ impl Run<'_> {
         match self.index.set(&bundle.key, Entry { rom_id, hash, save_id, files, stamp: self.stamp.clone(), ..Default::default() }) {
             Ok(()) => true,
             Err(e) => {
-                self.report.failed.push(format!("{name}: synced, but could not record it ({e})"));
+                self.report.fail(Some(rom_id), name, false, format!("synced, but could not record it ({e})"));
                 false
             }
         }

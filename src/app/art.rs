@@ -83,6 +83,14 @@ impl App {
                     }
                 }
             }
+            // The covers beside the save sync page's games, at a shelf's size, so the two share one copy.
+            Screen::Browsing(Route::Sync { .. }) => {
+                for game in self.sync_covers() {
+                    if let Some(url) = &game.cover_url {
+                        wanted.push((url.clone(), covers::Target::tall(px(crate::ui::home::COVER_H)), covers::Kind::Art));
+                    }
+                }
+            }
             Screen::Browsing(Route::Collections) => {
                 // The current kind's covers, for the rows on screen and a couple either side — a
                 // kind runs to hundreds of cards (one server here has 378 companies), and decoding

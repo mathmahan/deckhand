@@ -177,7 +177,7 @@ impl App {
                 Task::batch([self.scroll_page_to_top(), self.load_saves(rom_id), self.load_achievements(rom_id), self.load_files(rom_id)])
             }
             Message::Back => {
-                if let Screen::Browsing(Route::Detail { from, .. } | Route::Search { from } | Route::Saves { from, .. }) = &self.screen {
+                if let Screen::Browsing(Route::Detail { from, .. } | Route::Search { from } | Route::Saves { from, .. } | Route::Sync { from }) = &self.screen {
                     self.screen = Screen::Browsing((**from).clone());
                 }
                 Task::none()
@@ -451,7 +451,7 @@ impl App {
                 // Escape means "get me out of here" before it means "hide that message": from a
                 // detail page it goes back, and only dismisses the banner once there is nowhere
                 // left to go.
-                if matches!(self.screen, Screen::Browsing(Route::Detail { .. } | Route::Search { .. } | Route::Saves { .. })) {
+                if matches!(self.screen, Screen::Browsing(Route::Detail { .. } | Route::Search { .. } | Route::Saves { .. } | Route::Sync { .. })) {
                     return self.update(Message::Back);
                 }
                 // A collection's grid was opened from the Collections page, and that is where back is.
@@ -474,6 +474,7 @@ impl App {
                 self.scroll_cursor_into_view()
             }
             Message::SyncNow => self.sync_saves(),
+            Message::SyncFilter(filter) => self.show_sync_filter(filter),
             Message::ConnectionTested(result) => {
                 self.connection_check = match result {
                     Ok(user) => Check::Reachable(user),

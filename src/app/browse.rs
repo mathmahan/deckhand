@@ -662,6 +662,8 @@ impl App {
             return Task::none();
         };
         self.sync_before = std::mem::replace(&mut self.save_sync, SaveSync::Running);
+        // Until this one says how far it has got, the last one's last word is not this one's.
+        crate::sync::progress::end();
         Task::perform(
             crate::sync::sync_retroarch(
                 self.client.clone(),
@@ -781,7 +783,8 @@ impl App {
         let mut pictureless = false;
         self.save_synced_at = Some(std::time::Instant::now());
         self.save_sync = match result {
-            Ok(report) => {
+            Ok(mut report) => {
+                self.name_games(&mut report);
                 // What the sync wrote is where things stand now, not a change to sync again.
                 // Only what it wrote: a game running outside Deckhand may have written its
                 // own save while this ran, and that is still news.
