@@ -33,7 +33,7 @@ impl App {
             match route {
                 Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
                 Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
-                Route::Settings => stack![crate::ui::settings::backdrop(), page].into(),
+                Route::Settings | Route::Collections => stack![crate::ui::home::plain_stage(), page].into(),
                 Route::Detail { .. } => stack![self.detail_backdrop(), page].into(),
                 _ => page.into(),
             }

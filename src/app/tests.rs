@@ -1518,6 +1518,26 @@ fn with_collections(count: usize) -> (App, Vec<i64>) {
 }
 
 #[test]
+fn the_triggers_walk_the_collection_kinds_and_leave_the_cursor_in_its_band() {
+    use crate::collections::{Kind, Zone};
+    let (mut app, _) = with_collections(30);
+    let _ = app.update(Message::TabSelected(Tab::Collections));
+    assert_eq!(app.all_collections.kinds(), [Kind::Yours, Kind::Genre]);
+    let _ = app.update(Message::Nav(Direction::Right));
+    let _ = app.update(Message::CycleSystem(1));
+    assert_eq!((app.collections_focus.kind, app.collections_focus.zone, app.collections_focus.cards.index()), (1, Zone::Cards, 0), "R2: genres, from its first card");
+    let _ = app.update(Message::CycleSystem(1));
+    assert_eq!(app.collections_focus.kind, 1, "nothing past the last kind");
+    let _ = app.view();
+
+    // Up on the strip, the triggers still walk it, and the cursor stays up there.
+    let _ = app.update(Message::Nav(Direction::Up));
+    let _ = app.update(Message::CycleSystem(-1));
+    assert_eq!((app.collections_focus.kind, app.collections_focus.zone), (0, Zone::Kinds));
+    let _ = app.view();
+}
+
+#[test]
 fn a_collection_opens_as_a_grid_that_steps_through_its_kind_and_leads_back_to_the_page() {
     use crate::collections::Kind;
     let (mut app, ids) = with_collections(30);

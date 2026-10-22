@@ -12,6 +12,7 @@
 //! own alpha; the scrims are gradients; the lift of the card under the cursor is padding and its
 //! glow a box shadow. So the page draws the same on the software renderer as on the GPU.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use iced::widget::text::LineHeight;
@@ -361,6 +362,46 @@ pub fn ground<'a>() -> Element<'a, Message> {
         .height(Length::Fill)
         .style(|_| container::Style { background: Some(Background::Color(theme::GROUND)), ..Default::default() })
         .into()
+}
+
+/// Under a page with no game to show, and its header: Home's ground, and a wash of the accent at the
+/// top right where Home has its picture. Settings' and the Collections page's.
+pub fn plain_stage<'a>() -> Element<'a, Message> {
+    let (w, h) = WASH_BOX;
+    stack![
+        ground(),
+        container(image(accent_wash().clone()).content_fit(ContentFit::Fill).width(Length::Fixed(w)).height(Length::Fixed(h)))
+            .width(Length::Fill)
+            .align_right(Length::Fill),
+    ]
+    .into()
+}
+
+/// The wash's box, at the window's top right.
+const WASH_BOX: (f32, f32) = (740.0, 400.0);
+
+/// The accent fading out from a little in from the window's top right corner: an ellipse's worth,
+/// of which the box shows the part inside the window. Drawn once, small — it has no edge to keep
+/// sharp — and stretched to the box.
+fn accent_wash() -> &'static image::Handle {
+    static WASH: OnceLock<image::Handle> = OnceLock::new();
+    WASH.get_or_init(|| {
+        const SCALE: f32 = 5.0;
+        let (w, h) = ((WASH_BOX.0 / SCALE) as u32, (WASH_BOX.1 / SCALE) as u32);
+        // In the box's own units: the middle, and how far the light reaches across and down.
+        let (cx, cy, rx, ry) = (450.0, 90.0, 450.0, 310.0);
+        let [r, g, b, _] = theme::ACCENT_600.into_rgba8();
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let dx = ((x as f32 + 0.5) * SCALE - cx) / rx;
+                let dy = ((y as f32 + 0.5) * SCALE - cy) / ry;
+                let reach = (1.0 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+                rgba.extend([r, g, b, (0.30 * reach * 255.0).round() as u8]);
+            }
+        }
+        image::Handle::from_rgba(w, h, rgba)
+    })
 }
 
 /// The cover of a game with no screenshot, where its picture would be: a card at the right of the
