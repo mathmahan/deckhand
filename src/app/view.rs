@@ -34,6 +34,7 @@ impl App {
                 Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
                 Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
                 Route::Settings => stack![crate::ui::settings::backdrop(), page].into(),
+                Route::Detail { .. } => stack![self.detail_backdrop(), page].into(),
                 _ => page.into(),
             }
         } else {
@@ -225,6 +226,22 @@ impl App {
             band: crate::ui::browse::HERO_H,
             rows_top: crate::ui::browse::grid_top(),
             shade: &crate::ui::browse::SHADE,
+            cover_cards: true,
+        })
+    }
+
+    /// Under the game page and the header: the game's picture and light, as Home's spotlight has
+    /// them, the cover left out — the page shows it beside the facts.
+    fn detail_backdrop(&self) -> Element<'_, Message> {
+        crate::ui::home::stage(&crate::ui::home::Stage {
+            library: &self.library,
+            covers: &self.covers,
+            backdrop: &self.backdrop,
+            now: std::time::Instant::now(),
+            band: crate::ui::detail::COVER_H,
+            rows_top: crate::ui::detail::PICTURE_ENDS,
+            shade: &crate::ui::detail::SHADE,
+            cover_cards: false,
         })
     }
 
@@ -533,6 +550,7 @@ impl App {
                     favourite: game.builds().any(|id| self.favourites.contains(&id)),
                     extras: self.has_extras(*rom_id),
                     achievements_open: self.achievements_open,
+                    this_year: crate::library::this_year(),
                 };
                 crate::ui::detail::detail_view(&ctx)
             }

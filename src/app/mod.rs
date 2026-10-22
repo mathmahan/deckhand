@@ -1105,11 +1105,14 @@ impl App {
         ids.into_iter().filter_map(|id| self.library.game(id)).collect()
     }
 
-    /// The game in the spotlight: on the Library, the one under its grid's cursor; anywhere else,
-    /// Home's.
+    /// The game in the spotlight: on the Library, the one under its grid's cursor; on a game's page,
+    /// that game; anywhere else, Home's.
     fn spotlit_id(&self) -> Option<i64> {
         match &self.screen {
             Screen::Browsing(Route::Browse { .. }) => self.library_spotlit().first().map(|game| game.rom_id),
+            // The game page stands on its game's picture: opened from Home or the Library, the one
+            // already behind it.
+            Screen::Browsing(Route::Detail { rom_id, .. }) => Some(*rom_id),
             _ => self.focus.spotlit(&self.shelves).map(|game| game.rom_id),
         }
     }

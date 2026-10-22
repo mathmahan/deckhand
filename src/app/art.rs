@@ -53,9 +53,8 @@ impl App {
                     if let Some(url) = &game.cover_url {
                         wanted.push((url.clone(), covers::Target::tall(px(crate::ui::detail::COVER_H)), covers::Kind::Feature));
                     }
-                    if let Some(path) = &game.marquee_path {
-                        wanted.push((self.asset_url(path), covers::Target::tall(px(420.0)), covers::Kind::Backdrop));
-                    }
+                    // The picture and light behind the page, as Home's spotlight has them.
+                    wanted.extend(pictures_of(game, &px));
                     for shot in game.screenshots.iter().take(crate::ui::detail::SHOTS_SHOWN) {
                         wanted.push((shot.clone(), covers::Target::tall(px(crate::ui::detail::SCREENSHOT_H)), covers::Kind::Art));
                     }

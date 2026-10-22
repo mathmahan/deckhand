@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use iced::widget::text::Wrapping;
 use iced::widget::{self as widget, button, column, container, image, row, scrollable, stack, text, Space};
-use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding, Shadow, Vector};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding, Shadow};
 use iced_fonts::lucide;
 
 use crate::app::Message;
@@ -617,42 +617,23 @@ fn setting_row<'a>(index: usize, setting: Row, ctx: &SettingsContext<'_>) -> Ele
         .height(Length::Fixed(ROW_H))
         .padding([0, 20])
         .on_press(Message::SettingsClicked(index))
-        .style(move |_, status| {
-            let hovered = matches!(status, button::Status::Hovered);
-            button::Style {
-                background: Some(Background::Color(glass(if lit { 0.10 } else if hovered { 0.08 } else { 0.05 }))),
-                text_color: theme::INK,
-                border: Border { color: if lit { theme::INK } else { glass(0.10) }, width: if lit { 3.0 } else { 1.0 }, radius: 16.0.into() },
-                shadow: if lit {
-                    Shadow { color: alpha(Color::BLACK, 0.45), offset: Vector::new(0.0, 14.0), blur_radius: 32.0 }
-                } else {
-                    Shadow::default()
-                },
-                snap: true,
-            }
-        });
+        .style(crate::ui::style::glass_row(lit, 16.0));
     let row = container(row);
     if lit { row.id(cursor_id()).into() } else { row.into() }
 }
 
 /// What A and X do where the cursor is, said quietly at the foot of the page.
 fn hints<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
-    let hint = |button: &'a str, words: &'a str| {
-        row![crate::ui::tab_bar::glyph(button, false), text(words).size(13.0).color(theme::TEXT_SECONDARY)].spacing(8).align_y(Alignment::Center)
-    };
     let press = parts(ctx.focus.row(), ctx).into_iter().find_map(|part| match part {
         Part::Act(label, _) => Some(label),
         Part::Steps(..) => Some("Change"),
         _ => None,
     });
-    let mut line = row![Space::new().width(Length::Fill)].spacing(22).align_y(Alignment::Center);
-    if let Some(label) = press {
-        line = line.push(hint("A", label));
-    }
+    let mut hints: Vec<(&str, String)> = press.map(|label| ("A", label.to_string())).into_iter().collect();
     if ctx.focus.section() == Section::Saves {
-        line = line.push(hint("X", "Sync now"));
+        hints.push(("X", "Sync now".to_string()));
     }
-    container(line).padding([0.0, crate::ui::tab_bar::MARGIN]).center_y(Length::Fixed(44.0)).into()
+    crate::ui::tab_bar::hint_line(hints)
 }
 
 /// A piece of a row, right of its label.

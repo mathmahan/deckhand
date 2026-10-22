@@ -60,8 +60,6 @@ pub const TEXT_MUTED: Color = NEUTRAL_600;
 /// weight competes with the facts above it.
 pub const TEXT_BODY: Color = NEUTRAL_500;
 
-/// Separator dot between two inline facts (rating · last played) — below even the muted tier.
-pub const DOT_COLOR: Color = NEUTRAL_700;
 pub const BORDER: Color = NEUTRAL_800;
 pub const ERROR: Color = rgb(0xFF6B6B);
 /// Something here wants attention without being wrong — an update waiting on RomM.

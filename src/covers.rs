@@ -51,8 +51,6 @@ pub const RETRY: std::time::Duration = std::time::Duration::from_secs(120);
 pub enum Kind {
     /// A cover or logo: decoded at its display height, otherwise untouched.
     Art,
-    /// The detail page's 1024x512 banner, which is only usable *blurred* — see [`prepare`].
-    Backdrop,
     /// [`Kind::Art`] drawn larger somewhere else than it is on a shelf — the spotlight's cover, for
     /// a game with no screenshot. Prepared the same way, and kept apart: the store holds one image
     /// per key, and the shelf's copy is a third of the height.
@@ -87,7 +85,7 @@ impl Kind {
 /// behind it, and those are three images the store must not mistake for one another.
 pub fn key(url: &str, kind: Kind) -> String {
     match kind {
-        Kind::Art | Kind::Backdrop => url.to_string(),
+        Kind::Art => url.to_string(),
         Kind::Feature => format!("{url}#feature"),
         Kind::Ambient => format!("{url}#ambient"),
         Kind::Spotlight => format!("{url}#spotlight"),
@@ -660,22 +658,10 @@ fn resample(
                 decoded
             }
         }
-        // The banner is blurred past legibility on purpose. Left as-is it fights the band on three
-        // counts: it carries the game's wordmark dead centre (which the title beside it already
-        // shows), it has a hard-edged platform sidebar down its left quarter, and at 2:1 against a
-        // ~4.3:1 band a crop keeps precisely the middle strip both of those live in. Blurred it
-        // stops being a picture and becomes what a backdrop wants — this game's colours.
-        //
-        // Downscaling *first* is what makes the blur cheap: a 24 px sigma over 1024x512 is slow,
-        // where the same visual result is a 3 px sigma over a 128 px-wide thumbnail that the GPU
-        // then stretches back up. The stretch is free and adds blur of its own.
-        Kind::Backdrop => {
-            let small = decoded.resize_exact(160, 80, image::imageops::FilterType::Triangle);
-            image::DynamicImage::ImageRgba8(image::imageops::blur(&small.to_rgba8(), 3.0))
-        }
-        // The same trick as the banner's, taken further: a whole screenshot reduced to a 64x40
-        // smear of its colours. Cropped to the panel's shape first, so stretching it back over the
-        // window stretches both ways alike.
+        // A whole screenshot reduced to a 64x40 smear of its colours: downscaled first, which makes
+        // the blur cheap, and stretched back up by the GPU, which is free and adds blur of its own.
+        // Cropped to the panel's shape first, so stretching it back over the window stretches both
+        // ways alike.
         Kind::Ambient => {
             let (w, h) = AMBIENT;
             let small = cover_crop(&decoded, w as f32 / h as f32).resize_exact(w, h, image::imageops::FilterType::Triangle);
@@ -1131,9 +1117,9 @@ mod tests {
         let taller = Target { height_px: 400.0, box_ratio: Some(1.0) };
         assert!(prepared_art(url, taller, Kind::Art).is_none(), "a different size is not this file");
 
-        // Backdrops are never written to the prepared cache, so there is never anything to find -
+        // A light is never written to the prepared cache, so there is never anything to find -
         // asking must not hand back art prepared for the same URL as a cover.
-        assert!(prepared_art(url, target, Kind::Backdrop).is_none(), "backdrops are not cached here");
+        assert!(prepared_art(url, target, Kind::Ambient).is_none(), "lights are not cached here");
 
         // A prune well inside the budget leaves the cache alone; there is nothing to reclaim.
         prune_caches();

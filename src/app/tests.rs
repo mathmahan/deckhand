@@ -809,6 +809,23 @@ mod render {
         }
         let _ = app.update(Message::OpenDetail(game.rom_id));
         app.banner = None;
+        // Its first screenshot behind the page, as Home's spotlight draws it.
+        let png = {
+            let iced::widget::image::Handle::Rgba { width, height, pixels, .. } = picture_sized(512, 448, [90, 140, 220]) else { unreachable!() };
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_raw(width, height, pixels.to_vec()).unwrap().write_to(&mut png, image::ImageFormat::Png).unwrap();
+            png.into_inner()
+        };
+        let (w, h) = crate::ui::home::PICTURE;
+        for (kind, target) in [
+            (covers::Kind::Spotlight, covers::Target { height_px: (crate::ui::detail::PICTURE_ENDS + 70.0).min(h), box_ratio: Some(w / h) }),
+            (covers::Kind::Ambient, covers::Target::tall(40.0)),
+        ] {
+            let (handle, meta) = covers::prepare(&png, target, kind).unwrap();
+            app.covers.insert(covers::key(&shots[0], kind), covers::Cover::Ready(handle, meta));
+        }
+        app.follow_spotlight();
+        app.backdrop = settled(std::mem::take(&mut app.backdrop));
         let list = vec![
             Achievement { title: "First steps".into(), description: Some("Clear the opening area".into()), points: Some(5), num_awarded: Some(19_293), ..Default::default() },
             Achievement { title: "Collector".into(), description: Some("Find every hidden item".into()), points: Some(25), num_awarded: Some(1_204), ..Default::default() },
@@ -1306,6 +1323,16 @@ fn the_detail_page_asks_for_a_game_s_achievements_once_and_scrolls_down_to_them(
     let _ = app.view();
     assert!(app.update(Message::Nav(Direction::Down)).units() > 0, "Down scrolls the page");
     assert_eq!(app.detail_focus.zone, crate::ui::detail::Zone::Achievements, "to their heading");
+}
+
+#[test]
+fn the_game_page_stands_on_its_own_games_picture() {
+    let (app, game) = detail_with(2, 0);
+    assert_eq!(app.spotlit_id(), Some(game.rom_id), "the backdrop follows the page's game");
+    let wanted = app.wanted_art();
+    for kind in [covers::Kind::Spotlight, covers::Kind::Ambient] {
+        assert!(wanted.iter().any(|(url, _, k)| *k == kind && *url == game.screenshots[0]), "its first screenshot, as {kind:?}");
+    }
 }
 
 /// A game's page with `shots` screenshots arrived, and `achievements` to earn.

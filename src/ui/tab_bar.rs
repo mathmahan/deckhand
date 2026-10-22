@@ -246,6 +246,16 @@ pub fn glyph<'a>(letter: &'a str, solid: bool) -> Element<'a, Message> {
         .into()
 }
 
+/// The quiet line at a page's foot saying what the pad's buttons do there: each button's glyph and
+/// its words, at the right, lined up under the header's icons.
+pub fn hint_line<'a>(hints: Vec<(&'a str, String)>) -> Element<'a, Message> {
+    let mut line = row![Space::new().width(Length::Fill)].spacing(22).align_y(Alignment::Center);
+    for (button, words) in hints {
+        line = line.push(row![glyph(button, false), text(words).size(13.0).color(theme::TEXT_SECONDARY)].spacing(8).align_y(Alignment::Center));
+    }
+    container(line).padding([0.0, MARGIN]).center_y(Length::Fixed(44.0)).into()
+}
+
 /// The glass the bar's pill and icons stand in: faint, with a faint edge.
 fn glass_pill(_: &Theme) -> container::Style {
     container::Style {
