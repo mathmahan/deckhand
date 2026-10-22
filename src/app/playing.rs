@@ -131,6 +131,7 @@ impl App {
                     && !matches!(self.save_sync, SaveSync::Running)
                 {
                     self.save_sync = SaveSync::Done(report);
+                    self.save_synced_at = Some(std::time::Instant::now());
                 }
                 let no_emulator = matches!(&result, Err(why) if why == crate::launch::NO_EMULATOR);
                 let words = match result {

@@ -78,16 +78,12 @@ impl App {
                     },
                 )
             }
-            Route::Settings => scroll_to(
-                crate::ui::settings::settings_id(),
-                AbsoluteOffset {
-                    x: 0.0,
-                    y: crate::ui::settings::scroll_offset(
-                        self.settings_focus.index(),
-                        self.content_height,
-                    ),
-                },
-            ),
+            // A section's first row is shown with the section's heading over it; any other, by as
+            // little as brings it into view under a heading whose height its words decide.
+            Route::Settings if self.settings_focus.at_top() => {
+                scroll_to(crate::ui::settings::settings_id(), AbsoluteOffset { x: 0.0, y: 0.0 })
+            }
+            Route::Settings => reveal::reveal_part(crate::ui::settings::settings_id(), crate::ui::settings::cursor_id(), 24.0).discard(),
         }
     }
 
@@ -492,8 +488,13 @@ impl App {
             Pad::Erase if matches!(self.screen, Screen::Browsing(Route::Search { .. })) => {
                 Message::SearchKey(crate::search::BACKSPACE)
             }
-            // On Home, the spotlit game's saves and states: the X the spotlight shows beside
-            // the button.
+            // On Saves in Settings, Sync now: the X its card shows on the button.
+            Pad::Erase
+                if matches!(self.screen, Screen::Browsing(Route::Settings))
+                    && self.settings_focus.section() == crate::ui::settings::Section::Saves =>
+            {
+                Message::SyncNow
+            }
             Pad::Erase => return Task::none(),
             Pad::PrevTab => Message::CycleTab(-1),
             Pad::NextTab => Message::CycleTab(1),

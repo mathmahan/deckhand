@@ -1191,7 +1191,6 @@ mod render {
         let mut app = paired_fixtures(30);
         app.settings.launch_command = Some(["retroarch", "-L", "/usr/lib/libretro/snes9x_libretro.so", "{rom}"].map(String::from).to_vec());
         let _ = app.update(Message::TabSelected(Tab::Settings));
-        snapshot_sized(&app, "settings-all", (1280.0, 2400.0));
         let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::Launcher)));
         let _ = app.update(Message::Picked(1));
         let _ = app.update(Message::Pad(crate::gamepad::Pad::Nav(Direction::Up)));
@@ -1205,6 +1204,33 @@ mod render {
         let last = app.pick.as_ref().unwrap().picker.rows.len() - 1;
         let _ = app.update(Message::Picked(last));
         snapshot(&app, "browse-retroarch");
+    }
+
+    /// Every section of Settings, one at a time as the page shows them — Saves after a sync that
+    /// moved some saves, and again after one that could not send one.
+    #[test]
+    #[ignore = "writes PNGs; run explicitly"]
+    fn render_settings_sections() {
+        use crate::ui::settings::Section;
+        let mut app = paired_fixtures(30);
+        app.banner = None;
+        let _ = app.update(Message::TabSelected(Tab::Settings));
+        app.save_sync = SaveSync::Done(Box::new(crate::sync::Report { in_sync: 124, pushed: vec!["a".into(); 3], pulled: vec!["b".into()], ..Default::default() }));
+        app.save_synced_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(130));
+        for (i, section) in Section::ALL.into_iter().enumerate() {
+            let _ = app.update(Message::SettingsSection(section));
+            snapshot(&app, &format!("settings-{i}-{section:?}").to_lowercase());
+        }
+        let _ = app.update(Message::SettingsSection(Section::Saves));
+        let _ = app.update(Message::Nav(Direction::Down));
+        let _ = app.update(Message::Nav(Direction::Down));
+        app.save_sync = SaveSync::Done(Box::new(crate::sync::Report {
+            in_sync: 120,
+            pushed: vec!["a".into(); 2],
+            failed: vec!["An empty memory card on RomM has nothing to restore; the save on this device stays.".into()],
+            ..Default::default()
+        }));
+        snapshot(&app, "settings-saves-failing");
     }
 
     #[test]
@@ -2334,11 +2360,53 @@ fn settings_row(row: SettingRow) -> usize {
 }
 
 #[test]
+fn settings_shows_a_section_at_a_time_walked_with_the_triggers() {
+    use crate::ui::settings::{Row, Section};
+    let (mut app, _) = App::new(Some(60));
+    app.banner = None;
+    let _ = app.update(Message::TabSelected(Tab::Settings));
+    assert_eq!(app.settings_focus.section(), Section::Server);
+    let _ = app.view();
+
+    // Down stops at the section's last row: the next section is the triggers'.
+    for _ in 0..10 {
+        let _ = app.update(Message::Nav(Direction::Down));
+    }
+    assert_eq!(app.settings_focus.row(), Row::SignOut);
+    let _ = app.update(Message::CycleSystem(1));
+    assert_eq!((app.settings_focus.section(), app.settings_focus.row()), (Section::Playing, Row::Launcher), "R2: the next section, at its top");
+    let _ = app.update(Message::CycleSystem(-1));
+    assert_eq!(app.settings_focus.row(), Row::ServerAddress);
+
+    // A click on the strip shows a section too; Up off its first row is Up into the bar.
+    let _ = app.update(Message::SettingsSection(Section::Storage));
+    assert_eq!(app.settings_focus.row(), Row::RomsFolder);
+    let _ = app.view();
+    let _ = app.update(Message::Nav(Direction::Up));
+    assert_eq!(app.chrome, Some(Chrome::Tabs));
+}
+
+#[test]
+fn x_syncs_the_saves_from_the_saves_section_and_nowhere_else() {
+    use crate::gamepad::Pad;
+    use crate::ui::settings::Section;
+    let (mut app, _) = App::new(Some(60));
+    app.settings.connection = None;
+    let _ = app.update(Message::TabSelected(Tab::Settings));
+    let _ = app.update(Message::Pad(Pad::Erase));
+    assert!(matches!(app.save_sync, SaveSync::Idle), "not from the server's section");
+    let _ = app.update(Message::SettingsSection(Section::Saves));
+    let _ = app.update(Message::Pad(Pad::Erase));
+    assert!(matches!(&app.save_sync, SaveSync::Failed(why) if why.contains("not paired")), "X is the card's Sync now");
+    let _ = app.view();
+}
+
+#[test]
 fn syncing_saves_unpaired_says_why_instead_of_starting() {
     let (mut app, _) = App::new(Some(60));
     app.settings.connection = None;
     let _ = app.update(Message::TabSelected(Tab::Settings));
-    let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::SyncSaves)));
+    let _ = app.update(Message::SyncNow);
     assert!(matches!(&app.save_sync, SaveSync::Failed(why) if why.contains("not paired")));
 }
 
@@ -2354,7 +2422,7 @@ fn a_save_sync_runs_once_at_a_time_and_its_answer_lands_on_the_page() {
         device_id: None,
     });
     let _ = app.update(Message::TabSelected(Tab::Settings));
-    let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::SyncSaves)));
+    let _ = app.update(Message::SyncNow);
     assert!(matches!(app.save_sync, SaveSync::Running));
 
     // Leaving and coming back while it runs does not lose it, or start a second.
@@ -2364,8 +2432,10 @@ fn a_save_sync_runs_once_at_a_time_and_its_answer_lands_on_the_page() {
 
     let folder = std::path::PathBuf::from("/saves");
     let report = crate::sync::Report { folder: folder.clone(), in_sync: 2, ..Default::default() };
+    assert!(app.save_synced_at.is_none(), "nothing has finished yet to count from");
     let _ = app.update(Message::SavesSynced(Ok(report)));
     assert!(matches!(&app.save_sync, SaveSync::Done(r) if r.in_sync == 2));
+    assert!(app.save_synced_at.is_some_and(|at| at.elapsed().as_secs() < 5), "the card counts its \"ago\" from now");
     assert!(matches!(&app.save_folder, Some(Ok(f)) if *f == folder));
 }
 
@@ -3147,22 +3217,31 @@ mod page_place {
         }
     }
 
-    #[test]
-    fn a_banner_coming_or_going_leaves_the_page_where_it_was() {
+    /// The Downloads page with thirty games on it: a list that runs well past the window.
+    fn long_page() -> (App, Id) {
         let mut app = paired_fixtures(40);
         app.banner = None;
-        let _ = app.update(Message::TabSelected(Tab::Settings));
-        let settings = crate::ui::settings::settings_id();
+        let games: Vec<Game> = app.library.all_games()[..30].to_vec();
+        for game in &games {
+            app.downloads.finish(game.rom_id, Ok(installed(game.rom_id, &game.title, 1 << 20)));
+        }
+        let _ = app.update(Message::TabSelected(Tab::Downloads));
+        (app, crate::ui::downloads::downloads_id())
+    }
+
+    #[test]
+    fn a_banner_coming_or_going_leaves_the_page_where_it_was() {
+        let (mut app, page) = long_page();
         let mut window = Window::new();
-        window.scroll(&app, settings.clone(), 600.0);
+        window.scroll(&app, page.clone(), 600.0);
 
         // Each a step a person sees: an update found and its banner timing out, a second one.
         app.say("Deckhand 9.9.9 is out".into());
-        assert_eq!(window.offset(&app, settings.clone()), 600.0, "as the banner comes");
+        assert_eq!(window.offset(&app, page.clone()), 600.0, "as the banner comes");
         app.banner = None;
-        assert_eq!(window.offset(&app, settings.clone()), 600.0, "as it goes");
+        assert_eq!(window.offset(&app, page.clone()), 600.0, "as it goes");
         app.say("Deckhand 9.9.9 is in place".into());
-        assert_eq!(window.offset(&app, settings), 600.0, "and as another comes");
+        assert_eq!(window.offset(&app, page), 600.0, "and as another comes");
     }
 
     #[test]
@@ -3195,11 +3274,9 @@ mod page_place {
 
     #[test]
     fn closing_a_picker_leaves_the_page_where_it_was() {
-        let mut app = paired_fixtures(40);
-        let _ = app.update(Message::TabSelected(Tab::Settings));
-        let settings = crate::ui::settings::settings_id();
+        let (mut app, page) = long_page();
         let mut window = Window::new();
-        window.scroll(&app, settings.clone(), 600.0);
+        window.scroll(&app, page.clone(), 600.0);
 
         app.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker { title: "Emulator".into(), note: String::new(), rows: Vec::new(), cursor: 0 },
@@ -3208,7 +3285,7 @@ mod page_place {
         window.frame(&app, &mut operation::scrollable::scroll_by(Id::new("nothing"), AbsoluteOffset::default()));
         let _ = app.update(Message::Dismiss);
         assert!(app.pick.is_none());
-        assert_eq!(window.offset(&app, settings), 600.0);
+        assert_eq!(window.offset(&app, page), 600.0);
     }
 }
 

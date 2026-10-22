@@ -267,7 +267,7 @@ fn system_list<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
 
 /// A pad button with a name longer than a letter — a trigger — in a rounded box, set beside what it
 /// does.
-fn key<'a>(name: &'a str) -> Element<'a, Message> {
+pub fn key<'a>(name: &'a str) -> Element<'a, Message> {
     container(text(name).size(10.0).font(theme::BOLD).color(alpha(theme::INK, 0.7)))
         .padding([2.0, 5.0])
         .style(|_| container::Style {
@@ -445,7 +445,7 @@ fn chips_row<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
 }
 
 /// A row of pills on the glass the header's pill is cut from.
-fn strip<'a>(pills: iced::widget::Row<'a, Message>) -> Element<'a, Message> {
+pub fn strip<'a>(pills: iced::widget::Row<'a, Message>) -> Element<'a, Message> {
     container(pills)
         .padding(4)
         .style(|_| container::Style {
@@ -459,7 +459,7 @@ fn strip<'a>(pills: iced::widget::Row<'a, Message>) -> Element<'a, Message> {
 /// One pill: the chosen one filled with the brightest ink and its words gone dark, as the header's
 /// current destination is. Under the pad's cursor a ring of the ink — or, on the ink's own fill,
 /// of the accent.
-fn chip<'a>(label: String, selected: bool, lit: bool, message: Message) -> Element<'a, Message> {
+pub fn chip<'a>(label: String, selected: bool, lit: bool, message: Message) -> Element<'a, Message> {
     button(container(text(label).size(14.0).font(if selected { theme::SEMIBOLD } else { theme::MEDIUM })).center_y(Length::Fill))
         .height(Length::Fixed(32.0))
         .padding([0, 14])

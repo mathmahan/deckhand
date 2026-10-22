@@ -33,6 +33,7 @@ impl App {
             match route {
                 Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
                 Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
+                Route::Settings => stack![crate::ui::settings::backdrop(), page].into(),
                 _ => page.into(),
             }
         } else {
@@ -567,6 +568,7 @@ impl App {
                     save_folder: self.save_folder.as_ref(),
                     retroarch_found: self.retroarch_found.as_ref(),
                     save_sync: &self.save_sync,
+                    synced_ago: self.save_synced_at.map(|at| at.elapsed()),
                     release: &self.release,
                     appimage: self.appimage.is_some(),
                     retrodeck: self.retrodeck,

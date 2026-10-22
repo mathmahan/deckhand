@@ -779,6 +779,7 @@ impl App {
     pub(super) fn saves_synced(&mut self, result: Result<crate::sync::Report, String>) -> Task<Message> {
         let failed = result.is_err();
         let mut pictureless = false;
+        self.save_synced_at = Some(std::time::Instant::now());
         self.save_sync = match result {
             Ok(report) => {
                 // What the sync wrote is where things stand now, not a change to sync again.

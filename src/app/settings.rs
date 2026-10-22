@@ -13,7 +13,6 @@ impl App {
                 None => Task::none(),
             },
             SettingRow::ImageCache => self.clear_image_cache(),
-            SettingRow::SyncSaves => self.sync_saves(),
             // Installed hooks come off; anything else installs, or reinstalls what is stale.
             SettingRow::EsDeHooks => {
                 let remove = self.hooks.as_ref().is_some_and(|s| s.describe().0);

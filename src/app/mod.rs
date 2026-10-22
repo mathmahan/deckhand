@@ -192,6 +192,10 @@ pub enum Message {
     // Settings
     /// A settings row was clicked: put the cursor on it and press it.
     SettingsClicked(usize),
+    /// A section on the strip was clicked: show it, the cursor on its first row.
+    SettingsSection(crate::ui::settings::Section),
+    /// Sync every save now: the sync card's button, and X on the Saves section.
+    SyncNow,
     /// Set a stepped setting — UI scale, grid density — to one of its options, by index.
     SettingsPick(SettingRow, usize),
     /// The connection test's answer: the account the token reads as, or why it could not.
@@ -636,6 +640,9 @@ pub struct App {
     /// Turning state pictures on has been offered this session: once is enough.
     state_pictures_offered: bool,
     save_sync: SaveSync,
+    /// When the last sync of every save finished, or the one after a game did — what the sync
+    /// card's "2 min ago" is counted from.
+    save_synced_at: Option<std::time::Instant>,
     /// Where Deckhand's own update stands — see [`crate::release`].
     release: crate::release::Status,
     /// The repository Deckhand's own releases are read from: [`crate::release::REPOSITORY`], or a
@@ -758,6 +765,7 @@ impl App {
             state_pictures: None,
             state_pictures_offered: false,
             save_sync: SaveSync::Idle,
+            save_synced_at: None,
             release: crate::release::Status::Unasked,
             release_repository: crate::release::REPOSITORY,
             release_announced: None,
