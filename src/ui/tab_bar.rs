@@ -66,8 +66,10 @@ impl Tab {
 /// Height of the bar, and the content offset every destination sits below.
 pub const TAB_BAR_HEIGHT: f32 = 72.0;
 
-/// The bar's side margin — and Home's, whose spotlight and shelves line up under the wordmark.
-pub const MARGIN: f32 = 64.0;
+/// The bar's side margin — and Home's and the Library's, whose spotlight, shelves and system list
+/// line up under the wordmark. Kept narrow: on the Deck's panel every unit of it is one the covers
+/// do not get.
+pub const MARGIN: f32 = 32.0;
 
 /// How the header's saves icon reads — see [`Status`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

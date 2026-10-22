@@ -1,7 +1,7 @@
 //! The focus cross-fade — the hand-off between the card the cursor left and the one it landed on.
 //!
 //! A port of what the Compose original does on focus: cross-fade the brightness step over 130 ms.
-//! The original also scales the card 1.06; this port does not — see [`crate::ui::home::ringed`].
+//! The original also scales the card 1.06; this port does not — see [`crate::ui::home::ring_of`].
 //! This port shipped without the fade because iced 0.13 had no per-widget animation; 0.14 added
 //! `Animation`, which is what this is built on.
 

@@ -202,6 +202,7 @@ impl App {
         self.focus.reconcile(&self.shelves);
         // A refresh may have rewritten what a game says about itself.
         self.spotlight_text.borrow_mut().clear();
+        self.hero_titles.borrow_mut().clear();
     }
 
     /// Delete the art caches, then report what is left — a fetch in flight may already have put

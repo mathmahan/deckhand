@@ -29,10 +29,11 @@ impl App {
             let body: Element<Message> = stack![body, scrim].into();
             let page = column![tab_bar(route.tab(), self.chrome == Some(Chrome::Tabs), self.header_status()), body];
             // Home's picture runs to the top of the window, under the header: the bar floats on it.
-            if *route == Route::Home {
-                stack![crate::ui::home::page_backdrop(&self.home_context()), page].into()
-            } else {
-                page.into()
+            // So does the Library's, over its grid.
+            match route {
+                Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
+                Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
+                _ => page.into(),
             }
         } else {
             body
@@ -176,12 +177,7 @@ impl App {
     pub(super) fn home_context(&self) -> HomeContext<'_> {
         let spotlit = self.focus.spotlit(&self.shelves);
         let (title, summary) = self.spotlight_words();
-        // The game's own page has the freshest count, once it has been opened; otherwise what the
-        // user's record said at launch.
-        let earned = spotlit.and_then(|game| match self.achievements.get(&game.rom_id) {
-            Some(Ok(list)) if list.linked == Some(true) => Some(list.earned_count()),
-            _ => self.awarded.as_ref().map(|awarded| game.ra_id.and_then(|id| awarded.get(&id).copied()).unwrap_or(0)),
-        });
+        let earned = spotlit.and_then(|game| self.earned(game));
         HomeContext {
             library: &self.library,
             shelves: &self.shelves,
@@ -200,6 +196,58 @@ impl App {
             this_year: crate::library::this_year(),
             compact: self.content_height - crate::ui::tab_bar::TAB_BAR_HEIGHT < crate::ui::home::COMPACT_BELOW,
         }
+    }
+
+    /// How many of `game`'s achievements this user has earned, when RomM said. The game's own page
+    /// has the freshest count, once it has been opened; otherwise what the user's record said at
+    /// launch.
+    fn earned(&self, game: &Game) -> Option<usize> {
+        match self.achievements.get(&game.rom_id) {
+            Some(Ok(list)) if list.linked == Some(true) => Some(list.earned_count()),
+            _ => self.awarded.as_ref().map(|awarded| game.ra_id.and_then(|id| awarded.get(&id).copied()).unwrap_or(0)),
+        }
+    }
+
+    /// The page under the Library: its spotlit game's picture and light, as Home's — or the bare
+    /// ground, with no spotlight.
+    fn library_backdrop(&self) -> Element<'_, Message> {
+        if self.library_spotlit().is_empty() {
+            return crate::ui::home::ground();
+        }
+        crate::ui::home::stage(&crate::ui::home::Stage {
+            library: &self.library,
+            covers: &self.covers,
+            backdrop: &self.backdrop,
+            now: std::time::Instant::now(),
+            band: crate::ui::browse::HERO_H,
+            rows_top: crate::ui::browse::grid_top(),
+            shade: &crate::ui::browse::SHADE,
+        })
+    }
+
+    /// The Library's spotlight: the game under the grid's cursor, its name cut to one line.
+    fn library_hero(&self, scope: &Scope) -> Option<crate::ui::browse::Hero<'_>> {
+        use crate::ui::{browse, home};
+        let game = *self.library_spotlit().first()?;
+        let kept = self.hero_titles.borrow().get(&game.rom_id).cloned();
+        let title = kept.unwrap_or_else(|| {
+            let title = home::clamp_lines(&game.title, browse::HERO_TITLE_W, 1, browse::HERO_TITLE_SIZE, browse::HERO_TITLE_LINE, theme::DISPLAY);
+            let mut kept = self.hero_titles.borrow_mut();
+            // Bounded by what a session walks past, as Home's are.
+            if kept.len() > 512 {
+                kept.clear();
+            }
+            kept.insert(game.rom_id, title.clone());
+            title
+        });
+        Some(browse::Hero {
+            game,
+            title,
+            earned: self.earned(game),
+            // A system's grid is that system's; a collection's mixes them, so each game says its own.
+            system: matches!(scope, Scope::Collection(_)).then(|| self.library.system_name(&game.system_id)),
+            this_year: crate::library::this_year(),
+        })
     }
 
     /// The spotlit game's name and description, cut to the lines the spotlight gives them —
@@ -416,11 +464,17 @@ impl App {
                 let (view, spec) = self.scope_view(scope);
                 let packing = self.packing(&view, &spec);
                 let rows = self.grid_rows(&spec, packing.rows().len());
+                let heading = match scope {
+                    Scope::System(_) => "SYSTEMS".to_string(),
+                    Scope::Collection(key) => self.all_collections.get(key).map_or_else(|| "COLLECTIONS".to_string(), |c| c.kind.label().to_uppercase()),
+                };
                 let ctx = crate::ui::browse::BrowseContext {
                     packing,
                     places: self.places(scope),
+                    heading,
                     scope,
                     view,
+                    hero: self.library_hero(scope),
                     rows,
                     focus: &self.browse_focus,
                     covers: &self.covers,

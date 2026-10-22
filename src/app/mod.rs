@@ -435,6 +435,8 @@ pub struct App {
     /// The spotlit game's name and description, cut to their lines, by rom id: measured once a game
     /// and kept, since measuring is a layout of the text — see [`crate::ui::home::clamp_lines`].
     spotlight_text: std::cell::RefCell<HashMap<i64, (String, String)>>,
+    /// The Library's spotlit names, cut to its one line, by rom id — as [`App::spotlight_text`].
+    hero_titles: std::cell::RefCell<HashMap<i64, String>>,
     /// What this user has earned of each game's achievements, by RetroAchievements id, as RomM
     /// last said — for the spotlight. None until it has been asked, and for a user with no
     /// RetroAchievements account linked; a game missing from it has none earned.
@@ -666,6 +668,7 @@ impl App {
             glide: Default::default(),
             wheel: 0.0,
             spotlight_text: Default::default(),
+            hero_titles: Default::default(),
             awarded: None,
             collections_focus: Default::default(),
             collection_sources: None,
@@ -1077,9 +1080,13 @@ impl App {
         ids.into_iter().filter_map(|id| self.library.game(id)).collect()
     }
 
-    /// The game in Home's spotlight.
+    /// The game in the spotlight: on the Library, the one under its grid's cursor; anywhere else,
+    /// Home's.
     fn spotlit_id(&self) -> Option<i64> {
-        self.focus.spotlit(&self.shelves).map(|game| game.rom_id)
+        match &self.screen {
+            Screen::Browsing(Route::Browse { .. }) => self.library_spotlit().first().map(|game| game.rom_id),
+            _ => self.focus.spotlit(&self.shelves).map(|game| game.rom_id),
+        }
     }
 
     /// Point the backdrop at the spotlit game: up at once when its picture is in, otherwise the

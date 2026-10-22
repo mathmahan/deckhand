@@ -141,7 +141,7 @@ pub struct HomeContext<'a> {
     pub compact: bool,
 }
 
-impl HomeContext<'_> {
+impl<'a> HomeContext<'a> {
     /// Resolve a host-relative RomM asset path (`/assets/romm/resources/…`) against the server.
     fn asset_url(&self, path: &str) -> String {
         asset_url(self.host, path)
@@ -157,10 +157,44 @@ impl HomeContext<'_> {
         crate::ui::tab_bar::TAB_BAR_HEIGHT + self.spotlight_h() + ROWS_GAP
     }
 
-    /// The spotlight's picture's box: as tall as it can be and still fade out before the shelves,
-    /// at the box's own shape.
+    /// What the page under Home draws from.
+    fn stage(&self) -> Stage<'a> {
+        Stage {
+            library: self.library,
+            covers: self.covers,
+            backdrop: self.backdrop,
+            now: self.now,
+            band: self.spotlight_h(),
+            rows_top: self.rows_top(),
+            shade: &SHADE,
+        }
+    }
+}
+
+/// How Home's page darkens left to right behind the spotlight's text: where across the window, and
+/// how much of the ground is laid over the picture there.
+pub const SHADE: [(f32, f32); 4] = [(0.0, 1.0), (0.28, 0.94), (0.5, 0.6), (0.74, 0.0)];
+
+/// What the page under a spotlight draws from — Home's, and the Library's over its grid.
+pub struct Stage<'a> {
+    pub library: &'a Library,
+    pub covers: &'a Covers,
+    pub backdrop: &'a Backdrop,
+    pub now: Instant,
+    /// The spotlight's band, from under the header: a cover card stands in it, centred.
+    pub band: f32,
+    /// Where what lies under the spotlight starts, from the top of the window: the picture fades out
+    /// before it.
+    pub rows_top: f32,
+    /// How the page darkens left to right behind the spotlight's text — see [`SHADE`].
+    pub shade: &'a [(f32, f32)],
+}
+
+impl Stage<'_> {
+    /// The spotlight's picture's box: as tall as it can be and still fade out before the rows under
+    /// it, at the box's own shape.
     fn picture_size(&self) -> (f32, f32) {
-        let height = (self.rows_top() + 70.0).min(PICTURE.1);
+        let height = (self.rows_top + 70.0).min(PICTURE.1);
         (height * PICTURE.0 / PICTURE.1, height)
     }
 }
@@ -240,13 +274,17 @@ pub fn title_size(title: &str) -> f32 {
     }
 }
 
-/// The page under everything else on Home — the header included, which floats on it: the spotlit
-/// game's light over the whole window, its picture at the top right, and the scrims that keep the
-/// text over them readable.
+/// The page under everything else on Home — the header included, which floats on it.
+pub fn page_backdrop<'a>(ctx: &HomeContext<'a>) -> Element<'a, Message> {
+    stage(&ctx.stage())
+}
+
+/// The page under a spotlight: the spotlit game's light over the whole window, its picture at the
+/// top right, and the scrims that keep the text over them readable.
 ///
 /// Two games while the spotlight hands over from one to the next, each at its own strength — see
 /// [`Backdrop`].
-pub fn page_backdrop<'a>(ctx: &HomeContext<'a>) -> Element<'a, Message> {
+pub fn stage<'a>(ctx: &Stage<'a>) -> Element<'a, Message> {
     let mut light = stack![].width(Length::Fill).height(Length::Fill);
     let mut pictures = stack![].width(Length::Fill).height(Length::Fill);
     let mut cards = stack![].width(Length::Fill).height(Length::Fill);
@@ -291,20 +329,17 @@ pub fn page_backdrop<'a>(ctx: &HomeContext<'a>) -> Element<'a, Message> {
             Picture::Cover(url) => {
                 let key = covers::key(url, Kind::Feature);
                 if let (Some(handle), Some(meta)) = (ctx.covers.handle(&key), ctx.covers.meta(&key)) {
-                    cards = cards.push(cover_card(handle.clone(), meta.ratio, amount, ctx.spotlight_h()));
+                    cards = cards.push(cover_card(handle.clone(), meta.ratio, amount, ctx.band));
                 }
             }
         }
     }
 
     stack![
-        container(Space::new()).width(Length::Fill).height(Length::Fill).style(|_| container::Style {
-            background: Some(Background::Color(theme::GROUND)),
-            ..Default::default()
-        }),
+        ground(),
         light,
         pictures,
-        scrims(ctx.rows_top()),
+        scrims(ctx.rows_top, ctx.shade),
         // Over the scrims rather than under them: the card is the picture, and the left scrim would
         // dim its left half into the page.
         cards,
@@ -312,6 +347,15 @@ pub fn page_backdrop<'a>(ctx: &HomeContext<'a>) -> Element<'a, Message> {
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
+}
+
+/// Home's ground and nothing on it: the page under a spotlight with no game in it.
+pub fn ground<'a>() -> Element<'a, Message> {
+    container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_| container::Style { background: Some(Background::Color(theme::GROUND)), ..Default::default() })
+        .into()
 }
 
 /// The cover of a game with no screenshot, where its picture would be: a card at the right of the
@@ -341,11 +385,12 @@ fn cover_card<'a>(handle: image::Handle, ratio: f32, amount: f32, band: f32) -> 
 }
 
 /// The three washes of the page's own colour that keep text readable over the picture: down the left
-/// where the spotlight's text is, across the top under the header, and up from the bottom under the
-/// shelves — rising from a little above `rows_top`, where the shelves' window starts.
-fn scrims<'a>(rows_top: f32) -> Element<'a, Message> {
+/// where the spotlight's text is, as `shade` says, across the top under the header, and up from the
+/// bottom under the shelves — rising from a little above `rows_top`, where the shelves' window
+/// starts.
+fn scrims<'a>(rows_top: f32, shade: &[(f32, f32)]) -> Element<'a, Message> {
     use std::f32::consts::{FRAC_PI_2, PI};
-    let left = wash(FRAC_PI_2, &[(0.0, 1.0), (0.28, 0.94), (0.5, 0.6), (0.74, 0.0)]);
+    let left = wash(FRAC_PI_2, shade);
     let top = container(wash(PI, &[(0.0, 0.82), (1.0, 0.0)]).height(Length::Fixed(160.0))).height(Length::Fill);
     let bottom = column![Space::new().height(Length::Fixed(rows_top - 112.0)), wash(0.0, &[(0.0, 0.94), (0.64, 0.94), (1.0, 0.0)])]
         .height(Length::Fill);
@@ -411,7 +456,7 @@ fn spotlight<'a>(ctx: &HomeContext<'a>, shelf: &'a Shelf, game: &'a Game) -> Ele
     }
     info = info.push(Space::new().height(Length::Fixed(24.0))).push(view_button(game));
     if !ctx.compact {
-        info = info.push(Space::new().height(Length::Fixed(18.0))).push(facts(ctx, game, &state));
+        info = info.push(Space::new().height(Length::Fixed(18.0))).push(facts(game, &state, ctx.earned));
     }
 
     container(info)
@@ -425,30 +470,36 @@ fn spotlight<'a>(ctx: &HomeContext<'a>, shelf: &'a Shelf, game: &'a Game) -> Ele
 /// The shelf the game is on, as a filled tag, then its system and when it was last played — or,
 /// for one never played, when it arrived.
 fn eyebrow<'a>(ctx: &HomeContext<'a>, shelf: &'a Shelf, game: &'a Game) -> Element<'a, Message> {
-    let tag = container(text(shelf.title.to_uppercase()).size(12.0).font(theme::BOLD).color(Color::WHITE))
-        .height(Length::Fixed(26.0))
-        .padding([0.0, 10.0])
-        .align_y(alignment::Vertical::Center)
-        .style(|_| container::Style {
-            background: Some(Background::Color(theme::ACCENT_600)),
-            border: Border { radius: 13.0.into(), ..Default::default() },
-            ..Default::default()
-        });
+    eyebrow_of(tag(shelf.title.to_uppercase(), true), Some(ctx.library.system_name(&game.system_id)), game, ctx.this_year)
+}
+
+/// A tag, then `system` — when there is one to name — and when the game was last played, or for one
+/// never played, when it arrived.
+pub fn eyebrow_of<'a>(tag: Element<'a, Message>, system: Option<&str>, game: &Game, this_year: i64) -> Element<'a, Message> {
     let when = match (game.last_played.as_deref(), game.created_at.as_deref()) {
-        (Some(played), _) => crate::library::short_date(played, ctx.this_year).map(|d| format!("Played {d}")),
-        (None, Some(added)) => crate::library::short_date(added, ctx.this_year).map(|d| format!("Added {d}")),
+        (Some(played), _) => crate::library::short_date(played, this_year).map(|d| format!("Played {d}")),
+        (None, Some(added)) => crate::library::short_date(added, this_year).map(|d| format!("Added {d}")),
         (None, None) => None,
     };
-    let line = [Some(ctx.library.system_name(&game.system_id).to_string()), when]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("  ·  ")
-        .to_uppercase();
+    let line = [system.map(str::to_string), when].into_iter().flatten().collect::<Vec<_>>().join("  ·  ").to_uppercase();
     row![tag, text(line).size(13.0).font(theme::SEMIBOLD).color(alpha(theme::INK, 0.82))]
         .spacing(12)
         .height(Length::Fixed(26.0))
         .align_y(Alignment::Center)
+        .into()
+}
+
+/// The spotlight's tag: filled with the accent, or glass where it says something quieter.
+pub fn tag<'a>(words: String, filled: bool) -> Element<'a, Message> {
+    container(text(words).size(12.0).font(theme::BOLD).color(if filled { Color::WHITE } else { alpha(theme::INK, 0.86) }))
+        .height(Length::Fixed(26.0))
+        .padding([0.0, 10.0])
+        .align_y(alignment::Vertical::Center)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(if filled { theme::ACCENT_600 } else { theme::glass(0.08) })),
+            border: Border { color: if filled { Color::TRANSPARENT } else { theme::glass(0.16) }, width: 1.0, radius: 13.0.into() },
+            ..Default::default()
+        })
         .into()
 }
 
@@ -487,7 +538,7 @@ fn title_art<'a>(ctx: &HomeContext<'a>, game: &'a Game) -> Element<'a, Message> 
 }
 
 /// Year, genres, players and rating, in one line that never wraps.
-fn meta_line<'a>(game: &'a Game) -> Element<'a, Message> {
+pub fn meta_line<'a>(game: &'a Game) -> Element<'a, Message> {
     let mut parts: Vec<Element<'a, Message>> = Vec::new();
     let ink = alpha(theme::INK, 0.88);
     let mut push = |part: Element<'a, Message>| {
@@ -523,7 +574,7 @@ fn meta_line<'a>(game: &'a Game) -> Element<'a, Message> {
 
 /// The spotlight's one button: the game's own page, where it is played or fetched, its saves and
 /// states are, and it is a favourite. A on its card presses it, whichever shelf the card is on.
-fn view_button<'a>(game: &'a Game) -> Element<'a, Message> {
+pub fn view_button<'a>(game: &'a Game) -> Element<'a, Message> {
     let label = row![glyph("A", true), text("View").size(16.0).font(theme::BOLD).color(Color::WHITE)]
         .spacing(10)
         .align_y(Alignment::Center);
@@ -536,8 +587,9 @@ fn view_button<'a>(game: &'a Game) -> Element<'a, Message> {
 }
 
 /// What is worth knowing before pressing: how big it is and whether it is here, how long it takes,
-/// and how far into its achievements you are. Each only when RomM says.
-fn facts<'a>(ctx: &HomeContext<'a>, game: &'a Game, state: &SyncState) -> Element<'a, Message> {
+/// and how far into its achievements you are — `earned` of them, when RomM said. Each only when RomM
+/// says.
+pub fn facts<'a>(game: &'a Game, state: &SyncState, earned: Option<usize>) -> Element<'a, Message> {
     let mut items = row![].spacing(22).height(Length::Fixed(20.0)).align_y(Alignment::Center);
     let fact = |icon: iced::widget::Text<'a>, words: String| -> Element<'a, Message> {
         let ink = alpha(theme::INK, 0.72);
@@ -557,7 +609,7 @@ fn facts<'a>(ctx: &HomeContext<'a>, game: &'a Game, state: &SyncState) -> Elemen
         let total = game.achievements;
         items = items.push(fact(
             lucide::trophy(),
-            match ctx.earned {
+            match earned {
                 Some(earned) => format!("{earned} of {total} achievements"),
                 None if total == 1 => "1 achievement".into(),
                 None => format!("{total} achievements"),
@@ -678,11 +730,7 @@ fn card<'a>(ctx: &HomeContext<'a>, shelf_index: usize, index: usize, game: &'a G
     // between while the spotlight is handing over to or from it.
     let lit = ctx.fade.amount(key, spotlit, ctx.now);
     let hovered = ctx.hovered == Some(key);
-    // Home's cards sit on its deeper ground, which is the colour a ring at rest has to vanish into.
-    let (bright, rest) = match hover_look(lit, hovered) {
-        (bright, _) if !hovered => (bright, theme::GROUND),
-        look => look,
-    };
+    let (bright, rest) = hover_look(lit, hovered);
     let width = card_width(game, COVER_H, ctx.covers, ctx.library);
 
     let art: Element<Message> = match game.cover_url.as_deref().and_then(|u| ctx.covers.handle(u)) {
@@ -797,9 +845,9 @@ pub fn badged<'a>(art: Element<'a, Message>, state: &SyncState) -> Element<'a, M
 pub const RING: f32 = 3.0;
 
 /// A cover in its ring: the art inset by [`RING`], and the ring drawn *over* it at the card's edge
-/// — the accent under the cursor, `rest` away from it.
+/// in `ring` — the brightest ink under the cursor, the page's own colour away from it.
 ///
-/// The art is inset, and every `rest` is opaque, because a renderer may not round or crop an image:
+/// The art is inset, and every ring is opaque, because a renderer may not round or crop an image:
 /// tiny-skia draws one square-cornered whatever its container or its own `border_radius` say. Drawn
 /// to the card's edge, its corners poked out past a rounded ring. Inset inside an opaque ring of 8
 /// px corners they fall under the ring's stroke, so every renderer draws the same rounded card;
@@ -812,12 +860,7 @@ pub const RING: f32 = 3.0;
 ///
 /// `ground` fills the inside behind the art, for art that does not cover it. Nothing is drawn
 /// outside the ring, so no other edge shows beside it.
-pub fn ringed<'a>(art: Element<'a, Message>, ground: Color, rest: Color, lit: f32) -> Element<'a, Message> {
-    ring_of(art, ground, mix(rest, theme::ACCENT, lit))
-}
-
-/// [`ringed`], with the ring's colour already decided.
-fn ring_of<'a>(art: Element<'a, Message>, ground: Color, ring: Color) -> Element<'a, Message> {
+pub fn ring_of<'a>(art: Element<'a, Message>, ground: Color, ring: Color) -> Element<'a, Message> {
     let inside = container(art).width(Length::Fill).height(Length::Fill).style(move |_| container::Style {
         background: Some(Background::Color(ground)),
         border: Border { radius: (8.0 - RING).into(), ..Default::default() },
@@ -834,16 +877,17 @@ fn ring_of<'a>(art: Element<'a, Message>, ground: Color, ring: Color) -> Element
 ///
 /// The pointer lifts a card out of the dim; only the cursor adds its ring. The two must not look the
 /// same: the pointer can rest on one card while the cursor sits on another, and Confirm presses the
-/// cursor's. Each also sets the cover's ring — the muted accent for the pointer — see [`ringed`].
+/// cursor's. Each also sets the cover's ring — the muted accent for the pointer — see [`ring_of`].
 ///
 /// Returns how bright the card is — what drives the art's opacity and the title's colour — and
 /// the ring colour it rests at before the cursor's is mixed in.
 pub fn hover_look(lit: f32, hovered: bool) -> (f32, Color) {
-    // Opaque, both: the ring hides the art's corners — see [`ringed`].
+    // Opaque, both: the ring hides the art's corners — see [`ring_of`]. At rest it is the ground
+    // the cards sit on, which is what a ring at rest has to vanish into.
     if hovered {
         (1.0, theme::FOCUS_RING)
     } else {
-        (lit, theme::BACKGROUND)
+        (lit, theme::GROUND)
     }
 }
 
