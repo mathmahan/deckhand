@@ -29,6 +29,22 @@ pub fn row(lit: bool, radius: f32) -> impl Fn(&Theme, Status) -> Style {
     }
 }
 
+/// A row on glass, as Home's look has it: lifted under the cursor on a ring of the brightest ink and
+/// a shadow, and only brightened under the pointer.
+pub fn glass_row(lit: bool, radius: f32) -> impl Fn(&Theme, Status) -> Style {
+    move |_, status| Style {
+        background: Some(Background::Color(theme::glass(if lit { 0.10 } else if hovered(status) { 0.08 } else { 0.05 }))),
+        text_color: theme::INK,
+        border: Border { color: if lit { theme::INK } else { theme::glass(0.10) }, width: if lit { 3.0 } else { 1.0 }, radius: radius.into() },
+        shadow: if lit {
+            Shadow { color: theme::alpha(Color::BLACK, 0.45), offset: iced::Vector::new(0.0, 14.0), blur_radius: 32.0 }
+        } else {
+            Shadow::default()
+        },
+        snap: true,
+    }
+}
+
 /// A filter, sort or kind chip: filled with the accent when chosen, and ringed in white under the
 /// cursor — a ring in the accent disappeared into a chosen chip's accent fill.
 pub fn chip(selected: bool, lit: bool) -> impl Fn(&Theme, Status) -> Style {

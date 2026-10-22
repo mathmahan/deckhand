@@ -1,22 +1,23 @@
 //! The game detail page — a port of `browse/ui/DetailView.kt`.
 //!
-//! Full-bleed art behind a legibility scrim, the cover beside the game's name and its facts, the actions in a row under them, then the screenshots, the description and the
-//! achievements. Every fact here comes off the library snapshot: the RomM list response already
+//! Drawn as Home is: the game's picture and its light behind the page, the cover beside the game's
+//! name and its facts, the actions in a row under them, then the screenshots, the description and
+//! the achievements. Every fact here comes off the library snapshot: the RomM list response already
 //! carries the summary, the metadata, the size and the screenshot paths, so opening a game costs no
 //! fetch and the page draws in the first frame.
 //!
 //! The pad's cursor walks it in rows: the actions, the screenshots — any one of which opens over the
 //! whole window, see [`viewer`] — and the achievements' heading, which folds their list away.
 
-use iced::widget::{self as widget, button, column, container, image, mouse_area, row, scrollable, stack, text, Space};
-use iced::{Alignment, Background, Border, Color, ContentFit, Element, Gradient, Length, Radians};
+use iced::widget::{self as widget, button, column, container, image, mouse_area, row, scrollable, text, Space};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding, Shadow, Vector};
 use iced_fonts::lucide;
 
 use crate::app::Message;
 use crate::covers::Covers;
 use crate::downloads::{Downloads, SyncState};
 use crate::library::Game;
-use crate::theme::{self, alpha};
+use crate::theme::{self, alpha, glass};
 
 /// How tall the cover down the left is: about as tall as the facts beside it, so a wide box's
 /// cover does not take half the page.
@@ -215,17 +216,18 @@ pub struct DetailContext<'a> {
     pub extras: bool,
     /// The achievements' list is open under its heading.
     pub achievements_open: bool,
+    /// For dates: a game played this year says "1 Oct", one played before says the year too.
+    pub this_year: i64,
 }
 
-impl<'a> DetailContext<'a> {
-    fn asset(&self, path: &str) -> String {
-        if path.starts_with("http://") || path.starts_with("https://") {
-            path.to_string()
-        } else {
-            format!("{}{}", self.host.trim_end_matches('/'), path)
-        }
-    }
-}
+/// How the page darkens left to right over the game's picture: further across than Home's, since
+/// the facts beside the cover run most of the way over.
+pub const SHADE: [(f32, f32); 4] = [(0.0, 1.0), (0.45, 0.94), (0.7, 0.55), (0.92, 0.0)];
+
+/// Where the game's picture behind the page fades out, from the top of the window: under the row of
+/// actions, so what is read below it — the screenshots, the description, the achievements — is on
+/// the plain ground.
+pub const PICTURE_ENDS: f32 = crate::ui::tab_bar::TAB_BAR_HEIGHT + 400.0;
 
 pub fn detail_view<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     let game = ctx.game;
@@ -236,64 +238,30 @@ pub fn detail_view<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     let mut page = column![
         back_link(ctx),
         Space::new().height(Length::Fixed(12.0)),
-        row![art_panel(ctx), Space::new().width(Length::Fixed(28.0)), facts(ctx)]
-            .align_y(Alignment::Start),
-        Space::new().height(Length::Fixed(20.0)),
+        row![art_panel(ctx), Space::new().width(Length::Fixed(28.0)), facts(ctx)].align_y(Alignment::Start),
+        Space::new().height(Length::Fixed(24.0)),
         container(actions(ctx)).id(part_id(Zone::Actions)),
     ];
     for section in [screenshots(ctx), about(game), achievements(ctx)].into_iter().flatten() {
         page = page.push(Space::new().height(Length::Fixed(SECTION_GAP))).push(section);
     }
-    let page = page.push(Space::new().height(Length::Fixed(SECTION_GAP))).padding([16, 28]);
+    let margin = crate::ui::tab_bar::MARGIN;
+    let page = page
+        .push(Space::new().height(Length::Fixed(SECTION_GAP)))
+        .padding(Padding { top: 8.0, right: margin, bottom: 0.0, left: margin });
 
-    // The backdrop is the game's own banner, blurred, under a scrim heavy enough to read against.
-    // Same treatment as Home's hero and for the same reason: it should read as this game's colour,
-    // not as a picture competing with the text on top of it.
-    let backdrop = game
-        .marquee_path
-        .as_deref()
-        .map(|p| ctx.asset(p))
-        .and_then(|url| ctx.covers.handle(&url).cloned());
-
-    let mut layers = stack![];
-    if let Some(handle) = backdrop {
-        layers = layers.push(
-            container(
-                // Stretched, not cropped — blurred past telling, and a crop spills on tiny-skia; see
-                // the same call on Home's hero.
-                image(handle)
-                    .content_fit(ContentFit::Fill)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .clip(true),
-        );
-    }
-    layers = layers.push(
-        container(Space::new().width(Length::Fill).height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| container::Style {
-                background: Some(Background::Gradient(Gradient::Linear(
-                    iced::gradient::Linear::new(Radians(std::f32::consts::FRAC_PI_2))
-                        .add_stop(0.0, alpha(theme::BACKGROUND, 0.94))
-                        .add_stop(0.6, alpha(theme::BACKGROUND, 0.86))
-                        .add_stop(1.0, alpha(theme::BACKGROUND, 0.78)),
-                ))),
-                ..Default::default()
-            }),
-    );
-    layers = layers.push(
+    // On the game's own picture and light, drawn under the header by the window — see
+    // `crate::ui::home::stage`.
+    column![
         scrollable(page)
             .id(detail_id())
             .on_scroll(|viewport| Message::DetailScrolled(viewport.absolute_offset().y))
+            .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4).scroller_width(4).margin(4)))
             .width(Length::Fill)
             .height(Length::Fill),
-    );
-
-    layers.width(Length::Fill).height(Length::Fill).into()
+        hints(ctx),
+    ]
+    .into()
 }
 
 fn back_link<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
@@ -301,163 +269,116 @@ fn back_link<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
         Some(i) => format!("←  {} · {} of {}", ctx.system_name, i + 1, ctx.system_total),
         None => format!("←  {} · {} games", ctx.system_name, ctx.system_total),
     };
-    button(text(where_).size(theme::text_size::BODY_MEDIUM).color(theme::TEXT_SECONDARY))
+    button(text(where_).size(theme::text_size::BODY_MEDIUM).color(alpha(theme::INK, 0.72)))
         .padding([4, 2])
         .on_press(Message::Back)
         .style(crate::ui::style::link)
         .into()
 }
 
-/// The cover, with its install state called out across the top.
+/// The cover, rounded and stood off the page by its shadow, as Home's cover card is. Glass where
+/// there is none yet.
 fn art_panel<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
-    let game = ctx.game;
-    let cover = game.cover_url.as_deref().and_then(|url| ctx.covers.feature(url));
+    let cover = ctx.game.cover_url.as_deref().and_then(|url| ctx.covers.feature(url));
     let ratio = cover.as_ref().map(|(_, meta)| meta.ratio).unwrap_or(0.71);
     let width = COVER_H * ratio;
-
     let art: Element<Message> = match cover {
         Some((handle, _)) => image(handle)
             .content_fit(ContentFit::Cover)
             .width(Length::Fixed(width))
             .height(Length::Fixed(COVER_H))
+            .border_radius(12.0)
             .into(),
-        None => Space::new().width(Length::Fill).height(Length::Fill).into(),
+        None => Space::new().width(Length::Fixed(width)).height(Length::Fixed(COVER_H)).into(),
     };
-
-    let badge = container(
-        text(match ctx.downloads.state_of(game.builds()) {
-            SyncState::Installed => "ON THIS DEVICE".to_string(),
-            SyncState::UpdateAvailable => "UPDATE ON ROMM".to_string(),
-            SyncState::Downloading(progress) => {
-                format!("DOWNLOADING {}%", (progress * 100.0) as i32)
-            }
-            SyncState::Unpacking(progress) => format!("UNPACKING {}%", (progress * 100.0) as i32),
-            SyncState::Failed(_) => "DOWNLOAD FAILED".to_string(),
-            SyncState::RemoteOnly => "NOT DOWNLOADED".to_string(),
+    container(art)
+        .style(|_| container::Style {
+            background: Some(Background::Color(glass(0.06))),
+            border: Border { color: glass(0.10), width: 1.0, radius: 12.0.into() },
+            shadow: Shadow { color: alpha(Color::BLACK, 0.5), offset: Vector::new(0.0, 18.0), blur_radius: 40.0 },
+            ..Default::default()
         })
-        .size(10.0)
-        .font(theme::BOLD)
-        .color(theme::TEXT_PRIMARY),
-    )
-    .padding([4, 8])
-    .style(|_| container::Style {
-        background: Some(Background::Color(alpha(Color::BLACK, 0.72))),
-        border: Border { radius: 6.0.into(), ..Default::default() },
-        ..Default::default()
-    });
-
-    container(
-        stack![
-            art,
-            container(badge).padding(10),
-        ]
-        .width(Length::Fixed(width))
-        .height(Length::Fixed(COVER_H)),
-    )
-    .style(|_| container::Style {
-        background: Some(Background::Color(theme::SURFACE_VARIANT)),
-        border: Border {
-            color: alpha(theme::NEUTRAL_100, 0.12),
-            width: 1.0,
-            radius: 10.0.into(),
-        },
-        ..Default::default()
-    })
-    .clip(true)
-    .into()
+        .into()
 }
 
+/// Beside the cover: where the game stands on this device and when it was played, its name, its
+/// rating and what it is, and the figures worth knowing.
 fn facts<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     let game = ctx.game;
+    let size = crate::ui::home::title_size(&game.title);
 
-    // The chip row: what the game *is* — system, which build, year, genres — then where this player
+    // The rating, then what the game *is* — which build, year, genres — and where this player
     // stands with it, as marked in RomM.
-    let mut chips = row![].spacing(10);
-    for label in [Some(ctx.system_name.to_string()), game.build.clone(), game.year.map(|y| y.to_string())]
+    let mut what = row![].spacing(8).align_y(Alignment::Center);
+    if let Some(rating) = game.rating {
+        // Five glyphs, filled up to the rating. A half star would need a third glyph; the number
+        // beside it carries the precision that rounding loses.
+        let filled = rating.round() as usize;
+        what = what.push(
+            row![
+                text((0..5).map(|i| if i < filled { '★' } else { '☆' }).collect::<String>()).size(16.0).color(theme::STAR),
+                text(format!("{rating:.1}")).size(15.0).color(alpha(theme::INK, 0.88)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+        what = what.push(Space::new().width(Length::Fixed(6.0)));
+    }
+    for words in [game.build.clone(), game.year.map(|y| y.to_string())]
         .into_iter()
         .flatten()
-        .chain(game.genres.iter().take(2).cloned())
+        .chain(game.genres.iter().take(2).map(|g| crate::ui::home::short_genre(g).to_string()))
         .chain(game.status.map(|s| s.label().to_string()))
         .chain(game.now_playing.then(|| "Now playing".to_string()))
         .chain(game.backlogged.then(|| "On the backlog".to_string()))
     {
-        chips = chips.push(
-            container(
-                text(label).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY),
-            )
-            .padding([6, 12])
-            .style(|_| container::Style {
-                background: Some(Background::Color(alpha(theme::SURFACE, 0.75))),
-                border: Border { color: theme::BORDER, width: 1.0, radius: 8.0.into() },
-                ..Default::default()
-            }),
-        );
+        what = what.push(crate::ui::home::tag(words, false));
     }
 
     column![
-        title(ctx),
+        eyebrow(ctx),
         Space::new().height(Length::Fixed(10.0)),
-        rating_line(game),
+        text(game.title.as_str()).size(size).font(theme::DISPLAY).line_height(iced::widget::text::LineHeight::Relative(1.05)).color(theme::INK),
+        Space::new().height(Length::Fixed(12.0)),
+        what.wrap().vertical_spacing(8.0),
         Space::new().height(Length::Fixed(16.0)),
-        chips.wrap().vertical_spacing(10.0),
-        Space::new().height(Length::Fixed(20.0)),
         stats(ctx),
     ]
     .width(Length::Fill)
     .into()
 }
 
-/// The game's name, as text: RomM's title art beside the cover was the name a second time, in the
-/// box's own lettering.
-fn title<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
-    text(ctx.game.title.as_str())
-        .size(theme::text_size::DISPLAY_MEDIUM)
-        .font(theme::EXTRABOLD)
-        .color(theme::TEXT_PRIMARY)
-        .into()
+/// Where the game stands on this device, as a tag — filled while it is here or on its way — then its
+/// system and when it was last played.
+fn eyebrow<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
+    let (words, filled) = match ctx.downloads.state_of(ctx.game.builds()) {
+        SyncState::Installed => ("ON THIS DEVICE".to_string(), true),
+        SyncState::UpdateAvailable => ("UPDATE ON ROMM".to_string(), true),
+        SyncState::Downloading(progress) => (format!("DOWNLOADING {}%", (progress * 100.0) as i32), true),
+        SyncState::Unpacking(progress) => (format!("UNPACKING {}%", (progress * 100.0) as i32), true),
+        SyncState::Failed(_) => ("DOWNLOAD FAILED".to_string(), false),
+        SyncState::RemoteOnly => ("ON ROMM".to_string(), false),
+    };
+    let played = match ctx.game.last_played.as_deref().and_then(|played| crate::library::short_date(played, ctx.this_year)) {
+        Some(day) => format!("Played {day}"),
+        None => "Never played".to_string(),
+    };
+    row![
+        crate::ui::home::tag(words, filled),
+        text(format!("{}  ·  {played}", ctx.system_name).to_uppercase()).size(13.0).font(theme::SEMIBOLD).color(alpha(theme::INK, 0.82)),
+    ]
+    .spacing(12)
+    .height(Length::Fixed(26.0))
+    .align_y(Alignment::Center)
+    .into()
 }
 
-/// Stars, the numeric rating, and when it was last played.
-fn rating_line<'a>(game: &'a Game) -> Element<'a, Message> {
-    let mut line = row![].spacing(8).align_y(Alignment::Center);
-
-    if let Some(rating) = game.rating {
-        // Five glyphs, filled up to the rating. A half star would need a third glyph; the number
-        // beside it carries the precision that rounding loses.
-        let filled = rating.round() as usize;
-        line = line.push(
-            text((0..5).map(|i| if i < filled { '★' } else { '☆' }).collect::<String>())
-                .size(theme::text_size::TITLE_MEDIUM)
-                .color(theme::ACCENT_SOFT),
-        );
-        line = line.push(
-            text(format!("{rating:.1}"))
-                .size(theme::text_size::BODY_MEDIUM)
-                .color(theme::TEXT_SECONDARY),
-        );
-        line = line.push(text("·").size(theme::text_size::BODY_MEDIUM).color(theme::DOT_COLOR));
-    }
-
-    line = line.push(
-        text(match game.played_date() {
-            Some(date) => format!("Played {date}"),
-            None => "Never played".to_string(),
-        })
-        .size(theme::text_size::BODY_MEDIUM)
-        .color(theme::TEXT_SECONDARY),
-    );
-    line.into()
-}
-
-/// The stats strip. Each cell names a fact and gives it, and a fact this build cannot know says so
-/// rather than showing a confident zero.
+/// The figures, on a strip of glass. Each names a fact and gives it, and a fact this build cannot
+/// know says so rather than showing a confident zero.
 fn stats<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     let game = ctx.game;
     let cells = [
-        (
-            "PUBLISHER",
-            game.companies.first().cloned().unwrap_or_else(|| "Unknown".into()),
-        ),
+        ("PUBLISHER", game.companies.first().cloned().unwrap_or_else(|| "Unknown".into())),
         ("PLAYERS", game.players.clone().unwrap_or_else(|| "-".into())),
         ("SIZE", game.size_label().unwrap_or_else(|| "-".into())),
         // RomM's counts, once it has answered. Until then a dash: a 0 would claim it holds none.
@@ -467,23 +388,29 @@ fn stats<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
         ("HOW LONG TO BEAT", game.beat_label()),
     ];
 
-    let mut strip = row![].spacing(36);
+    let mut strip = row![].spacing(28);
     for (label, value) in cells {
         strip = strip.push(
             column![
-                text(label).size(10.0).font(theme::BOLD).color(theme::TEXT_MUTED),
-                Space::new().height(Length::Fixed(4.0)),
-                text(value)
-                    .size(theme::text_size::TITLE_MEDIUM)
-                    .font(theme::MEDIUM)
-                    .color(theme::TEXT_PRIMARY),
-            ],
+                text(label).size(10.0).font(theme::BOLD).color(alpha(theme::INK, 0.55)),
+                text(value).size(16.0).font(theme::MEDIUM).color(theme::INK),
+            ]
+            .spacing(3),
         );
     }
     // Wrapped, for the facts beside a wide box's cover.
-    strip.wrap().vertical_spacing(16.0).into()
+    container(strip.wrap().vertical_spacing(10.0))
+        .padding([10, 18])
+        .style(|_| container::Style {
+            background: Some(Background::Color(glass(0.05))),
+            border: Border { color: glass(0.10), width: 1.0, radius: 14.0.into() },
+            ..Default::default()
+        })
+        .into()
 }
 
+/// The actions, as Home's spotlight has them: the first in the accent, as its View is, the rest on
+/// glass, and the one under the cursor ringed in the brightest ink.
 fn actions<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     let state = ctx.downloads.state_of(ctx.game.builds());
     let pinned = ctx.downloads.installed_builds(ctx.game.builds()).iter().any(|i| i.pinned);
@@ -497,44 +424,54 @@ fn actions<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
         // A running download is inert: the percentage is the progress, and a second press on the
         // one button the thumb is already resting on should not be a cancel found by accident.
         let running = *action == Action::Download && state.is_busy();
-        let mut press = button(
-            text(label)
-                .size(theme::text_size::TITLE_MEDIUM)
-                .font(if primary { theme::BOLD } else { theme::MEDIUM }),
-        )
-        .padding([13, 22]);
+        let mut press = button(container(text(label).size(16.0).font(if primary { theme::BOLD } else { theme::MEDIUM })).center_y(Length::Fill))
+            .height(Length::Fixed(52.0))
+            .padding([0, 22]);
         if !running {
             press = press.on_press(Message::DetailAction(*action));
         }
-        buttons = buttons.push(
-            press
-            // One bright button, the one under the cursor. The first action keeps a purple of its own
-            // so it still reads as the main one, but a muted one: at full strength it out-shone a
-            // focused neighbour, and from a couch the brightest button is the one you're on.
-            .style(crate::ui::style::action(primary, lit)),
-        );
+        buttons = buttons.push(press.style(crate::ui::style::spotlight(primary, lit)));
     }
     // Wrapped, so the row never runs off a narrow window or a large UI scale.
     buttons.wrap().vertical_spacing(12.0).into()
+}
+
+/// What A does where the cursor is, and that B goes back, said quietly at the foot of the page.
+fn hints<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
+    let press = match ctx.focus.zone {
+        Zone::Actions => {
+            let shown = Action::shown(ctx.extras);
+            let state = ctx.downloads.state_of(ctx.game.builds());
+            let pinned = ctx.downloads.installed_builds(ctx.game.builds()).iter().any(|i| i.pinned);
+            let action = shown[ctx.focus.action.min(shown.len() - 1)];
+            // The button's own words, less the play glyph some carry.
+            let label = action.label(&state, pinned, ctx.game.missing(), ctx.in_steam, ctx.favourite);
+            let label = label.trim_start_matches(['▶', ' ']).to_string();
+            Some(label)
+        }
+        Zone::Shots => Some("View".to_string()),
+        Zone::Achievements => Some(if ctx.achievements_open { "Hide" } else { "Show" }.to_string()),
+    };
+    let mut hints: Vec<(&str, String)> = press.map(|words| ("A", words)).into_iter().collect();
+    hints.push(("B", "Back".to_string()));
+    crate::ui::tab_bar::hint_line(hints)
+}
+
+/// A section's name over it, as Home names its shelves.
+fn heading<'a>(words: &'a str) -> Element<'a, Message> {
+    text(words).size(20.0).font(theme::DISPLAY).color(theme::INK).into()
 }
 
 fn about<'a>(game: &'a Game) -> Option<Element<'a, Message>> {
     let summary = game.summary.as_deref()?;
     Some(
         column![
-            label("ABOUT"),
-            Space::new().height(Length::Fixed(10.0)),
-            text(summary.to_string())
-                .size(theme::text_size::BODY_LARGE)
-                .color(theme::TEXT_BODY),
+            heading("About"),
+            Space::new().height(Length::Fixed(12.0)),
+            text(summary.to_string()).size(16.0).line_height(iced::widget::text::LineHeight::Relative(1.5)).color(alpha(theme::INK, 0.76)),
         ]
         .into(),
     )
-}
-
-/// A section's name over it.
-fn label<'a>(words: &'a str) -> Element<'a, Message> {
-    text(words).size(10.0).font(theme::BOLD).color(theme::TEXT_MUTED).into()
 }
 
 /// A badge's size in the Achievements list, and how many rows it shows before saying how many more.
@@ -566,21 +503,22 @@ fn achievements<'a>(ctx: &DetailContext<'a>) -> Option<Element<'a, Message>> {
         _ => count.to_string(),
     };
     let chevron = if open { lucide::chevron_up() } else { lucide::chevron_down() };
+    let quiet = alpha(theme::INK, 0.68);
     let heading = button(
         row![
-            lucide::trophy().size(18.0).color(theme::ACCENT_SOFT),
-            text("Achievements").size(theme::text_size::TITLE_MEDIUM).font(theme::SEMIBOLD),
-            text(summary).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY).width(Length::Fill),
-            text(if open { "Hide" } else { "Show" }).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY),
-            chevron.size(18.0).color(theme::TEXT_SECONDARY),
+            lucide::trophy().size(18.0).color(theme::STAR),
+            text("Achievements").size(20.0).font(theme::DISPLAY),
+            text(summary).size(14.0).color(quiet).width(Length::Fill),
+            text(if open { "Hide" } else { "Show" }).size(14.0).color(quiet),
+            chevron.size(18.0).color(quiet),
         ]
         .spacing(12)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding([14, 18])
+    .padding([14, 20])
     .on_press(Message::ToggleAchievements)
-    .style(crate::ui::style::row(ctx.focus.zone == Zone::Achievements, 12.0));
+    .style(crate::ui::style::glass_row(ctx.focus.zone == Zone::Achievements, 16.0));
     let heading = container(heading).id(part_id(Zone::Achievements));
     if !open {
         return Some(heading.into());
@@ -611,19 +549,19 @@ fn achievement_rows<'a>(ctx: &DetailContext<'a>, game: &crate::achievements::Gam
                 .width(Length::Fixed(BADGE))
                 .height(Length::Fixed(BADGE))
                 .style(|_| container::Style {
-                    background: Some(Background::Color(theme::SURFACE_VARIANT)),
-                    border: Border { radius: 6.0.into(), ..Default::default() },
+                    background: Some(Background::Color(glass(0.06))),
+                    border: Border { radius: 8.0.into(), ..Default::default() },
                     ..Default::default()
                 })
                 .into(),
         };
-        let ink = if locked { theme::TEXT_SECONDARY } else { theme::TEXT_PRIMARY };
+        let ink = if locked { alpha(theme::INK, 0.72) } else { theme::INK };
         let mut words = column![text(achievement.title.clone()).size(theme::text_size::BODY_LARGE).font(theme::MEDIUM).color(ink)].spacing(2);
         if let Some(description) = achievement.description.as_deref().filter(|d| !d.trim().is_empty()) {
             words = words.push(
                 text(description.to_string())
-                    .size(theme::text_size::BODY_MEDIUM)
-                    .color(if locked { theme::TEXT_MUTED } else { theme::TEXT_SECONDARY }),
+                    .size(14.0)
+                    .color(alpha(theme::INK, if locked { 0.5 } else { 0.68 })),
             );
         }
         let mut figures = column![].align_x(Alignment::End).spacing(2);
@@ -632,7 +570,7 @@ fn achievement_rows<'a>(ctx: &DetailContext<'a>, game: &crate::achievements::Gam
                 text(format!("{points} pts"))
                     .size(theme::text_size::LABEL_LARGE)
                     .font(theme::SEMIBOLD)
-                    .color(if locked { theme::TEXT_MUTED } else { theme::ACCENT_SOFT }),
+                    .color(if locked { alpha(theme::INK, 0.5) } else { theme::ACCENT_400 }),
             );
         }
         match earned {
@@ -641,7 +579,7 @@ fn achievement_rows<'a>(ctx: &DetailContext<'a>, game: &crate::achievements::Gam
                 let day = earned.date.as_deref().map(|d| d.split([' ', 'T']).next().unwrap_or(d).to_string()).unwrap_or_default();
                 let mode = if earned.date_hardcore.is_some() { " · hardcore" } else { "" };
                 figures = figures.push(
-                    text(format!("✓ earned {day}{mode}")).size(theme::text_size::LABEL_LARGE).color(theme::ACCENT),
+                    text(format!("✓ earned {day}{mode}")).size(theme::text_size::LABEL_LARGE).color(theme::IN_SYNC),
                 );
             }
             None => {
@@ -653,15 +591,11 @@ fn achievement_rows<'a>(ctx: &DetailContext<'a>, game: &crate::achievements::Gam
         let lit = earned.is_some();
         rows = rows.push(
             container(row![badge, words.width(Length::Fill), figures].spacing(14).align_y(Alignment::Center))
-                .padding([8, 12])
+                .padding([10, 16])
                 .width(Length::Fill)
                 .style(move |_| container::Style {
-                    background: Some(Background::Color(alpha(theme::SURFACE, if locked { 0.45 } else { 0.75 }))),
-                    border: Border {
-                        color: if lit { alpha(theme::ACCENT, 0.55) } else { theme::BORDER },
-                        width: 1.0,
-                        radius: 10.0.into(),
-                    },
+                    background: Some(Background::Color(glass(if locked { 0.03 } else { 0.06 }))),
+                    border: Border { color: if lit { alpha(theme::IN_SYNC, 0.5) } else { glass(0.10) }, width: 1.0, radius: 14.0.into() },
                     ..Default::default()
                 }),
         );
@@ -775,8 +709,8 @@ fn screenshots<'a>(ctx: &DetailContext<'a>) -> Option<Element<'a, Message>> {
 
     Some(
         container(column![
-            label("SCREENSHOTS"),
-            Space::new().height(Length::Fixed(10.0)),
+            heading("Screenshots"),
+            Space::new().height(Length::Fixed(12.0)),
             scrollable(strip)
                 .id(shots_strip_id())
                 .on_scroll(|_| Message::Scrolled)

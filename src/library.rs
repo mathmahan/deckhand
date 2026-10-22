@@ -331,9 +331,6 @@ impl Game {
         self.unavailable && self.sibling_ids.is_empty()
     }
 
-    pub fn played_date(&self) -> Option<&str> {
-        self.last_played.as_deref().map(|s| &s[..s.len().min(10)])
-    }
 }
 
 /// An ISO date as a person would say it: "1 Oct", with the year as well when it is not `this_year`'s.

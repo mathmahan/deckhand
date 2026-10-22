@@ -167,6 +167,7 @@ impl<'a> HomeContext<'a> {
             band: self.spotlight_h(),
             rows_top: self.rows_top(),
             shade: &SHADE,
+            cover_cards: true,
         }
     }
 }
@@ -188,6 +189,9 @@ pub struct Stage<'a> {
     pub rows_top: f32,
     /// How the page darkens left to right behind the spotlight's text — see [`SHADE`].
     pub shade: &'a [(f32, f32)],
+    /// A game with no screenshot has its cover stood in the band as its picture. Not on a page that
+    /// shows the cover already.
+    pub cover_cards: bool,
 }
 
 impl Stage<'_> {
@@ -326,6 +330,7 @@ pub fn stage<'a>(ctx: &Stage<'a>) -> Element<'a, Message> {
                     );
                 }
             }
+            Picture::Cover(_) if !ctx.cover_cards => {}
             Picture::Cover(url) => {
                 let key = covers::key(url, Kind::Feature);
                 if let (Some(handle), Some(meta)) = (ctx.covers.handle(&key), ctx.covers.meta(&key)) {
