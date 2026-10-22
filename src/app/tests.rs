@@ -1047,22 +1047,42 @@ mod render {
                 }
             }
         };
-        hydrate(&mut app);
-        app.follow_spotlight();
-        app.backdrop = settled(std::mem::take(&mut app.backdrop));
-        snapshot(&app, "readme-home");
-        for system in ["snes", "ps2", "psx"] {
+        // The art the page asks for, then its picture settled behind it, as it is once the fade is
+        // over — or none, for a game whose picture the cache has not got, rather than the last page's.
+        let settle = |app: &mut App| {
+            app.fade = Default::default();
+            hydrate(app);
+            hydrate(app);
+            app.backdrop = Default::default();
+            app.follow_spotlight();
+            app.backdrop = settled(std::mem::take(&mut app.backdrop));
+        };
+        settle(&mut app);
+        readme_shot(&app, "readme-home");
+        for system in ["snes", "ps2", "psx", "n64"] {
             let _ = app.update(Message::OpenSystem(system.into()));
             let _ = app.update(Message::Nav(Direction::Down));
-            app.fade = Default::default();
-            hydrate(&mut app);
-            snapshot(&app, &format!("readme-browse-{system}"));
+            settle(&mut app);
+            readme_shot(&app, &format!("readme-library-{system}"));
         }
         if let Some(first) = app.shelves.first().and_then(|s| s.games.first()).map(|g| g.rom_id) {
             let _ = app.update(Message::OpenDetail(first));
-            hydrate(&mut app);
-            snapshot(&app, "readme-detail");
+            settle(&mut app);
+            readme_shot(&app, "readme-game");
         }
+    }
+
+    /// [`snapshot`], and beside it a JPEG of it 1600 px wide — what the README shows, as
+    /// `screenshots/home.jpg`, `library.jpg` (the PS2 grid) and `game.jpg`.
+    fn readme_shot(app: &App, name: &str) {
+        snapshot(app, name);
+        let dir = std::env::var("DECKHAND_SNAPSHOTS").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let frame = image::open(dir.join(format!("{name}-wgpu.png"))).expect("the frame just written");
+        let width = 1600;
+        let height = frame.height() * width / frame.width();
+        let small = frame.resize_exact(width, height, image::imageops::FilterType::Lanczos3).to_rgb8();
+        let mut out = std::fs::File::create(dir.join(format!("{name}.jpg"))).expect("a JPEG beside it");
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 86).encode_image(&small).expect("the JPEG written");
     }
 
     #[test]
