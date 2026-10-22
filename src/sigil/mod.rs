@@ -43,6 +43,12 @@ impl Error {
     fn new(code: c_int, problem: Option<String>) -> Self {
         Error { code, message: strerror(code), problem: problem.filter(|p| !p.is_empty()) }
     }
+
+    /// sigil found none of what it was asked for — from [`Request::restore`], a unit that holds no
+    /// save of this game.
+    pub fn is_not_found(&self) -> bool {
+        self.code == ffi::SIGIL_ERR_NOT_FOUND
+    }
 }
 
 impl std::fmt::Display for Error {

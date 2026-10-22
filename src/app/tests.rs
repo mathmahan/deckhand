@@ -426,7 +426,7 @@ fn the_detail_pages_action_row_does_what_it_says_at_each_stage() {
         exit,
         played_at: Some("2999-01-01T00:00:00Z".into()),
         notes: vec!["saves synced".into()],
-        pictureless: false,
+        report: None,
     };
     let _ = app.update(Message::LaunchEvent(crate::launch::Event::Ended(game.rom_id, Ok(session))));
     assert_eq!(app.playing, None);
@@ -3092,7 +3092,7 @@ fn state_pictures_are_offered_once_and_a_no_is_remembered() {
         exit: crate::launch::Exit { success: true, code: Some(0), last_line: None },
         played_at: None,
         notes: Vec::new(),
-        pictureless: true,
+        report: Some(Box::new(crate::sync::Report { pictureless: 1, ..Default::default() })),
     };
     let game = app.library.all_games()[0].rom_id;
     app.playing = Some(game);

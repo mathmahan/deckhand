@@ -158,9 +158,21 @@ impl Unit {
 
     /// Put `bytes` — RomM's `server_name`, made at `made` — in place of the game's saves here,
     /// answering RomM's hash of what is here then and every file written or taken away.
+    ///
+    /// A unit with none of this game's saves in it puts nothing here: an emulator elsewhere wrote
+    /// out a memory card it had only just formatted, say, for a game that never saved. Where the
+    /// game has no saves here either, that is no failure — the hash answered is still nothing. Where
+    /// it has, they stay, and RomM's copy is not taken as theirs.
     pub fn put(&self, bytes: &[u8], made: Option<SystemTime>, server_name: &str) -> Result<(String, Vec<PathBuf>), String> {
         let unit = self.adapt(bytes, server_name);
-        let restored = self.request.restore(&unit, None).map_err(|e| e.to_string())?;
+        let restored = match self.request.restore(&unit, None) {
+            Ok(restored) => restored,
+            Err(e) if e.is_not_found() && self.held()?.is_none() => sigil::Restored::default(),
+            Err(e) if e.is_not_found() => {
+                return Err("RomM's copy holds none of this game's saves, so the ones here were left as they are".into());
+            }
+            Err(e) => return Err(e.to_string()),
+        };
         // A file of its own takes RomM's time rather than now, as a battery save always has: a later
         // conflict weighs when the progress was made, not when it was copied here.
         if let (Some(made), Some(file)) = (made, self.file()) {

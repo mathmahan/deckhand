@@ -616,6 +616,18 @@ impl App {
         self.sync_saves_of(None)
     }
 
+    /// Every save synced, once each time the window opens: RomM's newer ones come down before a
+    /// game is picked, and the header's saves icon says where things stand from the start. Once the
+    /// library is here, since saves are matched to games by it.
+    pub(super) fn sweep_once(&mut self) -> Task<Message> {
+        // A fixture library is not a device's, and its tests have no RetroArch to read.
+        if self.swept || !self.writes_settings || self.settings.connection.is_none() {
+            return Task::none();
+        }
+        self.swept = true;
+        self.sync_saves()
+    }
+
     /// [`App::sync_saves`], narrowed to the games `changed` are saves of when given — the watcher's.
     pub(super) fn sync_saves_of(&mut self, changed: Option<Vec<std::path::PathBuf>>) -> Task<Message> {
         if matches!(self.save_sync, SaveSync::Running) {

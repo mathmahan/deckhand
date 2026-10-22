@@ -315,6 +315,9 @@ impl App {
                 if !matches!(self.screen, Screen::Browsing(_)) {
                     self.screen = Screen::Browsing(Route::Home);
                 }
+                // The first library this session — opening without a cache, or just paired — is when
+                // every save is synced.
+                let sweep = self.sweep_once();
                 // The first library after a pairing: the moment to offer RetroDECK, if it is not here.
                 let offer = if std::mem::take(&mut self.offer_retrodeck) { self.look_for_retrodeck(Offering::Pairing) } else { Task::none() };
                 // RomM's smart and generated collections move with the library: asked again with
@@ -336,6 +339,7 @@ impl App {
                     self.ensure_device(),
                     self.claim_installs(),
                     offer,
+                    sweep,
                 ])
             }
         }

@@ -677,7 +677,7 @@ pub async fn ready(ctx: &Context, plan: &Plan) -> Vec<String> {
 pub async fn settle(ctx: &Context, plan: &Plan, play: Option<PlaySession>) -> Synced {
     match &ctx.connection {
         Some(conn) => sync_any(ctx, conn, plan.rom_id, &plan.game(), false, play.into_iter().collect()).await,
-        None => Synced { notes: Vec::new(), recorded: 0, whole: true, pictureless: false },
+        None => Synced { notes: Vec::new(), recorded: 0, whole: true, report: None },
     }
 }
 
@@ -690,8 +690,8 @@ pub struct Synced {
     /// Whether every save that could move did — nothing failed, and RomM was there to ask. A game
     /// whose saves this build does not sync has nothing to fail.
     pub whole: bool,
-    /// A RetroArch state went up with no picture: RetroArch's state pictures are off.
-    pub pictureless: bool,
+    /// What the sync did, when it ran.
+    pub report: Option<Box<Report>>,
 }
 
 /// The game's saves, whichever emulator keeps them: RetroArch's battery saves and states, or a
@@ -700,10 +700,10 @@ async fn sync_any(ctx: &Context, conn: &Connection, rom_id: i64, game: &crate::p
     if let Some(core) = game.emulator.syncs() {
         return sync_save(ctx, conn, rom_id, game, core, plays).await;
     }
-    let Emulator::Other(name) = &game.emulator else { return Synced { notes: Vec::new(), recorded: 0, whole: true, pictureless: false } };
+    let Emulator::Other(name) = &game.emulator else { return Synced { notes: Vec::new(), recorded: 0, whole: true, report: None } };
     let Some(emulator) = sync::standalone::Emulator::for_launch(&game.system, name) else {
         let notes = if before { vec![format!("it runs on {name}, whose saves this build doesn't sync")] } else { Vec::new() };
-        return Synced { notes, recorded: 0, whole: true, pictureless: false };
+        return Synced { notes, recorded: 0, whole: true, report: None };
     };
     let result = sync::standalone::sync(&ctx.client, conn, &ctx.store, emulator, &game.rom, &game.title, rom_id, game.stamp.as_ref(), plays).await;
     reported(result, &format!("{name} saves not synced"))
@@ -712,7 +712,7 @@ async fn sync_any(ctx: &Context, conn: &Connection, rom_id: i64, game: &crate::p
 async fn sync_save(ctx: &Context, conn: &Connection, rom_id: i64, game: &crate::playing::Game, core: Option<&str>, plays: Vec<PlaySession>) -> Synced {
     let install = match sync::retroarch::locate(ctx.retroarch_config.as_deref()) {
         Ok(install) => install,
-        Err(why) => return Synced { notes: vec![format!("saves not synced: {why}")], recorded: 0, whole: false, pictureless: false },
+        Err(why) => return Synced { notes: vec![format!("saves not synced: {why}")], recorded: 0, whole: false, report: None },
     };
     let result = sync::sync_rom(&ctx.client, conn, &install, &ctx.store, &game.rom, &game.system, core, rom_id, game.stamp.as_ref(), plays).await;
     reported(result, "saves not synced")
@@ -725,9 +725,9 @@ fn reported(result: Result<Report, String>, failed: &str) -> Synced {
             notes: save_notes(&report),
             recorded: report.plays_recorded,
             whole: report.failed.is_empty(),
-            pictureless: report.pictureless > 0,
+            report: Some(Box::new(report)),
         },
-        Err(why) => Synced { notes: vec![format!("{failed}: {why}")], recorded: 0, whole: false, pictureless: false },
+        Err(why) => Synced { notes: vec![format!("{failed}: {why}")], recorded: 0, whole: false, report: None },
     }
 }
 
@@ -753,7 +753,7 @@ pub async fn finish_left(ctx: &Context) -> usize {
         let play = left.session();
         let synced = match left.game() {
             Some(game) => sync_any(ctx, conn, rom_id, game, false, play.clone().into_iter().collect()).await,
-            None => Synced { notes: Vec::new(), recorded: 0, whole: true, pictureless: false },
+            None => Synced { notes: Vec::new(), recorded: 0, whole: true, report: None },
         };
         let taken = synced.recorded > 0 || match &play {
             Some(play) => ctx.client.post_play_session(conn, play).await.is_ok(),
@@ -858,8 +858,8 @@ pub struct Session {
     pub played_at: Option<String>,
     /// What the steps around it did that is worth saying — a BIOS fetched, a save moved.
     pub notes: Vec<String>,
-    /// A RetroArch state of it went up with no picture: RetroArch's state pictures are off.
-    pub pictureless: bool,
+    /// What the sync after it did, when one ran: where the window's saves icon stands from then on.
+    pub report: Option<Box<Report>>,
 }
 
 /// Where a launch has got to, for whoever started it to show — see [`play`].
@@ -970,7 +970,7 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: 
                 held.touch();
             }
             let exit = Exit { success: false, code: None, last_line: None };
-            return Ok(Session { exit, played_at: None, notes: vec![NOT_CLOSED.into()], pictureless: false });
+            return Ok(Session { exit, played_at: None, notes: vec![NOT_CLOSED.into()], report: None });
         }
     };
     // When it closed, for a sync this process does not live to finish.
@@ -997,7 +997,7 @@ pub async fn play(ctx: Context, settings: Settings, installed: Installed, stop: 
         Some(held) if !owed => held.sent(),
         _ => {}
     }
-    Ok(Session { exit, played_at, notes: said(notes), pictureless: synced.pictureless })
+    Ok(Session { exit, played_at, notes: said(notes), report: synced.report })
 }
 
 /// What a launch says of a game asked to stop that did not close within [`GRACE`].
