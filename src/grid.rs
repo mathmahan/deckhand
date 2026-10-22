@@ -32,9 +32,12 @@ pub const LIST_LEFT: f32 = crate::ui::tab_bar::MARGIN;
 /// Between the system list and the grid's own padding.
 pub const LIST_GAP: f32 = 16.0;
 
-/// Right of the alphabet rail: what is left of the header's margin once the grid's padding and the
-/// rail have had theirs, so the page's right edge lines up under the header's icons.
-pub const RAIL_RIGHT: f32 = crate::ui::tab_bar::MARGIN - GRID_PADDING - ALPHA_RAIL_W;
+/// Either side of the alphabet rail's strip of glass, inside [`ALPHA_RAIL_W`].
+pub const RAIL_INSET: f32 = 4.0;
+
+/// Right of the alphabet rail: the header's margin less the rail's own inset, so the rail's glass
+/// lines up under the header's icons.
+pub const RAIL_RIGHT: f32 = crate::ui::tab_bar::MARGIN - RAIL_INSET;
 
 /// Everything beside the tiles: the margin and the system list, the page padding on both sides of
 /// the grid, and the alphabet rail with the margin after it.

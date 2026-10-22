@@ -438,8 +438,9 @@ fn chips_row<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
     row![strip(filters), Space::new().width(Length::Fill), strip(sorts)]
         .align_y(Alignment::Center)
         .height(Length::Fixed(CHIPS_H))
-        // Lined up with the grid's tiles, both ends: the rail stands to the right of them.
-        .padding(Padding { top: 4.0, right: grid::GRID_PADDING + grid::ALPHA_RAIL_W, bottom: 0.0, left: grid::GRID_PADDING })
+        // Lined up with the tiles on the left, and on the right with the rail's glass and the
+        // header's icons above.
+        .padding(Padding { top: 4.0, right: grid::RAIL_INSET, bottom: 0.0, left: grid::GRID_PADDING })
         .into()
 }
 
@@ -716,7 +717,7 @@ fn letter_rail<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
     }
 
     // On a strip of glass as tall as its letters, rather than the whole height beside the grid.
-    let strip = container(rail).width(Length::Fixed(26.0)).padding([6, 0]).style(|_| container::Style {
+    let strip = container(rail).width(Length::Fixed(grid::ALPHA_RAIL_W - 2.0 * grid::RAIL_INSET)).padding([6, 0]).style(|_| container::Style {
         background: Some(Background::Color(glass(0.05))),
         border: Border { color: glass(0.10), width: 1.0, radius: 13.0.into() },
         ..Default::default()
@@ -724,7 +725,7 @@ fn letter_rail<'a>(ctx: &BrowseContext<'a>) -> Element<'a, Message> {
     container(scrollable(strip).on_scroll(|_| Message::Scrolled).height(Length::Fill))
         .width(Length::Fixed(grid::ALPHA_RAIL_W))
         .height(Length::Fill)
-        .padding([0, 4])
+        .padding([0.0, grid::RAIL_INSET])
         .into()
 }
 
