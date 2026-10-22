@@ -87,6 +87,11 @@ named there, not edited.
 Neither Eden or Ryubing ships with RetroDECK, so you need to configure the one you have installed in
 *Emulator for each system* in *Settings*.
 
+Upload the Switch's `prod.keys`, `title.keys` and a firmware zip to RomM's Switch platform, and
+Deckhand puts them where that emulator reads them when a Switch game is downloaded or started. It
+lays them out the way the emulator's own installer does. Keys or firmware you installed yourself
+stay as they are, and nothing changes while the emulator runs.
+
 ![Browse](screenshots/browse.jpg)
 
 ## Getting started

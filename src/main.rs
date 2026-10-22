@@ -38,6 +38,7 @@ mod romm;
 mod fake_romm;
 #[cfg(test)]
 mod stub_server;
+mod switch_firmware;
 mod sync;
 mod systems;
 mod theme;

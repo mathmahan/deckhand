@@ -1439,6 +1439,11 @@ fn eden_config(data: &Path) -> PathBuf {
     if data.starts_with(&flatpak) { flatpak.join("config/eden/qt-config.ini") } else { home.join(".config/eden/qt-config.ini") }
 }
 
+/// The folder holding the `nand/` of the Eden whose data folder is `data`, as its settings put it.
+pub(crate) fn eden_nand_root(data: &Path) -> Result<PathBuf, String> {
+    eden_root(data, Some(&eden_config(data)))
+}
+
 /// The folder holding Eden's `nand/`: the one its settings name, else its data folder's. A settings
 /// file that isn't there names none.
 fn eden_root(data: &Path, config: Option<&Path>) -> Result<PathBuf, String> {

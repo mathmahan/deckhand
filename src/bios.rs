@@ -56,7 +56,7 @@ mod tests {
     use super::*;
 
     fn firmware(name: &str, size: i64) -> Firmware {
-        Firmware { id: 1, file_name: name.into(), file_size_bytes: size }
+        Firmware { id: 1, file_name: name.into(), file_size_bytes: size, md5_hash: None }
     }
 
     #[test]
