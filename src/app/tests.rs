@@ -2986,3 +2986,94 @@ mod page_place {
         assert_eq!(window.offset(&app, settings), 600.0);
     }
 }
+
+// ---- RetroDECK, offered and installed ----------------------------------------------------------
+
+fn retrodeck_look(presence: crate::retrodeck::Presence, scope: Option<crate::retrodeck::Scope>) -> crate::retrodeck::Look {
+    crate::retrodeck::Look { presence, scope, free: Some(40_000_000_000) }
+}
+
+#[test]
+fn retrodeck_is_only_offered_once_paired() {
+    use crate::retrodeck::{Presence, Scope};
+    // Signed out: nothing is offered, wherever it is asked.
+    let (mut app, _) = App::new(Some(12));
+    assert!(app.settings.connection.is_none());
+    let _ = app.update(Message::RetroDeckLooked(Offering::Pairing, retrodeck_look(Presence::Missing, Some(Scope::System))));
+    let _ = app.update(Message::RetroDeckLooked(Offering::NoEmulator, retrodeck_look(Presence::Missing, Some(Scope::System))));
+    assert!(app.pick.is_none(), "no RomM, nothing for RetroDECK to play");
+    let _ = app.pick_launcher();
+    assert_eq!(app.pick.as_ref().unwrap().picker.rows.len(), 2, "and Default emulator has no install");
+
+    // Paired: an install to say yes to, and what it costs.
+    let mut app = paired_fixtures(12);
+    let _ = app.update(Message::RetroDeckLooked(Offering::Pairing, retrodeck_look(Presence::Missing, Some(Scope::System))));
+    let pick = app.pick.as_ref().expect("the offer");
+    assert_eq!(pick.picker.title, "Install RetroDECK?");
+    let download = format!("{} to download", downloads::human_bytes(crate::retrodeck::DOWNLOAD_BYTES));
+    assert!(pick.picker.note.contains(&download), "{}", pick.picker.note);
+    assert_eq!(pick.picker.rows[0].label, "Install RetroDECK");
+    assert!(matches!(pick.then, Then::RetroDeck(Some(Scope::System))));
+
+    // Installed but never set up: its setup is what is offered.
+    app.pick = None;
+    let _ = app.update(Message::RetroDeckLooked(Offering::Asked, retrodeck_look(Presence::NotSetUp, None)));
+    assert_eq!(app.pick.as_ref().unwrap().picker.title, "Set up RetroDECK?");
+    assert!(matches!(app.pick.as_ref().unwrap().then, Then::RetroDeck(None)));
+
+    // Nowhere to install it from: quiet after a pairing, said when asked.
+    app.pick = None;
+    app.banner = None;
+    let _ = app.update(Message::RetroDeckLooked(Offering::Pairing, retrodeck_look(Presence::Missing, None)));
+    assert!(app.pick.is_none() && app.banner.is_none(), "{:?}", app.banner);
+    let _ = app.update(Message::RetroDeckLooked(Offering::Asked, retrodeck_look(Presence::Missing, None)));
+    assert!(app.banner.as_deref().is_some_and(|b| b.contains("Flatpak")), "{:?}", app.banner);
+
+    // And Default emulator offers it.
+    let _ = app.pick_launcher();
+    let rows = &app.pick.as_ref().unwrap().picker.rows;
+    assert_eq!(rows.last().map(|r| r.label.as_str()), Some("Install RetroDECK…"));
+}
+
+#[test]
+fn pairing_offers_retrodeck_once_the_library_is_in() {
+    let (mut app, _) = App::new(Some(12));
+    let connection = Connection { host: "http://127.0.0.1:1".into(), token: "rmm_test".into(), insecure: false, token_id: None, token_name: None, device_id: None };
+    let _ = app.update(Message::Paired(Ok(Box::new(connection))));
+    assert!(app.offer_retrodeck, "to be offered once the library is in");
+}
+
+#[test]
+fn retrodeck_s_install_shows_in_settings_and_its_setup_has_the_pad() {
+    use crate::gamepad::Pad;
+    use crate::retrodeck::{Event, Presence, Progress, Stop};
+    let mut app = paired_fixtures(12);
+    app.screen = Screen::Browsing(Route::Settings);
+    app.retrodeck_setup = RetroDeckSetup::Installing(None);
+    let _ = app.update(Message::RetroDeckEvent(Event::Progress(Progress { step: 2, of: 2, percent: 45 })));
+    assert_eq!(app.retrodeck_progress().as_deref(), Some("RetroDECK · installing 2 of 2 · 45%"));
+    let _ = app.view();
+
+    // Its row stops it — asked first, since a press there is easily one too many.
+    let _ = app.update(Message::SettingsClicked(settings_row(SettingRow::Launcher)));
+    assert_eq!(app.pick.as_ref().unwrap().picker.title, "Stop installing RetroDECK?");
+    app.pick = None;
+
+    // Open for its setup: the pad is RetroDECK's.
+    let _ = app.update(Message::RetroDeckEvent(Event::SettingUp));
+    let _ = app.update(Message::Pad(Pad::Select));
+    assert!(matches!(app.screen, Screen::Browsing(Route::Settings)), "Select would have opened Downloads");
+
+    // Set up: games start through it, and ES-DE's hooks are offered next.
+    let _ = app.update(Message::RetroDeckEvent(Event::Done(Ok(Presence::Ready))));
+    assert!(app.retrodeck);
+    assert_eq!(app.retrodeck_setup, RetroDeckSetup::Idle);
+    assert!(matches!(app.pick.as_ref().map(|p| &p.then), Some(Then::EsDeHooks)));
+    app.pick = None;
+
+    // Stopped part way: said, and back to where it was.
+    app.retrodeck_setup = RetroDeckSetup::Installing(None);
+    let _ = app.update(Message::RetroDeckEvent(Event::Done(Err(Stop::Cancelled))));
+    assert_eq!(app.retrodeck_setup, RetroDeckSetup::Idle);
+    assert!(app.banner.as_deref().is_some_and(|b| b.contains("stopped")), "{:?}", app.banner);
+}
