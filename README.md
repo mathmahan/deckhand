@@ -63,6 +63,12 @@ own pages, and a state deleted on either side is not brought back by the other. 
 is in no slot here, such as one saved in RomM's web player, can be put into one from the game's Saves
 page.
 
+A state's picture goes with it both ways, but RetroArch only takes one when its *Save State
+Thumbnails* setting is on, and RetroDECK ships it off. Deckhand offers to turn it on the first time a
+state goes up without a picture, and Settings ▸ Saves ▸ *State pictures* does it any time, while
+RetroArch is closed. An override of RetroArch's that turns them off again for a core or a game is
+named there, not edited.
+
 | Platform | Emulator | What syncs |
 |---|---|---|
 | Everything RetroArch runs | RetroArch, any core | ✅ Saves and save states, memory cards and backup RAM included |

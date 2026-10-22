@@ -632,6 +632,8 @@ impl Run<'_> {
     async fn push_state(&mut self, pair: &Pair<'_>, rom_id: i64, emulator: &str, bytes: Vec<u8>, hash: String, name: &str) -> bool {
         // RetroArch writes the thumbnail beside whichever file it saved: `.state.png`, `.state.auto.png`.
         let shot = pair.live.as_ref().and_then(|live| picture(live));
+        // RetroArch's own state with none beside it: its state pictures are off.
+        let pictureless = shot.is_none() && pair.live.as_ref().is_some_and(|live| file_name(live).contains(".state"));
         let created = match self.client.upload_state(self.connection, rom_id, emulator, &pair.upload_as, bytes, shot).await {
             Ok(created) => created,
             Err(e) => {
@@ -639,6 +641,9 @@ impl Run<'_> {
                 return false;
             }
         };
+        if pictureless {
+            self.report.pictureless += 1;
+        }
         if self.remember_state(&pair.key, rom_id, hash, created.id, created.updated_at.clone(), name) {
             self.report.pushed.push(name.to_string());
             return true;
@@ -808,6 +813,7 @@ mod tests {
         fs::write(a.state(&format!("{CHRONO}.state3.png")), b"\x89PNG three").unwrap();
         let report = a.sync(romm.host.clone()).await;
         assert_eq!(report.pushed.len(), 4, "{report:?}");
+        assert_eq!(report.pictureless, 3, "the three with no picture beside them: RetroArch's are off");
         let mut names: Vec<String> = romm.states(1).into_iter().map(|s| s.file_name).collect();
         names.sort();
         assert_eq!(names, [own("auto"), own("slot0"), own("slot12"), own("slot3")], "past slot 4 too");

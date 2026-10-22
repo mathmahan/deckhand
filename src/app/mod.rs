@@ -34,6 +34,7 @@ use crate::systems;
 use crate::theme;
 use crate::ui::home::{home_view, HomeContext};
 use crate::ui::login::{login_view, LoginState};
+use crate::sync::retroarch::StatePictures;
 use crate::ui::settings::{Check, Installs, Row as SettingRow, SaveSync};
 use crate::ui::tab_bar::{tab_bar, Tab};
 
@@ -187,9 +188,14 @@ pub enum Message {
     ConnectionTested(Result<String, String>),
     /// The art caches' size on disk, measured off the UI thread.
     ImageCacheMeasured(u64),
-    /// The config save sync reads (None when there is none to read), and where it says RetroArch
-    /// keeps saves, or why that could not be found.
-    SaveFolderFound(Option<std::path::PathBuf>, Result<std::path::PathBuf, String>),
+    /// The config save sync reads (None when there is none to read), where it says RetroArch keeps
+    /// saves, and whether it keeps a picture with each state — or why that could not be found.
+    SaveFolderFound(Option<std::path::PathBuf>, Result<std::path::PathBuf, String>, Result<StatePictures, String>),
+    /// Whether RetroArch keeps a picture with each state, read because a sync sent one up without:
+    /// what turning them on is offered on.
+    StatePicturesFound(Result<StatePictures, String>),
+    /// Turning RetroArch's state pictures on: whether it went, and where they stand now.
+    StatePicturesChanged(Result<(), String>, Result<StatePictures, String>),
     /// Where ES-DE's hooks stand, read off the UI thread.
     HooksRead(crate::hooks::Status),
     /// A side of the waiting conflict was clicked.
@@ -607,6 +613,11 @@ pub struct App {
     /// The RetroArch config save sync reads, for the Settings page: Some(None) when there is none on
     /// this device. None while it is being looked for.
     retroarch_found: Option<Option<std::path::PathBuf>>,
+    /// Whether RetroArch keeps a picture with each state, for the Settings page. None while it is
+    /// being looked for.
+    state_pictures: Option<Result<StatePictures, String>>,
+    /// Turning state pictures on has been offered this session: once is enough.
+    state_pictures_offered: bool,
     save_sync: SaveSync,
     /// Where Deckhand's own update stands — see [`crate::release`].
     release: crate::release::Status,
@@ -724,6 +735,8 @@ impl App {
             image_cache_bytes: None,
             save_folder: None,
             retroarch_found: None,
+            state_pictures: None,
+            state_pictures_offered: false,
             save_sync: SaveSync::Idle,
             release: crate::release::Status::Unasked,
             release_repository: crate::release::REPOSITORY,
@@ -1403,6 +1416,8 @@ enum Then {
     StopRetroDeck,
     /// Install ES-DE's hooks: the first row says yes.
     EsDeHooks,
+    /// Turn RetroArch's state pictures on: the first row says yes, the second no for good.
+    StatePictures,
 }
 
 /// Where RetroDECK's install has got — see [`crate::retrodeck`].
