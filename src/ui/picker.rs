@@ -21,6 +21,12 @@ pub fn scroll_offset(index: usize) -> f32 {
     (index.saturating_sub(2) as f32 * (ROW_H + ROW_GAP)).max(0.0)
 }
 
+/// Scroll the list to keep row `index` in view — see [`scroll_offset`]. A picker just opened asks
+/// for its cursor's row, since the list keeps whatever offset the last picker left it at.
+pub fn scroll_to<T>(index: usize) -> iced::Task<T> {
+    iced::widget::operation::scroll_to(list_id(), scrollable::AbsoluteOffset { x: 0.0, y: scroll_offset(index) })
+}
+
 /// One answer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -31,6 +37,13 @@ pub struct Row {
     pub aside: String,
     /// Marked beside its label — "on this device", "in use".
     pub mark: Option<String>,
+}
+
+impl Row {
+    /// An answer with nothing at its right and no mark.
+    pub fn new(label: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { label: label.into(), detail: detail.into(), aside: String::new(), mark: None }
+    }
 }
 
 /// The question, its answers, and the one the cursor is on.

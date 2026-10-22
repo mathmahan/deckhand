@@ -79,4 +79,35 @@ impl App {
             _ => None,
         }
     }
+
+    /// Sign out of RomM: this device forgets the pairing, and goes back to pairing.
+    pub(super) fn sign_out(&mut self) -> Task<Message> {
+        // Local only: the token is dropped here, not revoked on the server. Revoking is a
+        // remote, irreversible act that needs its own confirmation, and this build has no
+        // screen to host that conversation.
+        self.settings.connection = None;
+        // The downloads stop being this session's: every queue item and every record is
+        // keyed to the server it belongs to, so they are hidden rather than thrown away —
+        // the files are real, and signing back in has to find them again.
+        self.downloads.set_host("");
+        let _ = self.save_settings();
+        // The cached library belongs to the pairing being dropped. Leaving it would hand
+        // the next sign-in someone else's shelves for the frame before the sync lands.
+        cache::clear();
+        self.system_counts.clear();
+        self.library_read_at = None;
+        self.installs = Installs::Unknown;
+        self.install_requests.clear();
+        self.library = Arc::new(Library::default());
+        self.collections.clear();
+        self.collection_sources = None;
+        self.rebuild_collections();
+        self.shelves.clear();
+        self.covers = Covers::default();
+        self.backdrop = Default::default();
+        self.awarded = None;
+        self.say("Signed out locally. The token is still valid in RomM — revoke it there. Downloaded games are left on disk.".into());
+        self.screen = Screen::Login(LoginState::new("https://".into()));
+        Task::none()
+    }
 }

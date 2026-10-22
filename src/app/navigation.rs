@@ -395,4 +395,208 @@ impl App {
         self.browse_focus.set_zone(zone);
         Task::none()
     }
+
+    /// A destination chosen in the bar, from the pad's shoulders or a press: opened, or — when it is the
+    /// page already on screen — scrolled back to its top.
+    pub(super) fn select_tab(&mut self, tab: Tab) -> Task<Message> {
+        self.chrome = None;
+        let current = match &self.screen {
+            Screen::Browsing(route) => route.tab(),
+            _ => return Task::none(),
+        };
+        // Pressing the tab you are already on takes you back to the top of it — the same
+        // thing a tab bar does everywhere else, and the fastest way back from deep in a
+        // page.
+        //
+        // Except from a detail or search page, each a pushed destination showing under the tab
+        // it was opened from: there the press has to *leave* it for that tab's own page,
+        // which is what the bar looks like it is offering. Scrolling a page you are not
+        // on is the one thing it cannot mean.
+        // A collection's grid sits under the Collections tab the same way: pressing it goes
+        // back to the page of collections.
+        let on_detail = matches!(
+            self.screen,
+            Screen::Browsing(
+                Route::Detail { .. } | Route::Search { .. } | Route::Saves { .. } | Route::Browse { scope: Scope::Collection(_) }
+            )
+        );
+        if tab == current && !on_detail {
+            match tab {
+                Tab::Home => self.focus.reset_to_top(&self.shelves),
+                Tab::Downloads => self.downloads_focus = Default::default(),
+                Tab::Settings => self.settings_focus = Default::default(),
+                _ => {}
+            }
+            return Task::batch([self.scroll_page_to_top(), self.scroll_cursor_into_view()]);
+        }
+        match tab {
+            Tab::Home => {
+                self.screen = Screen::Browsing(Route::Home);
+                Task::batch([self.scroll_page_to_top(), self.scroll_cursor_into_view()])
+            }
+            // Back to the search a game was opened from, query and all; on the search
+            // itself, back up to its keyboard; anywhere else, a new search.
+            Tab::Search => {
+                fn search_behind(route: &Route) -> Option<Route> {
+                    match route {
+                        Route::Search { .. } => Some(route.clone()),
+                        Route::Detail { from, .. } | Route::Saves { from, .. } => search_behind(from),
+                        _ => None,
+                    }
+                }
+                let behind = match &self.screen {
+                    Screen::Browsing(route) => search_behind(route),
+                    _ => None,
+                };
+                match behind {
+                    Some(search) => {
+                        if matches!(self.screen, Screen::Browsing(Route::Search { .. })) {
+                            self.search_focus.in_results = false;
+                        }
+                        self.screen = Screen::Browsing(search);
+                        Task::none()
+                    }
+                    None => self.update(Message::OpenSearch),
+                }
+            }
+            Tab::Collections => {
+                // The page keeps its kind and card between visits: coming back from a
+                // collection's grid should land where you left, not on the first chip.
+                self.screen = Screen::Browsing(Route::Collections);
+                // Scrolled to the card it was left on, which is also what the cover window
+                // is cut from — so the art asked for is the art on screen.
+                let scroll = self.scroll_cursor_into_view();
+                Task::batch([scroll, self.load_collections(), self.refresh_own_collections(), self.fetch_art()])
+            }
+            Tab::Browse => {
+                // Browse needs a system. Carry the one you were in, else the first that has
+                // any games — an empty grid would be a dead end.
+                let system = match &self.screen {
+                    Screen::Browsing(route) => self.current_system(route),
+                    _ => None,
+                }
+                .or_else(|| {
+                    self.library
+                        .systems
+                        .iter()
+                        .find(|s| !self.library.games_for(&s.id).is_empty())
+                        .map(|s| s.id.clone())
+                });
+                match system {
+                    Some(system) => self.update(Message::OpenSystem(system)),
+                    None => Task::none(),
+                }
+            }
+            Tab::Settings => {
+                self.settings_focus = Default::default();
+                self.connection_check = Check::default();
+                // A finished sync's counts carry no time either, so they go the same way. A
+                // sync still running keeps saying so: its answer has not arrived yet.
+                if !matches!(self.save_sync, SaveSync::Running) {
+                    self.save_sync = SaveSync::Idle;
+                }
+                self.screen = Screen::Browsing(Route::Settings);
+                self.retrodeck = crate::launch::RetroDeck::detect().is_some();
+                self.steam_found = crate::steam::Steam::find().is_some();
+                Task::batch([
+                    self.scroll_page_to_top(),
+                    self.measure_image_cache(),
+                    self.locate_saves(),
+                    self.read_hooks(),
+                ])
+            }
+            Tab::Downloads => {
+                self.downloads_focus = Default::default();
+                self.screen = Screen::Browsing(Route::Downloads);
+                self.scroll_page_to_top()
+            }
+        }
+    }
+
+    /// A gamepad button, as what it means on the page it was pressed on.
+    pub(super) fn on_pad(&mut self, pad: crate::gamepad::Pad) -> Task<Message> {
+        use crate::gamepad::Pad;
+        // A game has the pad while it runs, and RetroDECK while it is open for its setup.
+        // Without this every button pressed there would also walk the grid behind it.
+        if self.playing.is_some() || self.retrodeck_setup == RetroDeckSetup::SettingUp {
+            return Task::none();
+        }
+        let message = match pad {
+            Pad::Nav(direction) => Message::Nav(direction),
+            Pad::Confirm => Message::Activate,
+            Pad::Back => Message::Dismiss,
+            Pad::Search => Message::OpenSearch,
+            Pad::Erase if matches!(self.screen, Screen::Browsing(Route::Search { .. })) => {
+                Message::SearchKey(crate::search::BACKSPACE)
+            }
+            // On Home, the spotlit game's saves and states: the X the spotlight shows beside
+            // the button.
+            Pad::Erase => return Task::none(),
+            Pad::PrevTab => Message::CycleTab(-1),
+            Pad::NextTab => Message::CycleTab(1),
+            Pad::PrevSystem => Message::CycleSystem(-1),
+            Pad::NextSystem => Message::CycleSystem(1),
+            // Settings and Downloads in one press, wherever the cursor is — the shoulders
+            // reach them too, a few tabs along.
+            Pad::Start => Message::TabSelected(Tab::Settings),
+            Pad::Select => Message::TabSelected(Tab::Downloads),
+        };
+        self.update(message)
+    }
+
+    /// The mouse wheel or a touchpad over Home's shelves, which walks them as Up and Down do.
+    pub(super) fn home_wheel(&mut self, delta: iced::mouse::ScrollDelta) -> Task<Message> {
+        use iced::mouse::ScrollDelta;
+        if !matches!(self.screen, Screen::Browsing(Route::Home)) {
+            return Task::none();
+        }
+        // A notch is a shelf. A touchpad's pixels are saved up until they come to one.
+        let steps = match delta {
+            ScrollDelta::Lines { y, .. } => y.round(),
+            ScrollDelta::Pixels { y, .. } => {
+                self.wheel += y;
+                let steps = (self.wheel / 60.0).trunc();
+                self.wheel -= steps * 60.0;
+                steps
+            }
+        };
+        // Up the wheel is up the page. It walks the shelves only: it does not climb out of
+        // them into the bar.
+        let direction = if steps > 0.0 { Direction::Up } else { Direction::Down };
+        let mut tasks = Vec::new();
+        for _ in 0..(steps.abs() as usize).min(3) {
+            if direction == Direction::Up && self.focus.shelf_pos() == 0 {
+                break;
+            }
+            tasks.push(self.navigate_page(Route::Home, direction));
+        }
+        self.up_stopped = false;
+        Task::batch(tasks)
+    }
+
+    /// The triggers: the next or the previous system, collection or Settings section.
+    pub(super) fn cycle_system(&mut self, delta: isize) -> Task<Message> {
+        let Screen::Browsing(route) = &self.screen else { return Task::none() };
+        // Settings has no system to step; the same keys walk its sections instead, which is
+        // what the Kotlin app's shoulder buttons do there.
+        if *route == Route::Settings {
+            if self.settings_focus.jump_section(delta) {
+                return self.scroll_cursor_into_view();
+            }
+            return Task::none();
+        }
+        // A collection's grid steps through its kind's collections; anything else through
+        // the systems, from the one it is showing.
+        let scope = match route {
+            Route::Browse { scope } => scope.clone(),
+            route => match self.current_system(route) {
+                Some(system) => Scope::System(system),
+                None => return Task::none(),
+            },
+        };
+        let places = self.places(&scope);
+        let Some(here) = places.iter().position(|p| p.scope == scope) else { return Task::none() };
+        let next = (here as isize + delta).rem_euclid(places.len() as isize) as usize;
+        self.open_scope(places[next].scope.clone())
+    }
 }

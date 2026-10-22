@@ -323,7 +323,6 @@ impl App {
             self.state_pictures_offered = false;
             return Task::none();
         }
-        let row = |label: &str, detail: &str| Row { label: label.into(), detail: detail.into(), aside: String::new(), mark: None };
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
                 title: "Keep a picture with each save state?".into(),
@@ -332,14 +331,14 @@ impl App {
                        game's Saves page show. States already saved get theirs the next time they're saved."
                     .into(),
                 rows: vec![
-                    row("Turn them on", "RetroArch has to be closed while its config changes"),
-                    row("Not now", "Settings ▸ Saves ▸ State pictures turns them on later"),
+                    Row::new("Turn them on", "RetroArch has to be closed while its config changes"),
+                    Row::new("Not now", "Settings ▸ Saves ▸ State pictures turns them on later"),
                 ],
                 cursor: 0,
             },
             then: Then::StatePictures,
         });
-        iced::widget::operation::scroll_to(crate::ui::picker::list_id(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 })
+        crate::ui::picker::scroll_to(0)
     }
 
     /// No to state pictures, which is not asked again.

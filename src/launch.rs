@@ -660,8 +660,10 @@ pub async fn ready(ctx: &Context, plan: &Plan) -> Vec<String> {
         };
         if let Ok(firmware) = ctx.client.fetch_firmware(conn, platform_id).await {
             let store = ctx.store.clone();
+            // Unknown reads as running: a firmware waits for later rather than going in under an
+            // emulator that has it open.
             let put = tokio::task::spawn_blocking(move || {
-                crate::switch_firmware::install(&target, &source, &firmware, &store, crate::switch_firmware::running)
+                crate::switch_firmware::install(&target, &source, &firmware, &store, |name| crate::processes::running(name).unwrap_or(true))
             });
             notes.extend(put.await.unwrap_or_default());
         }

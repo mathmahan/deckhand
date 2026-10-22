@@ -119,6 +119,16 @@ impl std::error::Error for ApiError {}
 
 type Result<T> = std::result::Result<T, ApiError>;
 
+/// RomM's `path` on `conn`'s server, as a URL a query or path segments can be added to.
+fn endpoint(conn: &Connection, path: &str) -> Result<reqwest::Url> {
+    reqwest::Url::parse(&format!("{}{path}", conn.host.trim_end_matches('/'))).map_err(|_| bad_address())
+}
+
+/// What a request says when the paired address cannot be made into a URL.
+fn bad_address() -> ApiError {
+    ApiError::new(-1, "The server address is not a valid URL.")
+}
+
 /// Map a status onto the message the user actually sees. Ported verbatim from `friendlyError`.
 fn friendly_error(status: u16) -> String {
     match status {
@@ -481,11 +491,9 @@ impl RommClient {
         dest: &Path,
         mut progress: impl FnMut(u64),
     ) -> Result<u64> {
-        let mut url =
-            reqwest::Url::parse(&format!("{}/api/roms/{rom_id}/content", conn.host.trim_end_matches('/')))
-                .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, &format!("/api/roms/{rom_id}/content"))?;
         url.path_segments_mut()
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?
+            .map_err(|_| bad_address())?
             .push(&file.file_name);
         url.query_pairs_mut().append_pair("file_ids", &file.id.to_string());
         self.fetch_to_file(conn, url, dest, Some(file.size()).filter(|s| *s > 0), &mut progress).await
@@ -601,11 +609,9 @@ impl RommClient {
 
     /// Stream one firmware file to `dest`, the same `.part`-then-rename way a rom file comes down.
     pub async fn download_firmware(&self, conn: &Connection, firmware: &Firmware, dest: &Path) -> Result<u64> {
-        let mut url =
-            reqwest::Url::parse(&format!("{}/api/firmware/{}/content", conn.host.trim_end_matches('/'), firmware.id))
-                .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, &format!("/api/firmware/{}/content", firmware.id))?;
         url.path_segments_mut()
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?
+            .map_err(|_| bad_address())?
             .push(&firmware.file_name);
         self.fetch_to_file(conn, url, dest, None, &mut |_| {}).await
     }
@@ -778,8 +784,7 @@ impl RommClient {
         bytes: Vec<u8>,
         screenshot: Option<(Vec<u8>, &str)>,
     ) -> Result<SaveAsset> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/states", conn.host.trim_end_matches('/')))
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, "/api/states")?;
         url.query_pairs_mut().append_pair("rom_id", &rom_id.to_string()).append_pair("emulator", emulator);
         let part = reqwest::multipart::Part::bytes(bytes)
             .file_name(file_name.to_string())
@@ -809,8 +814,7 @@ impl RommClient {
         file_name: &str,
         bytes: Vec<u8>,
     ) -> Result<Option<SaveAsset>> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/saves", conn.host.trim_end_matches('/')))
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, "/api/saves")?;
         url.query_pairs_mut()
             .append_pair("rom_id", &rom_id.to_string())
             .append_pair("emulator", emulator)
@@ -890,8 +894,7 @@ impl RommClient {
     /// not synced — someone else's progress landed since. That is answered as [`Pushed::Refused`], for
     /// the caller to settle as the conflict it is, never retried over the top.
     pub async fn push_save(&self, conn: &Connection, push: Push<'_>) -> Result<Pushed> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/saves", conn.host.trim_end_matches('/')))
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, "/api/saves")?;
         {
             let mut query = url.query_pairs_mut();
             query
@@ -937,8 +940,7 @@ impl RommClient {
     /// [`RommClient::confirm_downloaded`], once the bytes are in place — a download that dies on the
     /// way to disk must not leave RomM believing it arrived.
     pub async fn pull_save(&self, conn: &Connection, save_id: i64, session_id: Option<i64>) -> Result<Vec<u8>> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/saves/{save_id}/content", conn.host.trim_end_matches('/')))
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, &format!("/api/saves/{save_id}/content"))?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("optimistic", "false");
@@ -955,8 +957,7 @@ impl RommClient {
     /// Every save RomM holds for the roms `rom_ids` (`GET /api/saves?rom_ids=…`), at most 500 — what
     /// a sync settles by name the saves whose slots other saves share.
     pub async fn fetch_saves_of(&self, conn: &Connection, rom_ids: &[i64]) -> Result<Vec<SaveAsset>> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/saves", conn.host.trim_end_matches('/')))
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, "/api/saves")?;
         for id in rom_ids {
             url.query_pairs_mut().append_pair("rom_ids", &id.to_string());
         }
@@ -969,8 +970,7 @@ impl RommClient {
     /// Every version RomM holds in one slot of one game (`GET /api/saves?rom_id=&slot=`) — what a
     /// refused push is settled against.
     pub async fn slot_saves(&self, conn: &Connection, rom_id: i64, slot: &str) -> Result<Vec<SaveAsset>> {
-        let mut url = reqwest::Url::parse(&format!("{}/api/saves", conn.host.trim_end_matches('/')))
-            .map_err(|_| ApiError::new(-1, "The server address is not a valid URL."))?;
+        let mut url = endpoint(conn, "/api/saves")?;
         url.query_pairs_mut().append_pair("rom_id", &rom_id.to_string()).append_pair("slot", slot);
         let request = self.api(conn, reqwest::Method::GET, url);
         let value: Value = self.execute_json(request).await?;

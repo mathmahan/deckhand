@@ -19,12 +19,7 @@ impl App {
             })
             .collect();
         let mut rows: Vec<crate::ui::picker::Row> = rows;
-        rows.push(crate::ui::picker::Row {
-            label: "Another folder…".into(),
-            detail: "Walk this device's folders to any one".into(),
-            aside: String::new(),
-            mark: None,
-        });
+        rows.push(crate::ui::picker::Row::new("Another folder…", "Walk this device's folders to any one"));
         let cursor = places.iter().position(|p| p.current).unwrap_or(0);
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
@@ -51,8 +46,7 @@ impl App {
                     _ => return Some(Task::none()),
                 };
                 if pending.picker.step(delta) {
-                    let at = crate::ui::picker::scroll_offset(pending.picker.cursor);
-                    return Some(iced::widget::operation::scroll_to(crate::ui::picker::list_id(), iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: at }));
+                    return Some(crate::ui::picker::scroll_to(pending.picker.cursor));
                 }
                 return Some(Task::none());
             }
@@ -233,10 +227,7 @@ impl App {
             then: Then::Browse { purpose, dir, steps },
         });
         // The list is the same widget from folder to folder, so it would keep the last one's scroll.
-        iced::widget::operation::scroll_to(
-            crate::ui::picker::list_id(),
-            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: crate::ui::picker::scroll_offset(cursor) },
-        )
+        crate::ui::picker::scroll_to(cursor)
     }
 
     /// The RetroArch config save sync reads: found automatically, one of those found here, or one
@@ -266,7 +257,7 @@ impl App {
             rows.push(Row { label: label.into(), detail: path.display().to_string(), aside: String::new(), mark: in_use(chosen.as_ref() == Some(&path)) });
             choices.push(RetroArchChoice::Use(path));
         }
-        rows.push(Row { label: "Another file…".into(), detail: "Walk this device's folders to a retroarch.cfg".into(), aside: String::new(), mark: None });
+        rows.push(Row::new("Another file…", "Walk this device's folders to a retroarch.cfg"));
         choices.push(RetroArchChoice::Browse);
         let cursor = rows.iter().position(|r| r.mark.is_some()).unwrap_or(0);
         self.pick = Some(PendingPick {
@@ -320,12 +311,7 @@ impl App {
         ];
         // Only once paired: without a RomM there is nothing for RetroDECK to play.
         if !self.retrodeck && self.retrodeck_setup == RetroDeckSetup::Idle && self.settings.connection.is_some() {
-            rows.push(Row {
-                label: "Install RetroDECK…".into(),
-                detail: "From Flathub, or set up the one that is here".into(),
-                aside: String::new(),
-                mark: None,
-            });
+            rows.push(Row::new("Install RetroDECK…", "From Flathub, or set up the one that is here"));
         }
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
@@ -418,21 +404,11 @@ impl App {
         let home = dirs::home_dir().unwrap_or_default();
         let applications = home.join("Applications");
         let name = self.system_label(&system);
-        let mut rows = vec![Row {
-            label: "Choose the emulator…".into(),
-            detail: "Find a program or an AppImage on this device".into(),
-            aside: String::new(),
-            mark: None,
-        }];
+        let mut rows = vec![Row::new("Choose the emulator…", "Find a program or an AppImage on this device")];
         let mut choices = vec![EmulatorChoice::Pick(if applications.is_dir() { applications } else { home.clone() })];
         // Where Flatpak puts a launcher for each app it installs — the emulators Discover installs.
         if let Some(exports) = [home.join(".local/share/flatpak/exports/bin"), "/var/lib/flatpak/exports/bin".into()].into_iter().find(|d| d.is_dir()) {
-            rows.push(Row {
-                label: "Choose a Flatpak emulator…".into(),
-                detail: "One installed from Flathub, for instance through Discover".into(),
-                aside: String::new(),
-                mark: None,
-            });
+            rows.push(Row::new("Choose a Flatpak emulator…", "One installed from Flathub, for instance through Discover"));
             choices.push(EmulatorChoice::Pick(exports));
         }
         rows.push(Row {

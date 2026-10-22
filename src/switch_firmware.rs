@@ -44,7 +44,7 @@ impl Kind {
         }
     }
 
-    /// Its process, as `pgrep -x` names it.
+    /// Its process, as [`crate::processes::running`] names it.
     fn process(self) -> &'static str {
         match self {
             Kind::Eden => "eden",
@@ -290,12 +290,6 @@ fn unpack(zip: &Path, registered: &Path, kind: Kind) -> Result<(), String> {
         fs::remove_dir_all(registered).map_err(|e| format!("the old firmware could not be cleared ({e})"))?;
     }
     fs::rename(&staging, registered).map_err(|e| e.to_string())
-}
-
-/// Whether a process named `name` is up. Unknown reads as yes: the caller then writes nothing,
-/// which leaves a firmware for later rather than pulling one out from under a running emulator.
-pub fn running(name: &str) -> bool {
-    std::process::Command::new("pgrep").args(["-x", name]).output().map_or(true, |o| o.status.success())
 }
 
 #[cfg(test)]

@@ -97,11 +97,7 @@ pub fn tab_bar<'a>(current: Tab, focused: bool, status: Status) -> Element<'a, M
         .into_iter()
         .fold(row![].spacing(4).align_y(Alignment::Center), |pill, tab| pill.push(place(tab, current, focused)));
 
-    let pill = container(places).padding(5).style(|_| container::Style {
-        background: Some(Background::Color(glass(0.07))),
-        border: Border { color: glass(0.12), width: 1.0, radius: 999.0.into() },
-        ..Default::default()
-    });
+    let pill = container(places).padding(5).style(glass_pill);
 
     let right = row![downloads_icon(current, focused, status.downloads), saves_icon(status.saves), gear(current, focused)]
         .spacing(10)
@@ -208,13 +204,7 @@ fn saves_icon<'a>(saves: Saves) -> Element<'a, Message> {
         Saves::Attention => (lucide::cloud_alert(), theme::WARNING, "Saves need a look"),
         Saves::Failed => (lucide::cloud_off(), theme::ERROR, "Save sync failed"),
     };
-    let icon = container(sign.size(18.0).color(color))
-        .center(Length::Fixed(ICON))
-        .style(|_| container::Style {
-            background: Some(Background::Color(glass(0.07))),
-            border: Border { color: glass(0.12), width: 1.0, radius: 999.0.into() },
-            ..Default::default()
-        });
+    let icon = container(sign.size(18.0).color(color)).center(Length::Fixed(ICON)).style(glass_pill);
     tip(icon, words.into())
 }
 
@@ -254,6 +244,16 @@ pub fn glyph<'a>(letter: &'a str, solid: bool) -> Element<'a, Message> {
         .into()
 }
 
+/// The glass the bar's pill and icons stand in: faint, with a faint edge.
+fn glass_pill(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(glass(0.07))),
+        border: Border { color: glass(0.12), width: 1.0, radius: 999.0.into() },
+        ..Default::default()
+    }
+}
+
+/// A plain fill of `color` with its corners rounded by `radius`: a meter's track and its bar.
 fn rounded(color: Color, radius: f32) -> container::Style {
     container::Style {
         background: Some(Background::Color(color)),

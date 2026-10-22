@@ -13,6 +13,23 @@
 //! comes: the same Steam *Exit game* that asks Deckhand to stop may end the outer `bwrap` first,
 //! and then nothing under it can be found from the process Deckhand started.
 
+/// Whether a process named `name` is running, by its name as `/proc/<pid>/comm` has it — a program's
+/// name cut to its first 15 bytes. None where that cannot be told: no `/proc` to read. What an unknown
+/// answer means is the caller's: one about to write another program's settings takes it as running,
+/// and leaves them alone.
+pub fn running(name: &str) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let entries = std::fs::read_dir("/proc").ok()?;
+        Some(entries.flatten().any(|e| std::fs::read_to_string(e.path().join("comm")).is_ok_and(|comm| comm.trim_end() == name)))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = name;
+        None
+    }
+}
+
 /// The processes under one Deckhand started, as last seen — each by its id and when it started, so
 /// a process id the system has since given to something else is never signalled.
 #[derive(Debug, Default)]
@@ -132,6 +149,13 @@ mod tests {
             assert!(Instant::now() < deadline, "{what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_process_is_found_by_its_name_and_a_name_nothing_runs_under_is_not() {
+        let own = std::fs::read_to_string("/proc/self/comm").unwrap();
+        assert_eq!(running(own.trim_end()), Some(true), "this test, under its own name");
+        assert_eq!(running("no-such-program"), Some(false));
     }
 
     /// A launcher script around an "emulator" that writes its save when asked to close — the shape

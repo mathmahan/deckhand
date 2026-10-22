@@ -338,16 +338,7 @@ fn last_user(userdata: &Path) -> Option<PathBuf> {
 
 /// Whether Steam is running here.
 pub fn running() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_dir("/proc").into_iter().flatten().flatten().any(|e| {
-            std::fs::read_to_string(e.path().join("comm")).is_ok_and(|comm| comm.trim() == "steam")
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
+    crate::processes::running("steam").unwrap_or(false)
 }
 
 /// Running inside Steam's Game Mode — gamescope's session — where closing Steam ends the session

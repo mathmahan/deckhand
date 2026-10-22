@@ -23,7 +23,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::config::Settings;
 
@@ -253,7 +252,7 @@ fn enable_scripts(settings: &Path, running: impl Fn() -> bool) -> Result<bool, S
 /// Whether ES-DE is up. Unknown reads as yes: every caller then leaves ES-DE's files alone, which
 /// loses a setting rather than the user's.
 fn es_de_running() -> bool {
-    Command::new("pgrep").args(["-x", "es-de"]).output().map_or(true, |o| o.status.success())
+    crate::processes::running("es-de").unwrap_or(true)
 }
 
 #[cfg(test)]

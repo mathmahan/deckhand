@@ -531,6 +531,36 @@ impl App {
             }
         }
     }
+
+    /// The window took a new size, in the units iced lays the page out in.
+    pub(super) fn resized(&mut self, width: f32, height: f32) -> Task<Message> {
+        // iced divides a window's size by every scale it applies — the system's and this
+        // app's — so the size is in layout units already: what the page has to lay out in.
+        // Multiplied back by the scale iced applied, it is the window in the system's own
+        // pixels, which the screen is fitted against.
+        let applied = self.applied_scale.get();
+        let before = self.layout_scale();
+        self.window = (width * applied, height * applied);
+        let scale = self.layout_scale();
+        self.content_width = self.window.0 / scale;
+        self.content_height = self.window.1 / scale;
+        // A size reported under one scale and read under another is the one way that can
+        // be wrong: the screen's own resize and the size asked for at launch can cross. So
+        // when the scale moves, the size is asked again — iced applies the new scale before
+        // it answers — and that answer settles it.
+        let confirm = if (scale - before).abs() > before * 1e-3 { self.ask_window_size() } else { Task::none() };
+        // A resize changes the column count, which moves every row: the art window has to
+        // be recomputed against the new geometry rather than kept from the old one. The
+        // density is re-read with it because a window dragged to another monitor reports
+        // the move as a resize and nothing else.
+        Task::batch([
+            iced::window::latest()
+                .and_then(iced::window::scale_factor)
+                .map(Message::PanelDensity),
+            self.fetch_art(),
+            confirm,
+        ])
+    }
 }
 
 /// A bar sweeping back and forth along a track, for work with no measure of how far it has got:
