@@ -123,6 +123,7 @@ impl App {
                     }
                 };
                 let title = self.title_of(rom_id);
+                let pictureless = matches!(&result, Ok(session) if session.pictureless);
                 let words = match result {
                     Err(why) => format!("\"{title}\" could not be launched: {why}."),
                     Ok(session) => {
@@ -150,8 +151,10 @@ impl App {
                     }
                 };
                 self.say(words);
+                // A state of it went up without a picture: RetroArch's state pictures are offered.
+                let offer = if pictureless { self.offer_state_pictures() } else { Task::none() };
                 // Back to the front for the result. A compositor may refuse; then it is one click away.
-                Task::batch([iced::window::latest().and_then(iced::window::gain_focus), refresh])
+                Task::batch([iced::window::latest().and_then(iced::window::gain_focus), refresh, offer])
             }
         }
     }

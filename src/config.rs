@@ -77,6 +77,10 @@ pub struct Settings {
     /// Off until chosen.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resume_state: bool,
+    /// Turning RetroArch's state pictures on was offered after a sync sent a state up without one,
+    /// and declined: not offered again. Settings ▸ Saves ▸ State pictures still turns them on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub state_pictures_declined: bool,
 }
 
 /// Written by hand so the token never reaches a log line or a panic message through `{:?}` — a
@@ -118,6 +122,7 @@ impl Default for Settings {
             system_commands: Default::default(),
             storage_budget_gb: None,
             resume_state: false,
+            state_pictures_declined: false,
             watch_saves: true,
         }
     }

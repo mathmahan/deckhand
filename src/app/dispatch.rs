@@ -839,11 +839,14 @@ impl App {
                 self.image_cache_bytes = Some(bytes);
                 Task::none()
             }
-            Message::SaveFolderFound(config, folder) => {
+            Message::SaveFolderFound(config, folder, pictures) => {
                 self.retroarch_found = Some(config);
                 self.save_folder = Some(folder);
+                self.state_pictures = Some(pictures);
                 Task::none()
             }
+            Message::StatePicturesFound(pictures) => self.state_pictures_found(pictures),
+            Message::StatePicturesChanged(turned, now) => self.state_pictures_changed(turned, now),
             Message::HooksRead(status) => {
                 self.hooks = Some(status);
                 Task::none()
@@ -948,6 +951,7 @@ impl App {
             }
             Message::SavesSynced(result) => {
                 let failed = result.is_err();
+                let mut pictureless = false;
                 self.save_sync = match result {
                     Ok(report) => {
                         // What the sync wrote is where things stand now, not a change to sync again.
@@ -955,6 +959,7 @@ impl App {
                         // own save while this ran, and that is still news.
                         self.watcher.wrote(&report.written);
                         self.save_folder = Some(Ok(report.folder.clone()));
+                        pictureless = report.pictureless > 0;
                         SaveSync::Done(Box::new(report))
                     }
                     Err(why) => {
@@ -966,7 +971,8 @@ impl App {
                 // A sync RomM turned away because it no longer knows this device registers it again
                 // here — see [`crate::sync::device`]. Without this the window would go on failing the
                 // same way until it was restarted, since it only registers as it opens.
-                if failed { self.ensure_device() } else { Task::none() }
+                let offer = if pictureless { self.offer_state_pictures() } else { Task::none() };
+                Task::batch([if failed { self.ensure_device() } else { Task::none() }, offer])
             }
             Message::CheckRelease => self.check_release(),
             Message::GamesFound(found) => {

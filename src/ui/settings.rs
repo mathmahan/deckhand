@@ -104,6 +104,7 @@ pub enum Row {
     SyncSaves,
     WatchSaves,
     EsDeHooks,
+    StatePictures,
     UiScale,
     GridDensity,
     RomsFolder,
@@ -117,7 +118,7 @@ pub enum Row {
 }
 
 impl Row {
-    pub const ALL: [Row; 24] = [
+    pub const ALL: [Row; 25] = [
         Row::ServerAddress,
         Row::Connection,
         Row::Certificate,
@@ -132,6 +133,7 @@ impl Row {
         Row::SyncSaves,
         Row::WatchSaves,
         Row::EsDeHooks,
+        Row::StatePictures,
         Row::UiScale,
         Row::GridDensity,
         Row::RomsFolder,
@@ -160,6 +162,7 @@ impl Row {
             Row::SyncSaves => "Sync",
             Row::WatchSaves => "Sync as saves change",
             Row::EsDeHooks => "ES-DE launches",
+            Row::StatePictures => "State pictures",
             Row::UiScale => "UI scale",
             Row::GridDensity => "Grid density",
             Row::RomsFolder => "Downloads go to",
@@ -177,7 +180,9 @@ impl Row {
         match self {
             Row::ServerAddress | Row::Connection | Row::Certificate | Row::Device | Row::SignOut => Section::Server,
             Row::Launcher | Row::SystemEmulators | Row::Resume | Row::SteamLibrary => Section::Playing,
-            Row::RetroArchConfig | Row::SaveFolder | Row::SyncSaves | Row::WatchSaves | Row::EsDeHooks => Section::Saves,
+            Row::RetroArchConfig | Row::SaveFolder | Row::SyncSaves | Row::WatchSaves | Row::EsDeHooks | Row::StatePictures => {
+                Section::Saves
+            }
             Row::UiScale | Row::GridDensity => Section::Display,
             Row::RomsFolder | Row::Budget | Row::Downloaded | Row::ImageCache | Row::LibraryCache => {
                 Section::Storage
@@ -344,6 +349,8 @@ pub struct SettingsContext<'a> {
     pub steam: Option<(usize, usize)>,
     /// Where ES-DE's hooks stand. None while it is being read.
     pub hooks: Option<&'a crate::hooks::Status>,
+    /// Whether RetroArch keeps a picture with each save state. None while it is being read.
+    pub state_pictures: Option<&'a Result<crate::sync::retroarch::StatePictures, String>>,
     /// The art caches' size on disk. None while it is being measured.
     pub image_cache: Option<u64>,
     /// What this device has downloaded — see [`crate::downloads`].
@@ -628,6 +635,23 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
                 }
                 row
             }
+        },
+        // RetroArch's own setting, which save sync sends the pictures of: on, off, or on but turned off
+        // again by an override, which is named rather than edited.
+        Row::StatePictures => match ctx.state_pictures {
+            None => vec![value_text("looking…".to_string(), Tone::Plain)],
+            Some(Err(_)) => vec![value_text("no RetroArch config found".to_string(), Tone::Plain)],
+            Some(Ok(pictures)) if !pictures.on => vec![
+                status_dot(Some(false)),
+                value_text("off · states reach RomM without a picture".to_string(), Tone::Warn),
+                action_chip("Turn on", lit, false),
+            ],
+            Some(Ok(pictures)) if !pictures.off_in.is_empty() => {
+                let count = pictures.off_in.len();
+                let note = format!("on · off again in {count} override{}", if count == 1 { "" } else { "s" });
+                vec![status_dot(Some(false)), value_text(note, Tone::Warn), action_chip("Show", lit, false)]
+            }
+            Some(Ok(_)) => vec![status_dot(Some(true)), value_text("on · each state keeps a picture".to_string(), Tone::Plain)],
         },
         Row::UiScale | Row::GridDensity | Row::Budget | Row::Resume | Row::WatchSaves => setting
             .stepped(ctx.settings)

@@ -140,6 +140,13 @@ impl App {
                     _ => Task::none(),
                 }
             }
+            Then::StatePictures => match chosen {
+                0 => self.turn_on_state_pictures(),
+                _ => {
+                    self.decline_state_pictures();
+                    Task::none()
+                }
+            },
             Then::Launcher => match chosen {
                 0 => {
                     self.settings.launch_command = None;

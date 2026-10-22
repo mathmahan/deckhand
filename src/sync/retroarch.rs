@@ -375,6 +375,26 @@ impl Install {
         GameSaves { existing, target }
     }
 
+    /// Whether RetroArch keeps a picture with each save state — and which of its overrides turn
+    /// that off for a core, a content folder or a game, whatever the main config says.
+    pub fn state_pictures(&self) -> StatePictures {
+        let on = self.settings.get(STATE_PICTURES).is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let mut off_in: Vec<PathBuf> = fs::read_dir(&self.overrides)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|core| core.path().is_dir())
+            .flat_map(|core| fs::read_dir(core.path()).into_iter().flatten().flatten())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|e| e == "cfg"))
+            .filter(|path| {
+                fs::read_to_string(path).is_ok_and(|text| parse(&text).get(STATE_PICTURES).is_some_and(|v| v.eq_ignore_ascii_case("false")))
+            })
+            .collect();
+        off_in.sort();
+        StatePictures { on, off_in }
+    }
+
     /// Whether RetroArch loads a game's auto slot state by itself when the game starts —
     /// `savestate_auto_load`, which naming a slot to start in overrides.
     pub fn loads_auto_state(&self) -> bool {
@@ -507,6 +527,36 @@ fn cores(dir: &Path) -> HashMap<String, String> {
 /// RetroArch's *Auto Load State*: whether it loads a game's auto slot state by itself on start.
 pub const AUTO_LOAD: &str = "savestate_auto_load";
 
+/// RetroArch's *Save State Thumbnails*: a picture beside each state, `<state>.png`, which save sync
+/// sends to RomM as the state's screenshot. RetroArch has it off unless told, and so does the
+/// `retroarch.cfg` RetroDECK ships.
+pub const STATE_PICTURES: &str = "savestate_thumbnail_enable";
+
+/// Whether RetroArch keeps a picture with each save state — see [`Install::state_pictures`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatePictures {
+    /// The main config turns them on.
+    pub on: bool,
+    /// Overrides that turn them off for their core, content folder or game.
+    pub off_in: Vec<PathBuf>,
+}
+
+/// Turn RetroArch's state pictures on in its main config. Refused while RetroArch runs: it writes
+/// its whole config as it quits (RetroDECK sets `config_save_on_exit`), which would turn them off
+/// again. `running` is asked, and anything it cannot tell counts as running.
+pub fn turn_on_state_pictures(config: &Path, running: impl Fn() -> bool) -> Result<(), String> {
+    if running() {
+        return Err("RetroArch is running, and would turn them off again as it quits — quit it first".into());
+    }
+    set_setting(config, STATE_PICTURES, "true").map_err(|e| format!("could not update {}: {e}", config.display()))
+}
+
+/// Whether RetroArch is up, a Flatpak's included. Unknown reads as yes: the caller then leaves its
+/// config alone, which loses a setting rather than the user's.
+pub fn retroarch_running() -> bool {
+    std::process::Command::new("pgrep").args(["-x", "retroarch"]).output().map_or(true, |o| o.status.success())
+}
+
 /// What the config at `config` sets `key` to, read now. None when it says nothing of it, or cannot be
 /// read.
 pub fn setting(config: &Path, key: &str) -> Option<String> {
@@ -611,6 +661,22 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn state_pictures_are_read_with_the_overrides_that_turn_them_off_and_turned_on_only_with_retroarch_closed() {
+        let ra = Fixture::new("pictures", "savestate_thumbnail_enable = \"false\"\nconfig_save_on_exit = \"true\"\n");
+        ra.file("config/Snes9x/Snes9x.cfg", "video_smooth = \"true\"\n");
+        let game = ra.file("config/Snes9x/Chrono Trigger (USA).cfg", "savestate_thumbnail_enable = \"false\"\n");
+        ra.file("config/Snes9x/Snes9x.opt", "savestate_thumbnail_enable = \"false\"\n");
+        assert_eq!(ra.install().state_pictures(), StatePictures { on: false, off_in: vec![game.clone()] }, "a core option file is not an override");
+
+        let config = ra.root.join("retroarch.cfg");
+        assert!(turn_on_state_pictures(&config, || true).unwrap_err().contains("running"));
+        assert!(!ra.install().state_pictures().on, "left alone while RetroArch runs");
+        turn_on_state_pictures(&config, || false).unwrap();
+        assert_eq!(ra.install().state_pictures(), StatePictures { on: true, off_in: vec![game] }, "the game's override is named, not edited");
+        assert_eq!(setting(&config, "config_save_on_exit").as_deref(), Some("true"));
     }
 
     #[test]

@@ -197,6 +197,9 @@ pub struct Report {
     /// Save states newer than any this device's core has, which another core made and this one
     /// cannot load, left on RomM — each saying which core — see [`states::Core`].
     pub other_cores: Vec<String>,
+    /// RetroArch states sent up with no picture beside them: RetroArch's state pictures are off
+    /// (see [`retroarch::StatePictures`]), and RomM shows the state without one.
+    pub pictureless: usize,
     /// Anything else worth saying about the run that is not a count — why nothing happened, say.
     pub notes: Vec<String>,
     /// Play sessions RomM took with the sync session — see [`session::sync`].
@@ -220,6 +223,7 @@ impl Report {
         self.homeless.extend(other.homeless);
         self.failed.extend(other.failed);
         self.other_cores.extend(other.other_cores);
+        self.pictureless += other.pictureless;
         self.notes.extend(other.notes);
         self.plays_recorded += other.plays_recorded;
         self.written.extend(other.written);

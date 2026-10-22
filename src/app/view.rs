@@ -519,6 +519,7 @@ impl App {
                         (here.iter().filter(|id| self.steam_bindings.get(host, **id).is_some()).count(), here.len())
                     }),
                     hooks: self.hooks.as_ref(),
+                    state_pictures: self.state_pictures.as_ref(),
                     image_cache: self.image_cache_bytes,
                     downloads: &self.downloads,
                     games: self.library.total_games,

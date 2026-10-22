@@ -426,6 +426,7 @@ fn the_detail_pages_action_row_does_what_it_says_at_each_stage() {
         exit,
         played_at: Some("2999-01-01T00:00:00Z".into()),
         notes: vec!["saves synced".into()],
+        pictureless: false,
     };
     let _ = app.update(Message::LaunchEvent(crate::launch::Event::Ended(game.rom_id, Ok(session))));
     assert_eq!(app.playing, None);
@@ -2985,4 +2986,60 @@ mod page_place {
         assert!(app.pick.is_none());
         assert_eq!(window.offset(&app, settings), 600.0);
     }
+}
+
+// ---- RetroArch's state pictures --------------------------------------------------------------
+
+#[test]
+fn state_pictures_are_offered_once_and_a_no_is_remembered() {
+    use crate::sync::retroarch::StatePictures;
+    let off = || Ok(StatePictures { on: false, off_in: Vec::new() });
+    let mut app = paired_fixtures(12);
+
+    // A game's sync sent a state up without a picture: offered, once this session.
+    let session = crate::launch::Session {
+        exit: crate::launch::Exit { success: true, code: Some(0), last_line: None },
+        played_at: None,
+        notes: Vec::new(),
+        pictureless: true,
+    };
+    let game = app.library.all_games()[0].rom_id;
+    app.playing = Some(game);
+    let _ = app.update(Message::LaunchEvent(crate::launch::Event::Ended(game, Ok(session))));
+    assert!(app.state_pictures_offered, "a sync without a picture asks where they stand");
+    let _ = app.update(Message::StatePicturesFound(off()));
+    let pick = app.pick.as_ref().expect("the offer");
+    assert_eq!(pick.picker.title, "Keep a picture with each save state?");
+    assert!(pick.picker.note.contains("next time they're saved"), "{}", pick.picker.note);
+
+    // No: remembered, and not asked again — the Settings row still turns them on.
+    let _ = app.update(Message::Picked(1));
+    assert!(app.settings.state_pictures_declined);
+    app.state_pictures_offered = false;
+    let _ = app.offer_state_pictures();
+    assert!(!app.state_pictures_offered, "declined for good");
+
+    // Already on: nothing to offer.
+    let mut app = paired_fixtures(12);
+    let _ = app.update(Message::StatePicturesFound(Ok(StatePictures { on: true, off_in: Vec::new() })));
+    assert!(app.pick.is_none());
+}
+
+#[test]
+fn the_state_pictures_row_turns_them_on_or_names_the_override_that_turns_them_off() {
+    use crate::sync::retroarch::StatePictures;
+    let mut app = paired_fixtures(12);
+    app.screen = Screen::Browsing(Route::Settings);
+    app.state_pictures = Some(Ok(StatePictures { on: false, off_in: Vec::new() }));
+    let _ = app.view();
+    assert!(app.update(Message::SettingsClicked(settings_row(SettingRow::StatePictures))).units() > 0, "turning them on is under way");
+
+    let override_file = std::path::PathBuf::from("/ra/config/Snes9x/Chrono Trigger (USA).cfg");
+    let _ = app.update(Message::StatePicturesChanged(Ok(()), Ok(StatePictures { on: true, off_in: vec![override_file.clone()] })));
+    assert!(app.banner.as_deref().is_some_and(|b| b.contains("Chrono Trigger (USA).cfg")), "{:?}", app.banner);
+    let _ = app.view();
+
+    // Refused while RetroArch runs: said, and still off.
+    let _ = app.update(Message::StatePicturesChanged(Err("RetroArch is running".into()), Ok(StatePictures { on: false, off_in: Vec::new() })));
+    assert!(app.banner.as_deref().is_some_and(|b| b.contains("left off: RetroArch is running")), "{:?}", app.banner);
 }
