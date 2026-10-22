@@ -66,6 +66,10 @@ pub enum Kind {
     /// alpha* — so it melts into the page on every renderer, where a mask over it would need one the
     /// renderer has.
     Spotlight,
+    /// A screenshot opened over the whole window: fitted into the box it is shown in, at the pixels
+    /// it is drawn at. Made bigger as well as smaller, and squarely once at least doubled — see
+    /// [`Kind::Spotlight`] for why the stretch is done here and not by the GPU.
+    Full,
 }
 
 impl Kind {
@@ -87,6 +91,7 @@ pub fn key(url: &str, kind: Kind) -> String {
         Kind::Feature => format!("{url}#feature"),
         Kind::Ambient => format!("{url}#ambient"),
         Kind::Spotlight => format!("{url}#spotlight"),
+        Kind::Full => format!("{url}#full"),
     }
 }
 
@@ -702,6 +707,23 @@ fn resample(
             feather(&mut picture);
             image::DynamicImage::ImageRgba8(picture)
         }
+        // Fitted into the box, the whole picture showing: as tall as the box where it is the
+        // narrower of the two, as wide where it is the wider.
+        Kind::Full => {
+            let box_ratio = target.box_ratio.unwrap_or(ratio);
+            let rows = if ratio > box_ratio { target.height_px * box_ratio / ratio } else { target.height_px };
+            let rows = rows.round().max(1.0) as u32;
+            if rows == h {
+                return decoded;
+            }
+            let width = ((rows as f32) * ratio).round().max(1.0) as u32;
+            let filter = if rows >= h * 2 {
+                image::imageops::FilterType::Nearest
+            } else {
+                image::imageops::FilterType::CatmullRom
+            };
+            decoded.resize_exact(width, rows, filter)
+        }
     }
 }
 
@@ -860,7 +882,7 @@ mod tests {
     #[test]
     fn one_screenshot_is_held_once_for_each_thing_it_becomes() {
         let url = "https://romm.lan/assets/romm/resources/roms/1/211/screenshots/0.jpg";
-        let keys = [Kind::Art, Kind::Feature, Kind::Ambient, Kind::Spotlight].map(|kind| key(url, kind));
+        let keys = [Kind::Art, Kind::Feature, Kind::Ambient, Kind::Spotlight, Kind::Full].map(|kind| key(url, kind));
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
                 assert_ne!(a, b, "a thumbnail, a picture and a light are three images");
@@ -912,6 +934,20 @@ mod tests {
         for value in [bright.0, bright.1, bright.2, bright.3] {
             assert!(!(60..=180).contains(&value), "a hard edge, not a smear: {bright:?}");
         }
+    }
+
+    #[test]
+    fn a_screenshot_opened_full_is_fitted_whole_into_its_box() {
+        // Narrower than the box: as tall as it, made bigger.
+        let target = Target { height_px: 672.0, box_ratio: Some(1.6) };
+        let (handle, _) = prepare(&solid_png(90, 160, 220, 256, 224), target, Kind::Full).expect("decodes");
+        let (w, h, _) = rgba_of(&handle);
+        assert_eq!((w, h), (768, 672), "three times over, the whole frame");
+        // Wider than the box: as wide as it, made smaller.
+        let target = Target { height_px: 720.0, box_ratio: Some(1.0) };
+        let (handle, _) = prepare(&solid_png(90, 160, 220, 1280, 720), target, Kind::Full).expect("decodes");
+        let (w, h, _) = rgba_of(&handle);
+        assert_eq!((w, h), (720, 405), "the box's width, nothing cut off");
     }
 
     fn store(entries: &[(&str, usize)]) -> Covers {

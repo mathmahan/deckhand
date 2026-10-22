@@ -1,12 +1,16 @@
 //! The game detail page — a port of `browse/ui/DetailView.kt`.
 //!
-//! Full-bleed art behind a legibility scrim, the cover beside the game's own transparent title art,
-//! then the facts, the actions, the description and the screenshots. Every fact here comes off the
-//! library snapshot: the RomM list response already carries the summary, the metadata, the size and
-//! the screenshot paths, so opening a game costs no fetch and the page draws in the first frame.
+//! Full-bleed art behind a legibility scrim, the cover beside the game's name and its facts, the actions in a row under them, then the screenshots, the description and the
+//! achievements. Every fact here comes off the library snapshot: the RomM list response already
+//! carries the summary, the metadata, the size and the screenshot paths, so opening a game costs no
+//! fetch and the page draws in the first frame.
+//!
+//! The pad's cursor walks it in rows: the actions, the screenshots — any one of which opens over the
+//! whole window, see [`viewer`] — and the achievements' heading, which folds their list away.
 
-use iced::widget::{self as widget, button, column, container, image, row, scrollable, stack, text, Space};
+use iced::widget::{self as widget, button, column, container, image, mouse_area, row, scrollable, stack, text, Space};
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Gradient, Length, Radians};
+use iced_fonts::lucide;
 
 use crate::app::Message;
 use crate::covers::Covers;
@@ -14,22 +18,86 @@ use crate::downloads::{Downloads, SyncState};
 use crate::library::Game;
 use crate::theme::{self, alpha};
 
-/// How tall the art panel down the left is.
-pub const COVER_H: f32 = 380.0;
+/// How tall the cover down the left is: about as tall as the facts beside it, so a wide box's
+/// cover does not take half the page.
+pub const COVER_H: f32 = 190.0;
 
-/// The band the title art is fitted into, so a wide wordmark cannot shove the facts down the page.
-const LOGO_H: f32 = 96.0;
+/// How tall the screenshots are drawn in their row.
+pub const SCREENSHOT_H: f32 = 128.0;
 
-const SCREENSHOT_H: f32 = 128.0;
+/// How many of a game's screenshots the page shows.
+pub const SHOTS_SHOWN: usize = 8;
+
+/// Around each screenshot, inside the ring the cursor puts on it.
+const SHOT_INSET: f32 = 3.0;
+
+const SHOT_GAP: f32 = 12.0;
+
+/// Between the page's parts: the cover and facts, the actions, and each section under them.
+const SECTION_GAP: f32 = 28.0;
+
+/// What a pad step up or down the page moves it by, where a step does not move the cursor.
+pub const READ_STEP: f32 = 160.0;
+
+/// Kept clear above or below a row the cursor is brought to.
+pub const REVEAL_MARGIN: f32 = 24.0;
+
+/// Around a screenshot opened over the window: room either side for the arrows to the next, and
+/// above and below for its count and the way out.
+pub const VIEWER_MARGIN: (f32, f32) = (96.0, 72.0);
 
 pub fn detail_id() -> widget::Id {
     widget::Id::new("detail-page")
 }
 
-/// The detail page's own cursor: which action button is under it.
+/// The row of actions, the screenshots and the achievements' heading, each as the part of the page
+/// the cursor brings into view when it lands there.
+pub fn part_id(zone: Zone) -> widget::Id {
+    match zone {
+        Zone::Actions => widget::Id::new("detail-actions"),
+        Zone::Shots => widget::Id::new("detail-shots"),
+        Zone::Achievements => widget::Id::new("detail-achievements"),
+    }
+}
+
+/// The screenshots' own row, which scrolls sideways.
+pub fn shots_strip_id() -> widget::Id {
+    widget::Id::new("detail-shots-strip")
+}
+
+/// The detail page's own cursor: which row it is on, and where along it.
 #[derive(Debug, Default)]
 pub struct DetailFocus {
+    pub zone: Zone,
     pub action: usize,
+    pub shot: usize,
+    /// The screenshot open over the whole window, if one is — see [`viewer`].
+    pub viewing: Option<usize>,
+}
+
+/// The rows of the page the cursor stops on, top to bottom.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Zone {
+    #[default]
+    Actions,
+    Shots,
+    /// The heading over the achievements, which opens and closes their list.
+    Achievements,
+}
+
+impl Zone {
+    /// The rows a page has: the actions always, the screenshots and the achievements where the
+    /// game has any.
+    pub fn of(shots: usize, achievements: u32) -> Vec<Zone> {
+        let mut zones = vec![Zone::Actions];
+        if shots > 0 {
+            zones.push(Zone::Shots);
+        }
+        if achievements > 0 {
+            zones.push(Zone::Achievements);
+        }
+        zones
+    }
 }
 
 /// The actions the page offers. All four are drawn because the page is a poor thing without them —
@@ -48,7 +116,6 @@ pub enum Action {
     /// What RomM keeps beside the game — a manual, a hack, a translation — to put on this device or
     /// take off it. Only on a game that has any, and only once the game is here.
     Extras,
-    LaunchWith,
     Favourite,
     /// Keep it when a space budget makes room — see [`crate::downloads::storage`].
     Pin,
@@ -58,8 +125,8 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 8] =
-        [Action::Download, Action::Saves, Action::Extras, Action::LaunchWith, Action::Favourite, Action::Pin, Action::Steam, Action::Remove];
+    pub const ALL: [Action; 7] =
+        [Action::Download, Action::Saves, Action::Extras, Action::Favourite, Action::Pin, Action::Steam, Action::Remove];
 
     /// The actions the page draws, in order: all of them, but Extras only for a game with extras on
     /// this device to offer. Every other action is drawn either way and says why it can't, when it
@@ -85,7 +152,6 @@ impl Action {
             },
             Action::Saves => "Saves & states".into(),
             Action::Extras => "Extras".into(),
-            Action::LaunchWith => "Launch with...".into(),
             // The word carries it, as the Kotlin app has it: a heart glyph comes from a fallback
             // face, set tight against the word.
             Action::Favourite => if favourite { "Favourited".into() } else { "Favourite".into() },
@@ -113,10 +179,6 @@ impl Action {
             (Action::Extras, s) if s.is_busy() => Some("is downloading — its extras can be picked once that's done"),
             (Action::Extras, s) if s.is_here() => None,
             (Action::Extras, _) => Some("isn't on this device, and its extras go in beside it"),
-            // ES-DE's per-game emulator choice is what RetroDECK follows, so that is where it is made.
-            (Action::LaunchWith, _) => {
-                Some("can't pick an emulator from here yet — choose one for the game in ES-DE, and Play follows it")
-            }
             (Action::Steam, _) if !cfg!(target_os = "linux") => Some("can only be added to Steam on Linux in this build"),
             (Action::Steam, s) if s.is_here() => None,
             (Action::Steam, _) => Some("isn't on this device, so there's nothing for Steam to start"),
@@ -151,6 +213,8 @@ pub struct DetailContext<'a> {
     pub achievements: Option<&'a Result<std::sync::Arc<crate::achievements::GameAchievements>, String>>,
     /// RomM has extras of the build on this device to offer — see [`Action::Extras`].
     pub extras: bool,
+    /// The achievements' list is open under its heading.
+    pub achievements_open: bool,
 }
 
 impl<'a> DetailContext<'a> {
@@ -166,18 +230,21 @@ impl<'a> DetailContext<'a> {
 pub fn detail_view<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     let game = ctx.game;
 
-    let page = column![
+    // The actions under the cover, across the page, rather than beside it under the facts: a wide
+    // box's cover leaves the facts too little room to hold a row of buttons as well, and they wrapped
+    // into two and three rows there.
+    let mut page = column![
         back_link(ctx),
         Space::new().height(Length::Fixed(12.0)),
         row![art_panel(ctx), Space::new().width(Length::Fixed(28.0)), facts(ctx)]
             .align_y(Alignment::Start),
-        Space::new().height(Length::Fixed(28.0)),
-        about(game),
-        screenshots(ctx),
-        achievements(ctx),
-        Space::new().height(Length::Fixed(28.0)),
-    ]
-    .padding([16, 28]);
+        Space::new().height(Length::Fixed(20.0)),
+        container(actions(ctx)).id(part_id(Zone::Actions)),
+    ];
+    for section in [screenshots(ctx), about(game), achievements(ctx)].into_iter().flatten() {
+        page = page.push(Space::new().height(Length::Fixed(SECTION_GAP))).push(section);
+    }
+    let page = page.push(Space::new().height(Length::Fixed(SECTION_GAP))).padding([16, 28]);
 
     // The backdrop is the game's own banner, blurred, under a scrim heavy enough to read against.
     // Same treatment as Home's hero and for the same reason: it should read as this game's colour,
@@ -335,35 +402,19 @@ fn facts<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
         chips.wrap().vertical_spacing(10.0),
         Space::new().height(Length::Fixed(20.0)),
         stats(ctx),
-        Space::new().height(Length::Fixed(20.0)),
-        actions(ctx),
     ]
     .width(Length::Fill)
     .into()
 }
 
-/// RomM's transparent title art where the game has one, the plain title otherwise.
+/// The game's name, as text: RomM's title art beside the cover was the name a second time, in the
+/// box's own lettering.
 fn title<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
-    let logo = ctx
-        .game
-        .logo_path
-        .as_deref()
-        .map(|p| ctx.asset(p))
-        .and_then(|url| ctx.covers.handle(&url).cloned());
-
-    match logo {
-        Some(handle) => container(
-            image(handle).content_fit(ContentFit::Contain).height(Length::Fixed(LOGO_H)),
-        )
-        .height(Length::Fixed(LOGO_H))
-        .align_left(Length::Fill)
-        .into(),
-        None => text(ctx.game.title.as_str())
-            .size(theme::text_size::DISPLAY_MEDIUM)
-            .font(theme::EXTRABOLD)
-            .color(theme::TEXT_PRIMARY)
-            .into(),
-    }
+    text(ctx.game.title.as_str())
+        .size(theme::text_size::DISPLAY_MEDIUM)
+        .font(theme::EXTRABOLD)
+        .color(theme::TEXT_PRIMARY)
+        .into()
 }
 
 /// Stars, the numeric rating, and when it was last played.
@@ -429,7 +480,8 @@ fn stats<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
             ],
         );
     }
-    strip.into()
+    // Wrapped, for the facts beside a wide box's cover.
+    strip.wrap().vertical_spacing(16.0).into()
 }
 
 fn actions<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
@@ -440,7 +492,7 @@ fn actions<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     for (i, action) in shown.iter().enumerate() {
         let primary = i == 0;
         // Held to the row: a button that went (Extras, with the game) can leave the cursor past it.
-        let lit = ctx.focus.action.min(shown.len() - 1) == i;
+        let lit = ctx.focus.zone == Zone::Actions && ctx.focus.action.min(shown.len() - 1) == i;
         let label = action.label(&state, pinned, ctx.game.missing(), ctx.in_steam, ctx.favourite);
         // A running download is inert: the percentage is the progress, and a second press on the
         // one button the thumb is already resting on should not be a cancel found by accident.
@@ -466,19 +518,23 @@ fn actions<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     buttons.wrap().vertical_spacing(12.0).into()
 }
 
-fn about<'a>(game: &'a Game) -> Element<'a, Message> {
-    let Some(summary) = game.summary.as_deref() else {
-        return Space::new().height(Length::Fixed(0.0)).into();
-    };
-    column![
-        text("ABOUT").size(10.0).font(theme::BOLD).color(theme::TEXT_MUTED),
-        Space::new().height(Length::Fixed(10.0)),
-        text(summary.to_string())
-            .size(theme::text_size::BODY_LARGE)
-            .color(theme::TEXT_BODY),
-        Space::new().height(Length::Fixed(24.0)),
-    ]
-    .into()
+fn about<'a>(game: &'a Game) -> Option<Element<'a, Message>> {
+    let summary = game.summary.as_deref()?;
+    Some(
+        column![
+            label("ABOUT"),
+            Space::new().height(Length::Fixed(10.0)),
+            text(summary.to_string())
+                .size(theme::text_size::BODY_LARGE)
+                .color(theme::TEXT_BODY),
+        ]
+        .into(),
+    )
+}
+
+/// A section's name over it.
+fn label<'a>(words: &'a str) -> Element<'a, Message> {
+    text(words).size(10.0).font(theme::BOLD).color(theme::TEXT_MUTED).into()
 }
 
 /// A badge's size in the Achievements list, and how many rows it shows before saying how many more.
@@ -488,32 +544,58 @@ pub const ACHIEVEMENTS_SHOWN: usize = 60;
 /// RetroAchievements' list for the game: each one's badge, title, what it asks, its points and
 /// how many players have it — the last being the only rarity RomM carries — and, with an account
 /// linked, which this player has: earned ones lit with the day they were earned, the rest locked.
-fn achievements<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
+///
+/// Folded under a heading that says how many there are and how far along this player is, until it
+/// is opened: a list that runs to dozens of rows is not what most visits to the page are for.
+fn achievements<'a>(ctx: &DetailContext<'a>) -> Option<Element<'a, Message>> {
     let count = ctx.game.achievements as usize;
     if count == 0 {
-        return Space::new().height(Length::Fixed(0.0)).into();
+        return None;
     }
-    let heading = |extra: String| {
-        text(format!("ACHIEVEMENTS · {extra}")).size(10.0).font(theme::BOLD).color(theme::TEXT_MUTED)
-    };
-    let game = match ctx.achievements {
-        None => {
-            return column![heading(count.to_string()), Space::new().height(Length::Fixed(10.0)), muted("Asking RomM…".into())].into();
+    let open = ctx.achievements_open;
+    let summary = match ctx.achievements {
+        Some(Ok(game)) => {
+            let points: i64 = game.list.iter().filter_map(|a| a.points).sum();
+            match game.linked {
+                // RetroAchievements' own count; earned points are not given, since a badge several
+                // achievements share does not say which of them it was — see `achievements`.
+                Some(true) => format!("{} of {} earned · {} points", game.earned_count(), game.list.len(), thousands(points)),
+                _ => format!("{} · {} points", game.list.len(), thousands(points)),
+            }
         }
-        Some(Err(why)) => {
-            return column![heading(count.to_string()), Space::new().height(Length::Fixed(10.0)), muted(why.clone())].into();
-        }
-        Some(Ok(game)) => game.clone(),
+        _ => count.to_string(),
     };
-    let list = &game.list;
-    let points: i64 = list.iter().filter_map(|a| a.points).sum();
-    let summary = match game.linked {
-        // RetroAchievements' own count; earned points are not given, since a badge several
-        // achievements share does not say which of them it was — see `achievements`.
-        Some(true) => format!("{} OF {} EARNED · {} POINTS", game.earned_count(), list.len(), thousands(points)),
-        _ => format!("{} · {} POINTS", list.len(), thousands(points)),
+    let chevron = if open { lucide::chevron_up() } else { lucide::chevron_down() };
+    let heading = button(
+        row![
+            lucide::trophy().size(18.0).color(theme::ACCENT_SOFT),
+            text("Achievements").size(theme::text_size::TITLE_MEDIUM).font(theme::SEMIBOLD),
+            text(summary).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY).width(Length::Fill),
+            text(if open { "Hide" } else { "Show" }).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY),
+            chevron.size(18.0).color(theme::TEXT_SECONDARY),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([14, 18])
+    .on_press(Message::ToggleAchievements)
+    .style(crate::ui::style::row(ctx.focus.zone == Zone::Achievements, 12.0));
+    let heading = container(heading).id(part_id(Zone::Achievements));
+    if !open {
+        return Some(heading.into());
+    }
+    let body = match ctx.achievements {
+        None => muted("Asking RomM…".into()),
+        Some(Err(why)) => muted(why.clone()),
+        Some(Ok(game)) => achievement_rows(ctx, game),
     };
+    Some(column![heading, Space::new().height(Length::Fixed(14.0)), body].into())
+}
 
+/// The opened list: a note to link an account where none is, then a row per achievement.
+fn achievement_rows<'a>(ctx: &DetailContext<'a>, game: &crate::achievements::GameAchievements) -> Element<'a, Message> {
+    let list = &game.list;
     let mut rows = column![].spacing(8);
     for achievement in list.iter().take(ACHIEVEMENTS_SHOWN) {
         let earned = game.earned(achievement);
@@ -587,13 +669,15 @@ fn achievements<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
     if list.len() > ACHIEVEMENTS_SHOWN {
         rows = rows.push(muted(format!("and {} more", list.len() - ACHIEVEMENTS_SHOWN)));
     }
-    let mut section = column![Space::new().height(Length::Fixed(24.0)), heading(summary)];
     if game.linked == Some(false) {
-        section = section.push(Space::new().height(Length::Fixed(6.0))).push(muted(
-            "Link a RetroAchievements account to your user in RomM to see which ones you have.".into(),
-        ));
+        return column![
+            muted("Link a RetroAchievements account to your user in RomM to see which ones you have.".into()),
+            Space::new().height(Length::Fixed(10.0)),
+            rows,
+        ]
+        .into();
     }
-    section.push(Space::new().height(Length::Fixed(10.0))).push(rows).into()
+    rows.into()
 }
 
 /// Where an achievement's badge is — the greyed one for a `locked` achievement: RomM's own copy
@@ -628,51 +712,144 @@ fn thousands(n: i64) -> String {
     if n < 0 { format!("-{out}") } else { out }
 }
 
-fn screenshots<'a>(ctx: &DetailContext<'a>) -> Element<'a, Message> {
-    let shots: Vec<&String> = ctx
-        .game
-        .screenshots
-        .iter()
-        .filter(|url| ctx.covers.handle(url).is_some())
-        .take(8)
-        .collect();
+/// The screenshots the page shows: the first [`SHOTS_SHOWN`] of the game's, of those that have
+/// arrived. What the cursor walks and the viewer steps through.
+pub fn shown_shots<'g>(game: &'g Game, covers: &Covers) -> Vec<&'g String> {
+    game.screenshots.iter().take(SHOTS_SHOWN).filter(|url| covers.handle(url).is_some()).collect()
+}
+
+/// How wide screenshot `url` is drawn in its row: its own shape, at the row's height.
+fn shot_width(covers: &Covers, url: &str) -> f32 {
+    SCREENSHOT_H * covers.meta(url).map_or(4.0 / 3.0, |meta| meta.ratio)
+}
+
+/// Where shown screenshot `index` sits along its row, left and right, ring and all — for scrolling
+/// the row to it.
+pub fn shot_span(game: &Game, covers: &Covers, index: usize) -> (f32, f32) {
+    let shots = shown_shots(game, covers);
+    let tile = |url: &String| shot_width(covers, url) + 2.0 * SHOT_INSET;
+    let left: f32 = shots.iter().take(index).map(|url| tile(url) + SHOT_GAP).sum();
+    (left, left + shots.get(index).map_or(0.0, |url| tile(url)))
+}
+
+/// The screenshots in a row that scrolls sideways, each one a button that opens it over the whole
+/// window. The cursor's is ringed in the brightest ink, as a tile on Home is.
+fn screenshots<'a>(ctx: &DetailContext<'a>) -> Option<Element<'a, Message>> {
+    let shots = shown_shots(ctx.game, ctx.covers);
     if shots.is_empty() {
-        return Space::new().height(Length::Fixed(0.0)).into();
+        return None;
     }
+    let cursor = (ctx.focus.zone == Zone::Shots).then(|| ctx.focus.shot.min(shots.len() - 1));
 
-    let mut strip = row![].spacing(12);
-    for url in shots {
-        if let Some(handle) = ctx.covers.handle(url) {
-            strip = strip.push(
-                container(
-                    image(handle.clone())
-                        .content_fit(ContentFit::Cover)
-                        .height(Length::Fixed(SCREENSHOT_H)),
-                )
-                .height(Length::Fixed(SCREENSHOT_H))
-                .style(|_| container::Style {
-                    background: Some(Background::Color(theme::SURFACE_VARIANT)),
-                    border: Border {
-                        color: alpha(theme::NEUTRAL_100, 0.08),
-                        width: 1.0,
-                        radius: 8.0.into(),
+    let mut strip = row![].spacing(SHOT_GAP);
+    for (i, url) in shots.into_iter().enumerate() {
+        let Some(handle) = ctx.covers.handle(url) else { continue };
+        let lit = cursor == Some(i);
+        strip = strip.push(
+            button(
+                image(handle.clone())
+                    .content_fit(ContentFit::Cover)
+                    .width(Length::Fixed(shot_width(ctx.covers, url)))
+                    .height(Length::Fixed(SCREENSHOT_H))
+                    .border_radius(6.0),
+            )
+            .padding(SHOT_INSET)
+            .on_press(Message::ViewShot(i))
+            .style(move |_, status| button::Style {
+                background: None,
+                border: Border {
+                    color: if lit {
+                        theme::INK
+                    } else if matches!(status, button::Status::Hovered) {
+                        theme::FOCUS_RING
+                    } else {
+                        Color::TRANSPARENT
                     },
-                    ..Default::default()
-                })
-                .clip(true),
-            );
-        }
+                    width: 2.0,
+                    radius: (6.0 + SHOT_INSET).into(),
+                },
+                ..Default::default()
+            }),
+        );
     }
 
-    column![
-        text("SCREENSHOTS").size(10.0).font(theme::BOLD).color(theme::TEXT_MUTED),
-        Space::new().height(Length::Fixed(10.0)),
-        scrollable(strip)
-            .on_scroll(|_| Message::Scrolled)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::new().width(5).scroller_width(5),
-            ))
-            .width(Length::Fill),
+    Some(
+        container(column![
+            label("SCREENSHOTS"),
+            Space::new().height(Length::Fixed(10.0)),
+            scrollable(strip)
+                .id(shots_strip_id())
+                .on_scroll(|_| Message::Scrolled)
+                .direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::new().width(5).scroller_width(5).spacing(6),
+                ))
+                .width(Length::Fill),
+        ])
+        .id(part_id(Zone::Shots))
+        .into(),
+    )
+}
+
+/// Screenshot `index` of the page's over the whole window, as large as fits: the full-size copy
+/// once it has come — see [`crate::covers::Kind::Full`] — and the row's until then.
+///
+/// Arrows either side step to the one before and after; Left and Right do the same on the pad.
+/// A click anywhere else closes it, as B does.
+pub fn viewer<'a>(game: &'a Game, covers: &'a Covers, index: usize) -> Element<'a, Message> {
+    let shots = shown_shots(game, covers);
+    let index = index.min(shots.len().saturating_sub(1));
+    let picture: Element<Message> = match shots.get(index) {
+        Some(url) => match covers.handle(&crate::covers::key(url, crate::covers::Kind::Full)).or_else(|| covers.handle(url)) {
+            Some(handle) => image(handle.clone()).content_fit(ContentFit::Contain).width(Length::Fill).height(Length::Fill).into(),
+            None => Space::new().into(),
+        },
+        None => Space::new().into(),
+    };
+
+    let arrow = |icon: iced::widget::Text<'a>, to: Option<usize>| -> Element<'a, Message> {
+        let Some(to) = to else { return Space::new().width(Length::Fixed(48.0)).into() };
+        button(container(icon.size(26.0).color(theme::INK)).center(Length::Fixed(48.0)))
+            .padding(0)
+            .on_press(Message::ViewShot(to))
+            .style(|_, status| button::Style {
+                background: Some(Background::Color(theme::glass(if matches!(status, button::Status::Hovered) { 0.16 } else { 0.08 }))),
+                border: Border { color: theme::glass(0.14), width: 1.0, radius: 24.0.into() },
+                text_color: theme::INK,
+                ..Default::default()
+            })
+            .into()
+    };
+    let before = index.checked_sub(1);
+    let after = (index + 1 < shots.len()).then_some(index + 1);
+    let (side, end) = VIEWER_MARGIN;
+
+    let count = text(format!("{} of {}", index + 1, shots.len())).size(theme::text_size::BODY_MEDIUM).color(theme::TEXT_SECONDARY);
+    let close = button(
+        row![crate::ui::tab_bar::glyph("B", false), text("Close").size(theme::text_size::BODY_MEDIUM)]
+            .spacing(8)
+            .align_y(Alignment::Center),
+    )
+    .padding([6, 12])
+    .on_press(Message::CloseShot)
+    .style(crate::ui::style::quiet);
+    let top = row![count, Space::new().width(Length::Fill), close]
+        .align_y(Alignment::Center)
+        .height(Length::Fixed(end))
+        .padding([0.0, side - 48.0]);
+    let middle = row![
+        container(arrow(lucide::chevron_left(), before)).center_x(Length::Fixed(side)),
+        picture,
+        container(arrow(lucide::chevron_right(), after)).center_x(Length::Fixed(side)),
     ]
+    .align_y(Alignment::Center)
+    .height(Length::Fill);
+
+    mouse_area(
+        container(column![top, middle, Space::new().height(Length::Fixed(end))])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_| container::Style { background: Some(Background::Color(alpha(theme::GROUND, 0.98))), ..Default::default() }),
+    )
+    .on_press(Message::CloseShot)
     .into()
 }

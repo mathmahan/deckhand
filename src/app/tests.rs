@@ -779,6 +779,53 @@ mod render {
         snapshot(&app, "detail-favourited");
     }
 
+    /// The game page with a wide box's cover, a row of screenshots and the achievements' heading;
+    /// then the cursor on a screenshot, the list opened, and a screenshot open over the window.
+    #[test]
+    #[ignore = "draws pages to PNGs for a person to look at"]
+    fn render_detail_rows() {
+        use crate::romm::models::Achievement;
+        let (mut app, game) = with_saves();
+        let host = app.host().to_string();
+        let cover = format!("{host}/assets/wide-cover.png");
+        let shots: Vec<String> = (0..5).map(|i| format!("{host}/assets/screenshots/{i}.png")).collect();
+        let mut games = app.library.all_games().to_vec();
+        for each in &mut games {
+            if each.rom_id == game.rom_id {
+                each.cover_url = Some(cover.clone());
+                each.screenshots = shots.clone();
+                each.achievements = 3;
+            }
+        }
+        app.library = Arc::new(Library::new(app.library.systems.clone(), games));
+        let meta = |ratio: f32| covers::CoverMeta { ratio, dominant: Color::BLACK };
+        app.covers.insert(cover, covers::Cover::Ready(picture_sized(548, 400, [200, 60, 50]), meta(1.37)));
+        let hues = [[90, 140, 220], [220, 120, 70], [80, 190, 120], [200, 180, 60], [150, 90, 200]];
+        for (i, (url, hue)) in shots.iter().zip(hues).enumerate() {
+            app.covers.insert(url.clone(), covers::Cover::Ready(picture_sized(256, 224, hue), meta(256.0 / 224.0)));
+            if i == 1 {
+                app.covers.insert(covers::key(url, covers::Kind::Full), covers::Cover::Ready(picture_sized(768, 672, hue), meta(256.0 / 224.0)));
+            }
+        }
+        let _ = app.update(Message::OpenDetail(game.rom_id));
+        app.banner = None;
+        let list = vec![
+            Achievement { title: "First steps".into(), description: Some("Clear the opening area".into()), points: Some(5), num_awarded: Some(19_293), ..Default::default() },
+            Achievement { title: "Collector".into(), description: Some("Find every hidden item".into()), points: Some(25), num_awarded: Some(1_204), ..Default::default() },
+            Achievement { title: "No damage".into(), description: Some("Beat the last boss without a hit".into()), points: Some(50), num_awarded: Some(87), ..Default::default() },
+        ];
+        app.achievements.insert(game.rom_id, Ok(Arc::new(crate::achievements::GameAchievements::new(list, None, None))));
+        snapshot(&app, "detail-wide");
+        let _ = app.update(Message::Nav(Direction::Down));
+        let _ = app.update(Message::Nav(Direction::Right));
+        snapshot(&app, "detail-shots");
+        let _ = app.update(Message::Nav(Direction::Down));
+        let _ = app.update(Message::Activate);
+        snapshot_sized(&app, "detail-achievements", (1280.0, 1300.0));
+        let _ = app.update(Message::ViewShot(1));
+        snapshot(&app, "detail-viewer");
+    }
+
     /// What Download offers for a three-disc game with another build — and the drive picker.
     #[test]
     #[ignore = "draws pages to PNGs for a person to look at"]
@@ -1229,6 +1276,101 @@ fn the_detail_page_asks_for_a_game_s_achievements_once_and_scrolls_down_to_them(
     assert!(app.load_achievements(with).units() > 0, "asked again on every visit: earning happens in between");
     let _ = app.view();
     assert!(app.update(Message::Nav(Direction::Down)).units() > 0, "Down scrolls the page");
+    assert_eq!(app.detail_focus.zone, crate::ui::detail::Zone::Achievements, "to their heading");
+}
+
+/// A game's page with `shots` screenshots arrived, and `achievements` to earn.
+fn detail_with(shots: usize, achievements: u32) -> (App, Game) {
+    let mut app = paired_fixtures(12);
+    let mut games: Vec<Game> = app.library.all_games().to_vec();
+    let host = app.host().to_string();
+    games[0].screenshots = (0..shots).map(|i| format!("{host}/assets/screenshots/{i}.png")).collect();
+    games[0].achievements = achievements;
+    let game = games[0].clone();
+    app.library = Arc::new(Library::new(app.library.systems.clone(), games));
+    let meta = covers::CoverMeta { ratio: 4.0 / 3.0, dominant: Color::BLACK };
+    for url in &game.screenshots {
+        app.covers.insert(url.clone(), covers::Cover::Ready(iced::widget::image::Handle::from_rgba(4, 3, vec![0; 48]), meta));
+    }
+    let _ = app.update(Message::OpenDetail(game.rom_id));
+    (app, game)
+}
+
+#[test]
+fn the_game_pages_cursor_walks_the_actions_the_screenshots_and_the_achievements() {
+    use crate::ui::detail::Zone;
+    let (mut app, _) = detail_with(3, 12);
+    assert_eq!(app.detail_zones(), [Zone::Actions, Zone::Shots, Zone::Achievements]);
+
+    let _ = app.update(Message::Nav(Direction::Down));
+    assert_eq!(app.detail_focus.zone, Zone::Shots);
+    for _ in 0..4 {
+        let _ = app.update(Message::Nav(Direction::Right));
+    }
+    assert_eq!(app.detail_focus.shot, 2, "held at the last");
+    let _ = app.update(Message::Nav(Direction::Down));
+    assert_eq!(app.detail_focus.zone, Zone::Achievements);
+    assert!(!app.achievements_open, "folded until opened");
+    let _ = app.update(Message::Activate);
+    assert!(app.achievements_open);
+    let _ = app.view();
+    let _ = app.update(Message::Activate);
+    assert!(!app.achievements_open, "and folded again");
+
+    // Up reads an opened list back up before the cursor leaves it: the page says which.
+    let _ = app.update(Message::DetailClimbed(Some(300.0)));
+    assert_eq!(app.detail_focus.zone, Zone::Achievements, "a step up the list keeps the cursor in it");
+    let _ = app.update(Message::DetailClimbed(None));
+    assert_eq!(app.detail_focus.zone, Zone::Shots, "the heading in view, on to the row above");
+    let _ = app.update(Message::DetailClimbed(None));
+    assert_eq!(app.detail_focus.zone, Zone::Actions);
+    assert_eq!(app.detail_focus.shot, 2, "the screenshots keep their place for the way back");
+    let _ = app.update(Message::Nav(Direction::Up));
+    assert_eq!(app.chrome, None, "scrolled down the page, Up goes up it first");
+    let _ = app.update(Message::DetailScrolled(0.0));
+    let _ = app.update(Message::Nav(Direction::Up));
+    assert_eq!(app.chrome, Some(Chrome::Tabs), "from the top of the page, up into the bar");
+
+    // A game with neither has its actions alone, and Down reads on down the page.
+    let (mut app, _) = detail_with(0, 0);
+    assert_eq!(app.detail_zones(), [Zone::Actions]);
+    assert!(app.update(Message::Nav(Direction::Down)).units() > 0);
+    assert_eq!(app.detail_focus.zone, Zone::Actions);
+}
+
+#[test]
+fn a_screenshot_opens_over_the_window_steps_along_and_closes_back_to_the_page() {
+    use crate::ui::detail::Zone;
+    let (mut app, game) = detail_with(3, 0);
+    let _ = app.update(Message::Nav(Direction::Down));
+    let _ = app.update(Message::Nav(Direction::Right));
+    let _ = app.update(Message::Activate);
+    assert_eq!(app.detail_focus.viewing, Some(1));
+    let full: Vec<String> = app.wanted_art().into_iter().filter(|(_, _, kind)| *kind == covers::Kind::Full).map(|(url, _, _)| url).collect();
+    assert_eq!(full, [game.screenshots[1].clone(), game.screenshots[0].clone(), game.screenshots[2].clone()], "the one open first, then either side");
+    let _ = app.view();
+
+    for _ in 0..2 {
+        let _ = app.update(Message::Nav(Direction::Right));
+    }
+    assert_eq!(app.detail_focus.viewing, Some(2), "held at the last");
+    // Keys that would act on the page under it wait until it is closed.
+    let _ = app.update(Message::CycleTab(1));
+    let _ = app.update(Message::Nav(Direction::Down));
+    assert!(matches!(app.screen, Screen::Browsing(Route::Detail { .. })));
+    assert_eq!(app.detail_focus.viewing, Some(2));
+
+    let _ = app.update(Message::Pad(crate::gamepad::Pad::Back));
+    assert_eq!(app.detail_focus.viewing, None);
+    assert!(matches!(app.screen, Screen::Browsing(Route::Detail { .. })), "Back closes the picture, not the page");
+    assert_eq!((app.detail_focus.zone, app.detail_focus.shot), (Zone::Shots, 2), "the cursor on the last one looked at");
+
+    // A click on one opens it too, and a click on the backdrop closes it.
+    let _ = app.update(Message::ViewShot(0));
+    assert_eq!(app.detail_focus.viewing, Some(0));
+    let _ = app.update(Message::CloseShot);
+    assert_eq!(app.detail_focus.viewing, None);
+    assert!(app.wanted_art().iter().all(|(_, _, kind)| *kind != covers::Kind::Full), "nothing full-size kept asking once closed");
 }
 
 #[test]
@@ -1889,7 +2031,7 @@ fn the_header_says_what_is_coming_and_where_the_saves_stand() {
 }
 
 #[test]
-fn a_cover_opened_from_its_grid_is_drawn_from_romms_big_copy_not_the_tiles() {
+fn a_cover_opened_from_its_grid_is_a_copy_of_its_own_not_the_tiles() {
     let (mut app, _) = App::new(Some(60));
     let mut games = app.library.all_games().to_vec();
     let url = format!("https://romm.lan/assets/romm/resources/roms/{}/cover/big.png", games[0].rom_id);
@@ -1905,7 +2047,13 @@ fn a_cover_opened_from_its_grid_is_drawn_from_romms_big_copy_not_the_tiles() {
     let wanted = app.wanted_art();
     let (_, target, kind) = wanted.iter().find(|(u, _, _)| *u == url).expect("the cover is asked for");
     assert_eq!(*kind, covers::Kind::Feature, "under a key of its own, so the grid's copy does not answer for it");
-    assert_eq!(covers::source_url(&url, *target), url, "from RomM's big copy");
+    // Drawn as tall as the facts beside it: RomM's small copy has the rows for that on a 1x panel,
+    // and only its big copy on a 2x one.
+    assert_eq!(covers::source_url(&url, *target), url.replace("big.png", "small.png"), "from RomM's small copy at 1x");
+    app.panel_density = 2.0;
+    let wanted = app.wanted_art();
+    let (_, target, _) = wanted.iter().find(|(u, _, _)| *u == url).expect("the cover is asked for");
+    assert_eq!(covers::source_url(&url, *target), url, "from RomM's big copy at 2x");
 
     // The tile's copy until the page's own has come, then that.
     assert_eq!(app.covers.feature(&url).map(|(h, _)| h), Some(tile));
