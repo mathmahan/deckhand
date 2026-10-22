@@ -568,6 +568,7 @@ impl App {
                     save_folder: self.save_folder.as_ref(),
                     retroarch_found: self.retroarch_found.as_ref(),
                     save_sync: &self.save_sync,
+                    sync_before: &self.sync_before,
                     synced_ago: self.save_synced_at.map(|at| at.elapsed()),
                     release: &self.release,
                     appimage: self.appimage.is_some(),

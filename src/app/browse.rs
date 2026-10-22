@@ -661,7 +661,7 @@ impl App {
             self.save_sync = SaveSync::Failed("not paired with a RomM server".into());
             return Task::none();
         };
-        self.save_sync = SaveSync::Running;
+        self.sync_before = std::mem::replace(&mut self.save_sync, SaveSync::Running);
         Task::perform(
             crate::sync::sync_retroarch(
                 self.client.clone(),

@@ -643,6 +643,8 @@ pub struct App {
     /// When the last sync of every save finished, or the one after a game did — what the sync
     /// card's "2 min ago" is counted from.
     save_synced_at: Option<std::time::Instant>,
+    /// How the sync before the one running ended, so the sync card goes on saying it meanwhile.
+    sync_before: SaveSync,
     /// Where Deckhand's own update stands — see [`crate::release`].
     release: crate::release::Status,
     /// The repository Deckhand's own releases are read from: [`crate::release::REPOSITORY`], or a
@@ -766,6 +768,7 @@ impl App {
             state_pictures_offered: false,
             save_sync: SaveSync::Idle,
             save_synced_at: None,
+            sync_before: SaveSync::Idle,
             release: crate::release::Status::Unasked,
             release_repository: crate::release::REPOSITORY,
             release_announced: None,

@@ -1231,6 +1231,9 @@ mod render {
             ..Default::default()
         }));
         snapshot(&app, "settings-saves-failing");
+        // A sync under way: the card as the last one left it, the icon turning.
+        app.sync_before = std::mem::replace(&mut app.save_sync, SaveSync::Running);
+        snapshot(&app, "settings-saves-syncing");
     }
 
     #[test]
@@ -2437,6 +2440,12 @@ fn a_save_sync_runs_once_at_a_time_and_its_answer_lands_on_the_page() {
     assert!(matches!(&app.save_sync, SaveSync::Done(r) if r.in_sync == 2));
     assert!(app.save_synced_at.is_some_and(|at| at.elapsed().as_secs() < 5), "the card counts its \"ago\" from now");
     assert!(matches!(&app.save_folder, Some(Ok(f)) if *f == folder));
+
+    // The next run keeps that one's outcome for the card to go on showing while it runs.
+    let _ = app.update(Message::SyncNow);
+    assert!(matches!(app.save_sync, SaveSync::Running));
+    assert!(matches!(&app.sync_before, SaveSync::Done(r) if r.in_sync == 2));
+    let _ = app.view();
 }
 
 fn release(version: &str) -> crate::release::Release {

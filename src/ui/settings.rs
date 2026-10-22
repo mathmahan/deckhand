@@ -354,6 +354,8 @@ pub struct SettingsContext<'a> {
     /// while it is being looked for.
     pub retroarch_found: Option<&'a Option<PathBuf>>,
     pub save_sync: &'a SaveSync,
+    /// How the sync before a running one ended — what the sync card shows while one runs.
+    pub sync_before: &'a SaveSync,
     /// How long ago the last sync finished, if one has this session.
     pub synced_ago: Option<Duration>,
     /// Where Deckhand's own update stands — see [`crate::release`].
@@ -483,26 +485,31 @@ fn heading<'a>(section: Section) -> Element<'a, Message> {
     .into()
 }
 
-/// The last sync, as a card beside the Saves heading: how it went and when, what it moved, the
-/// first thing that went wrong, and the button that runs it again — which X presses from anywhere
-/// in the section.
+/// The last sync, as a card beside the Saves heading: how it went and when, what it moved, and the
+/// button that runs it again — which X presses from anywhere in the section.
+///
+/// A sync running changes the icon alone: the card goes on saying how the one before it went until
+/// this one has something new to say, rather than emptying for the seconds it takes.
 fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
     let when = |prefix: &str| ctx.synced_ago.map(|ago| format!("{prefix} {}", ago_words(ago))).unwrap_or_default();
-    let (icon, tone, headline, under) = match ctx.save_sync {
-        SaveSync::Idle => (
+    let running = matches!(ctx.save_sync, SaveSync::Running);
+    let shown = if running { ctx.sync_before } else { ctx.save_sync };
+    let (icon, tone, headline, under) = match shown {
+        SaveSync::Idle | SaveSync::Running => (
             lucide::cloud(),
             theme::TEXT_SECONDARY,
             "Not synced yet".to_string(),
             "Sync now sends this device's saves up and brings RomM's down".to_string(),
         ),
-        SaveSync::Running => (lucide::refresh_cw(), theme::ACCENT_400, "Syncing…".to_string(), String::new()),
         SaveSync::Done(report) if !report.failed.is_empty() => {
             let n = report.failed.len();
             (lucide::cloud_alert(), theme::WARNING, format!("{n} save{} didn't sync", if n == 1 { "" } else { "s" }), when("Last tried"))
         }
         SaveSync::Done(_) => (lucide::cloud(), theme::IN_SYNC, "Everything is in sync".to_string(), when("Last synced")),
-        SaveSync::Failed(_) => (lucide::cloud_off(), theme::WARNING, "The sync didn't run".to_string(), when("Last tried")),
+        // Why it could not start — no RomM to sync with, say — is the one thing to say about it.
+        SaveSync::Failed(why) => (lucide::cloud_off(), theme::WARNING, "The sync didn't run".to_string(), truncated(why.clone(), 60)),
     };
+    let (icon, tone) = if running { (lucide::refresh_cw(), theme::ACCENT_400) } else { (icon, tone) };
     let badge = container(icon.size(17.0).color(tone)).center(Length::Fixed(34.0)).style(move |_| container::Style {
         background: Some(Background::Color(alpha(tone, 0.16))),
         border: Border { radius: 17.0.into(), ..Default::default() },
@@ -514,25 +521,13 @@ fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
     }
     let mut card = column![row![badge, top].spacing(12).align_y(Alignment::Center)].spacing(14);
 
-    // What the run moved, and what it says about it: the first failure, else whatever it set aside
-    // or found worth saying — the line that tells anyone the backups folder is there.
-    let (counts, note) = match ctx.save_sync {
-        SaveSync::Done(report) => {
-            let last = match report.failed.len() {
-                0 => (report.in_sync.to_string(), "already in step", theme::IN_SYNC),
-                n => (n.to_string(), "failed", theme::WARNING),
-            };
-            let counts = [(report.pushed.len().to_string(), "went up", theme::INK), (report.pulled.len().to_string(), "came down", theme::INK), last];
-            let note = match report.failed.first() {
-                Some(why) => Some((why.clone(), theme::WARNING)),
-                None => report.conflicts.first().or(report.removed.first()).or(report.notes.first()).map(|said| (said.clone(), theme::TEXT_SECONDARY)),
-            };
-            (Some(counts), note)
-        }
-        SaveSync::Failed(why) => (None, Some((why.clone(), theme::WARNING))),
-        _ => (None, None),
-    };
-    if let Some(counts) = counts {
+    // What the run moved, as counts. What each save went through is more than a line here can say.
+    if let SaveSync::Done(report) = shown {
+        let last = match report.failed.len() {
+            0 => (report.in_sync.to_string(), "already in step", theme::IN_SYNC),
+            n => (n.to_string(), "failed", theme::WARNING),
+        };
+        let counts = [(report.pushed.len().to_string(), "went up", theme::INK), (report.pulled.len().to_string(), "came down", theme::INK), last];
         let mut boxes = row![].spacing(8);
         for (value, label, ink) in counts {
             boxes = boxes.push(
@@ -548,13 +543,10 @@ fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
         }
         card = card.push(boxes);
     }
-    if let Some((words, ink)) = note {
-        card = card.push(text(truncated(words, 120)).size(13.0).color(ink));
-    }
 
-    let running = matches!(ctx.save_sync, SaveSync::Running);
-    let mut press = button(
-        row![crate::ui::tab_bar::glyph("X", true), text(if running { "Syncing…" } else { "Sync now" }).size(15.0).font(theme::BOLD)]
+    // Pressable while one runs as well: a second press is let go — see `App::sync_saves`.
+    let press = button(
+        row![crate::ui::tab_bar::glyph("X", true), text("Sync now").size(15.0).font(theme::BOLD)]
             .spacing(9)
             .align_y(Alignment::Center),
     )
@@ -565,10 +557,8 @@ fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
         border: Border { radius: 12.0.into(), ..Default::default() },
         shadow: Shadow::default(),
         snap: true,
-    });
-    if !running {
-        press = press.on_press(Message::SyncNow);
-    }
+    })
+    .on_press(Message::SyncNow);
     card = card.push(press);
 
     container(card)
@@ -659,7 +649,7 @@ fn hints<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
     if let Some(label) = press {
         line = line.push(hint("A", label));
     }
-    if ctx.focus.section() == Section::Saves && !matches!(ctx.save_sync, SaveSync::Running) {
+    if ctx.focus.section() == Section::Saves {
         line = line.push(hint("X", "Sync now"));
     }
     container(line).padding([0.0, crate::ui::tab_bar::MARGIN]).center_y(Length::Fixed(44.0)).into()
