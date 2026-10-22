@@ -45,32 +45,6 @@ pub fn glass_row(lit: bool, radius: f32) -> impl Fn(&Theme, Status) -> Style {
     }
 }
 
-/// A filter, sort or kind chip: filled with the accent when chosen, and ringed in white under the
-/// cursor — a ring in the accent disappeared into a chosen chip's accent fill.
-pub fn chip(selected: bool, lit: bool) -> impl Fn(&Theme, Status) -> Style {
-    move |_, status| {
-        let fill = if selected {
-            Some(theme::ACCENT)
-        } else if lit || hovered(status) {
-            Some(theme::FOCUS_FILL)
-        } else {
-            None
-        };
-        let ring = if lit {
-            theme::TEXT_PRIMARY
-        } else if selected {
-            theme::ACCENT
-        } else {
-            theme::BORDER
-        };
-        style(
-            fill,
-            if selected { Color::WHITE } else { theme::TEXT_SECONDARY },
-            Border { color: ring, width: if lit { 2.0 } else { 1.0 }, radius: 16.0.into() },
-        )
-    }
-}
-
 /// A key of an on-screen keyboard: filled with the accent under the cursor. `on` is a key held
 /// down — the shift, say — which keeps a fill of its own.
 pub fn key(lit: bool, on: bool) -> impl Fn(&Theme, Status) -> Style {

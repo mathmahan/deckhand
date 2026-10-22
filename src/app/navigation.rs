@@ -538,7 +538,8 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// The triggers: the next or the previous system, collection or Settings section.
+    /// The triggers: the next or the previous system or collection, Collections kind or Settings
+    /// section.
     pub(super) fn cycle_system(&mut self, delta: isize) -> Task<Message> {
         let Screen::Browsing(route) = &self.screen else { return Task::none() };
         // Settings has no system to step; the same keys walk its sections instead, which is
@@ -548,6 +549,16 @@ impl App {
                 return self.scroll_cursor_into_view();
             }
             return Task::none();
+        }
+        // Nor has Collections: they walk its kinds, the cursor staying in the band it is in.
+        if *route == Route::Collections {
+            let kinds = self.all_collections.kinds().len();
+            let to = self.collections_focus.kind.saturating_add_signed(delta).min(kinds.saturating_sub(1));
+            if to == self.collections_focus.kind || kinds == 0 {
+                return Task::none();
+            }
+            self.collections_focus.show(to);
+            return Task::batch([self.scroll_page_to_top(), self.fetch_art()]);
         }
         // A collection's grid steps through its kind's collections; anything else through
         // the systems, from the one it is showing.
