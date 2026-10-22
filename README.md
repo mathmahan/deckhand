@@ -6,68 +6,28 @@
 
 # Deckhand
 
-A gamepad-first companion for the [RomM](https://romm.app) ROM manager, built for the Steam Deck.
-Browse your library from the couch, download games onto the device, play them through [RetroDECK](https://retrodeck.net),
-and keep saves and save states in sync with your server.
+A gamepad-first companion for [RomM](https://romm.app) on the Steam Deck: browse your library from
+the couch, download games, play them through [RetroDECK](https://retrodeck.net), and keep your saves
+in sync.
 
 ![Home](screenshots/home.jpg)
 
+<p>
+  <img src="screenshots/library.jpg" width="49%" alt="Library">
+  <img src="screenshots/game.jpg" width="49%" alt="A game's page">
+</p>
+
 ## Features
 
-- **Pairing without a keyboard.** Scan a QR code with your phone and approve Deckhand in RomM, or
-  type a pairing code.
-- **Home.** A spotlight on the game under the cursor, starting with the last one played; press A
-  on any game to view its page, where it's played, downloaded and its saves are. Below it are
-  sections for *Continue playing*, *On this device*, your RomM *Now playing*.
-- **Library and Collections.** Every system or collection as a cover grid, with filters, sorting and
-  an A–Z jump. Your favourites and your own collections are a chip each, and RomM's genres,
-  franchises and series are browsable across systems.
-- **Search.** Ranked search across every system, by title and by other names, so `ff7` finds
-  *Final Fantasy VII*. An on-screen keyboard makes it work with a gamepad.
-- **Game pages.** Art, rating, How Long to Beat, regions and builds, and the game's
-  RetroAchievements, with the ones you have earned marked. *Favourite* marks it in RomM.
-- **Downloads.** A queue that survives restarts, unpacks archives, writes an `.m3u` for multi-disc
-  games and fetches the BIOS. A game's update and DLC come with it, and its other extras on RomM
-  (a manual, a hack, a translation) are on its page under *Extras*. Games can go to any drive (an
-  SD card, for instance), with an optional space budget. Games already in the folder are found and
-  count as downloaded. With RomM 5.4 and a QR pairing, a game can be sent to the Deck from RomM's
-  web app with *Install on device*.
-- **Playing.** Games start through [RetroDECK](https://retrodeck.net), a command of your own, or an emulator picked per
-  system, such as a PCSX2 you installed yourself. They can resume from their newest save state, and
-  *Resume from the newest state* decides that for the games Deckhand starts, whatever RetroArch's
-  own *Auto Load State* is set to. RomM 5.4's web app shows the game as being played on the Deck.
-- **Save sync.** Saves and save states sync both ways through RomM: around every launch, and while
-  the window is open, as soon as a save changes. An older save can be restored from a game's Saves
-  page, and a save state there put into a slot. See [Save sync](#save-sync) for what each system syncs.
-- **Steam and ES-DE.** Downloaded games can be added to Steam with their art, and still sync when
-  started there. Games started from ES-DE sync too, through hooks Deckhand installs. Add Deckhand
-  itself to Steam as a non-Steam game and it gives itself a cover, banner, logo and backdrop.
-- **Made for a gamepad.** The d-pad reaches every page and button, and L1/R1 move between tabs.
-- **Updates itself** from this repository's releases.
+- Pair by QR code, no keyboard needed
+- Every system and RomM collection as a cover grid, and search across them all
+- Downloads to any drive, with multi-disc games, BIOS, updates and DLC taken care of
+- Play through RetroDECK, or an emulator of your own for each system
+- Saves and save states synced both ways, around every launch and as they change
+- Add games to Steam; games started from ES-DE sync too
+- Made for a gamepad, and updates itself
 
 ## Save sync
-
-Saves go through [argosy-sigil](https://github.com/rommapp/argosy-sigil), RomM's own save library:
-it reads each game's id off its disc and finds that game's saves in the emulator's folders, even on a
-memory card every game shares. A game's saves travel as one file in its `autosave` slot, in the same
-shape RomM's Android app syncs. Saves put on RomM by earlier versions of Deckhand are read and moved
-over on each game's first sync. A client that keeps a game's save in a slot of its own, such as
-`battery`, is followed there: like RomM's web player, Deckhand goes on in whichever slot holds the
-newest version of the save, and leaves the slot it came from as it is.
-
-Save states are RetroArch's slots, one to one: slot 0, every numbered slot however many there are,
-and the auto slot are each one state on RomM, under a name that says the slot and the core. Saving
-into a slot again replaces its state on RomM, so a slot is the same on every device that runs the
-game under that core. Deckhand never deletes a save state on RomM; that is yours to do, on RomM's
-own pages, and a state deleted on either side is not brought back by the other. A state on RomM that
-is in no slot here, such as one saved in RomM's web player, can be put into one from the game's Saves
-page.
-
-A state's picture goes with it both ways, but RetroArch only takes one when its *Save State
-Thumbnails* setting is on, and RetroDECK ships it off. Deckhand offers to turn it on the first time a
-state goes up without a picture, and Settings ▸ Saves ▸ *State pictures* does it any time, while
-RetroArch is closed. An override of RetroArch's that turns them off again for a core or a game is
-named there, not edited.
 
 | Platform | Emulator | What syncs |
 |---|---|---|
@@ -84,83 +44,27 @@ named there, not edited.
 | Switch | Ryubing, Eden | ✅ Saves, each user's and the ones the console shares, which move between the two |
 | Xbox, Xbox 360 | — | ❌ Not synced yet |
 
-Neither Eden or Ryubing ships with RetroDECK, so you need to configure the one you have installed in
-*Emulator for each system* in *Settings*.
-
-Upload the Switch's `prod.keys`, `title.keys` and a firmware zip to RomM's Switch platform, and
-Deckhand puts them where that emulator reads them when a Switch game is downloaded or started. It
-lays them out the way the emulator's own installer does. Keys or firmware you installed yourself
-stay as they are, and nothing changes while the emulator runs.
-
-![Browse](screenshots/browse.jpg)
+For Switch, pick Eden or Ryubing in Settings ▸ Playing ▸ *Emulator for each system*. Keys and
+firmware uploaded to RomM's Switch platform are put in place for it.
 
 ## Getting started
 
-Download the AppImage (Linux, Steam Deck) from
-[Releases](https://github.com/mathmahan/deckhand/releases), then run it:
-
-```sh
-chmod +x Deckhand-*-x86_64.AppImage
-./Deckhand-*-x86_64.AppImage
-```
-
-You need a [RomM](https://docs.romm.app) server, 5.3 or later for QR pairing. To see which version
-yours runs:
-
-```sh
-curl -s https://romm.example.com/api/heartbeat | jq -r .SYSTEM.VERSION
-```
-
-Games play through [RetroDECK](https://retrodeck.net). Once Deckhand is paired with your RomM, it
-offers to install RetroDECK from Flathub when it isn't there, then opens it once for its own setup.
-It does the same from Settings ▸ Playing ▸ *Default emulator*, and when a game has nothing to start
-it with. To install it yourself instead, then open it once to set it up:
-
-```sh
-flatpak install flathub net.retrodeck.retrodeck
-```
-
-To assign a system its own emulator, such as a PCSX2 you installed yourself, use Settings ▸ Playing ▸
-*Emulator for each system*. Choose the emulator (a program, an AppImage, or a Flatpak) and
-Deckhand fills in the usual options for it:
-
-```sh
-# PlayStation 2, with the PCSX2 AppImage
-/home/deck/Applications/pcsx2-v2.2.0-linux-appimage-x64-Qt.AppImage -batch {rom}
-
-# GameCube, with the Dolphin Flatpak
-/var/lib/flatpak/exports/bin/org.DolphinEmu.dolphin-emu -b -e {rom}
-
-# Switch, with the Eden AppImage
-/home/deck/Applications/Eden-Linux-v0.2.0-amd64.AppImage -f -g {rom}
-```
-
-A Flatpak only sees the folders it was granted, and some are granted none of yours. So Deckhand
-starts one with access to the game's folder for that launch (`flatpak run --filesystem=…`), and a
-game on an SD card opens without a `flatpak override`.
-
-Saves sync for RetroArch, and standalone emulators: PCSX2, DuckStation, Dolphin, PPSSPP, RPCS3, Vita3K, Azahar,
-Cemu, Ryubing and Eden — see [Save sync](#save-sync).
+Download the AppImage from [Releases](https://github.com/mathmahan/deckhand/releases) and run it. You
+need a [RomM](https://docs.romm.app) server, 5.3 or later for QR pairing. Deckhand offers to install
+RetroDECK when it isn't there.
 
 ## Building
 
-Save sync is built on [argosy-sigil](https://github.com/rommapp/argosy-sigil), a C library kept as a
-git submodule, so a build needs it checked out, and CMake and a C compiler to build it:
-
 ```sh
-git submodule update --init --recursive
-cargo run                      # the app
-cargo run -- --fixtures=60     # 60 made-up games, no server needed
+git submodule update --init --recursive   # argosy-sigil: needs CMake and a C compiler
+cargo run -- --fixtures=60                # made-up games, no server needed
 cargo test
-packaging/build-appimage.sh    # AppImage, built in Docker
-packaging/build-windows.sh     # Windows .exe, cross-compiled in Docker
+packaging/build-appimage.sh
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Releases up to and including 0.9.4 were published under GPL-3.0, and
-stay under it. DM Sans and Space Grotesk are under the SIL OFL 1.1
-([DM Sans](fonts/OFL.txt), [Space Grotesk](fonts/OFL-SpaceGrotesk.txt)) and the Lucide icons under
-ISC. Bundled game data is credited in [ATTRIBUTIONS.md](ATTRIBUTIONS.md). The AppImage carries the
-notices of everything built into it in `usr/share/doc/deckhand/THIRD-PARTY-LICENSES.md`, which
-[packaging/licences.sh](packaging/licences.sh) writes from `Cargo.lock` and the files above.
+MIT — see [LICENSE](LICENSE); releases up to and including 0.9.4 stay under GPL-3.0. DM Sans and
+Space Grotesk are under the SIL OFL 1.1 ([DM Sans](fonts/OFL.txt),
+[Space Grotesk](fonts/OFL-SpaceGrotesk.txt)), the Lucide icons under ISC, and bundled game data is
+credited in [ATTRIBUTIONS.md](ATTRIBUTIONS.md).
