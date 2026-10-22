@@ -100,7 +100,10 @@ yours runs:
 curl -s https://romm.example.com/api/heartbeat | jq -r .SYSTEM.VERSION
 ```
 
-Games play through [RetroDECK](https://retrodeck.net). Install it from Flathub, then open it once to set it up:
+Games play through [RetroDECK](https://retrodeck.net). Once Deckhand is paired with your RomM, it
+offers to install RetroDECK from Flathub when it isn't there, then opens it once for its own setup.
+It does the same from Settings ▸ Playing ▸ *Default emulator*, and when a game has nothing to start
+it with. To install it yourself instead, then open it once to set it up:
 
 ```sh
 flatpak install flathub net.retrodeck.retrodeck

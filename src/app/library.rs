@@ -315,6 +315,8 @@ impl App {
                 if !matches!(self.screen, Screen::Browsing(_)) {
                     self.screen = Screen::Browsing(Route::Home);
                 }
+                // The first library after a pairing: the moment to offer RetroDECK, if it is not here.
+                let offer = if std::mem::take(&mut self.offer_retrodeck) { self.look_for_retrodeck(Offering::Pairing) } else { Task::none() };
                 // RomM's smart and generated collections move with the library: asked again with
                 // every load, so the Collections page is current by the time it is opened — and kept
                 // on screen until the new answer lands.
@@ -333,6 +335,7 @@ impl App {
                     self.load_awarded(),
                     self.ensure_device(),
                     self.claim_installs(),
+                    offer,
                 ])
             }
         }

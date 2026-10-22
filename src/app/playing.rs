@@ -123,6 +123,7 @@ impl App {
                     }
                 };
                 let title = self.title_of(rom_id);
+                let no_emulator = matches!(&result, Err(why) if why == crate::launch::NO_EMULATOR);
                 let words = match result {
                     Err(why) => format!("\"{title}\" could not be launched: {why}."),
                     Ok(session) => {
@@ -150,8 +151,10 @@ impl App {
                     }
                 };
                 self.say(words);
+                // Nothing to start it with: RetroDECK is offered, where it can be installed.
+                let offer = if no_emulator { self.look_for_retrodeck(Offering::NoEmulator) } else { Task::none() };
                 // Back to the front for the result. A compositor may refuse; then it is one click away.
-                Task::batch([iced::window::latest().and_then(iced::window::gain_focus), refresh])
+                Task::batch([iced::window::latest().and_then(iced::window::gain_focus), refresh, offer])
             }
         }
     }

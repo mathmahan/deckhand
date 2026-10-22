@@ -29,6 +29,7 @@ mod playing;
 mod processes;
 mod qr_pairing;
 mod release;
+mod retrodeck;
 mod search;
 mod sigil;
 mod steam;
