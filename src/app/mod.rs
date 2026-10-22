@@ -51,6 +51,7 @@ mod pickers;
 mod playing;
 mod queue;
 mod release;
+mod retrodeck;
 mod settings;
 mod view;
 #[cfg(test)]
@@ -304,6 +305,10 @@ pub enum Message {
     // Playing
     /// News from a running launch: the game has started, or it is over — see [`crate::launch`].
     LaunchEvent(crate::launch::Event),
+    /// Where RetroDECK stands on this device, read for an offer to install it — see [`crate::retrodeck`].
+    RetroDeckLooked(Offering, crate::retrodeck::Look),
+    /// News from RetroDECK's install, or its first-run setup.
+    RetroDeckEvent(crate::retrodeck::Event),
     /// The window is asked to close by a signal: Steam's *Exit game* on Deckhand's own shortcut, or
     /// the session ending — see [`App::stop_asked`].
     StopAsked,
@@ -550,6 +555,12 @@ pub struct App {
     entry: Option<PendingEntry>,
     /// Whether RetroDECK is installed, as Settings last looked.
     retrodeck: bool,
+    /// RetroDECK being installed, or open for its first-run setup — see [`crate::retrodeck`].
+    retrodeck_setup: RetroDeckSetup,
+    /// How to stop RetroDECK's install while it runs.
+    retrodeck_cancel: Option<crate::retrodeck::Cancel>,
+    /// Paired just now: once the library is in, RetroDECK is offered if it is not here.
+    offer_retrodeck: bool,
     /// Which of this device's games are in Steam's library — see [`crate::steam`].
     steam_bindings: crate::steam::Bindings,
     /// Whether Steam is installed, as Settings last looked.
@@ -699,6 +710,9 @@ impl App {
             pick: None,
             entry: None,
             retrodeck: fixtures.is_none() && crate::launch::RetroDeck::detect().is_some(),
+            retrodeck_setup: RetroDeckSetup::Idle,
+            retrodeck_cancel: None,
+            offer_retrodeck: false,
             steam_bindings: crate::steam::Bindings::load(),
             steam_found: false,
             watcher: crate::watch::Watcher::default(),
@@ -1396,8 +1410,35 @@ enum Then {
     Steam { games: Vec<i64>, add: bool },
     /// Put the extra chosen of the build `rom_id` on this device, or take it off when it is here.
     Extras { rom_id: i64, extras: Vec<Extra> },
+    /// Install RetroDECK into this installation, or set up the one here: the first row says yes.
+    RetroDeck(Option<crate::retrodeck::Scope>),
+    /// Stop RetroDECK's install: the first row says yes.
+    StopRetroDeck,
+    /// Install ES-DE's hooks: the first row says yes.
+    EsDeHooks,
     /// Turn RetroArch's state pictures on: the first row says yes, the second no for good.
     StatePictures,
+}
+
+/// Where RetroDECK's install has got — see [`crate::retrodeck`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RetroDeckSetup {
+    Idle,
+    /// Before `flatpak` has said anything, its progress is None.
+    Installing(Option<crate::retrodeck::Progress>),
+    /// Installed and open for its first-run setup, which has the screen and the pad.
+    SettingUp,
+}
+
+/// What an offer of RetroDECK answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offering {
+    /// A pairing just made: offered when there is something to offer, and nothing said otherwise.
+    Pairing,
+    /// A game that could not start for want of an emulator.
+    NoEmulator,
+    /// The player asked, from Settings.
+    Asked,
 }
 
 /// One of a build's extras, as its game's page offers it.

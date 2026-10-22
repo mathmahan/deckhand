@@ -154,7 +154,23 @@ impl App {
                     self.say("The default emulator is now RetroDECK.".into());
                     Task::none()
                 }
-                _ => self.type_launch_command(),
+                1 => self.type_launch_command(),
+                _ => self.look_for_retrodeck(Offering::Asked),
+            },
+            Then::RetroDeck(scope) => match (chosen, scope) {
+                (0, Some(scope)) => self.install_retrodeck(scope),
+                (0, None) => self.set_up_retrodeck(),
+                _ => Task::none(),
+            },
+            Then::StopRetroDeck => {
+                if chosen == 0 {
+                    self.stop_retrodeck();
+                }
+                Task::none()
+            }
+            Then::EsDeHooks => match chosen {
+                0 => self.activate_setting(SettingRow::EsDeHooks),
+                _ => Task::none(),
             },
             Then::SystemEmulators { systems } => match systems.get(chosen) {
                 Some(system) => self.pick_emulator_for(system.clone()),
@@ -288,7 +304,7 @@ impl App {
         use crate::ui::picker::Row;
         let custom = self.settings.launch_command.as_deref().filter(|c| !c.is_empty());
         let in_use = |on: bool| on.then(|| "in use".to_string());
-        let rows = vec![
+        let mut rows = vec![
             Row {
                 label: "RetroDECK".into(),
                 detail: "Uses the emulator you set up in RetroDECK for each system and game".into(),
@@ -302,6 +318,15 @@ impl App {
                 mark: in_use(custom.is_some()),
             },
         ];
+        // Only once paired: without a RomM there is nothing for RetroDECK to play.
+        if !self.retrodeck && self.retrodeck_setup == RetroDeckSetup::Idle && self.settings.connection.is_some() {
+            rows.push(Row {
+                label: "Install RetroDECK…".into(),
+                detail: "From Flathub, or set up the one that is here".into(),
+                aside: String::new(),
+                mark: None,
+            });
+        }
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
                 title: "Default emulator".into(),

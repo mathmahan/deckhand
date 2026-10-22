@@ -513,6 +513,7 @@ impl App {
                     release: &self.release,
                     appimage: self.appimage.is_some(),
                     retrodeck: self.retrodeck,
+                    retrodeck_setup: self.retrodeck_progress().map(|words| (words, matches!(self.retrodeck_setup, RetroDeckSetup::Installing(_)))),
                     steam: self.steam_found.then(|| {
                         let here = self.downloads.installed_ids();
                         let host = self.host();

@@ -52,6 +52,10 @@ use crate::sync::{self, Report};
 /// RetroDECK's Flatpak id.
 pub const RETRODECK: &str = "net.retrodeck.retrodeck";
 
+/// Why a game cannot start on a device with neither RetroDECK nor an emulator of the player's own —
+/// which the window answers by offering to install RetroDECK.
+pub const NO_EMULATOR: &str = "no emulator is set up for it — install RetroDECK, or choose an emulator in Settings ▸ Playing";
+
 /// The ES-DE system a RomM platform slug is, which is the name RetroDECK knows it by.
 ///
 /// The two mostly agree; these are the ones that do not, from the Kotlin app's `romFolderFor`. It
@@ -208,10 +212,7 @@ impl Launcher {
         if let Some(command) = own.into_iter().find(|c| !c.is_empty()) {
             return Ok(Launcher::Custom(command.clone()));
         }
-        RetroDeck::detect().map(Launcher::RetroDeck).ok_or_else(|| {
-            "no emulator is set up for it — install RetroDECK, or choose an emulator in Settings ▸ Playing"
-                .to_string()
-        })
+        RetroDeck::detect().map(Launcher::RetroDeck).ok_or_else(|| NO_EMULATOR.to_string())
     }
 
     /// The argv that plays `rom` as `system`.

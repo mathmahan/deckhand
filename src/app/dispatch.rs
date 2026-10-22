@@ -86,6 +86,8 @@ impl App {
                     self.say(format!("Paired, but the settings file could not be written: {e}"));
                 }
                 self.screen = Screen::Loading { status: "Loading your library…".into() };
+                // Paired: once the library is in, RetroDECK is offered if it is not here.
+                self.offer_retrodeck = true;
                 Task::batch([Task::done(Message::LoadLibrary), self.ensure_device()])
             }
             Message::DeviceReady(id) => {
@@ -215,9 +217,9 @@ impl App {
             }
             Message::Pad(pad) => {
                 use crate::gamepad::Pad;
-                // A game has the pad while it runs. Without this every button pressed in the game
-                // would also walk the grid behind it.
-                if self.playing.is_some() {
+                // A game has the pad while it runs, and RetroDECK while it is open for its setup.
+                // Without this every button pressed there would also walk the grid behind it.
+                if self.playing.is_some() || self.retrodeck_setup == RetroDeckSetup::SettingUp {
                     return Task::none();
                 }
                 let message = match pad {
@@ -908,6 +910,8 @@ impl App {
                 Task::none()
             }
             Message::LaunchEvent(event) => self.on_launch_event(event),
+            Message::RetroDeckLooked(offering, look) => self.offer_retrodeck(offering, look),
+            Message::RetroDeckEvent(event) => self.on_retrodeck_event(event),
             Message::StopAsked => self.stop_asked(),
             // Answered in `update`, before dispatch; one arriving with nothing waiting is stale.
             Message::ConflictChosen(_) => Task::none(),

@@ -345,6 +345,9 @@ pub struct SettingsContext<'a> {
     pub appimage: bool,
     /// Whether RetroDECK is installed.
     pub retrodeck: bool,
+    /// RetroDECK's install or first-run setup while one runs, as its row says it, and whether the
+    /// row stops it.
+    pub retrodeck_setup: Option<(String, bool)>,
     /// How many of the downloaded games are in Steam's library, of how many — None without Steam.
     pub steam: Option<(usize, usize)>,
     /// Where ES-DE's hooks stand. None while it is being read.
@@ -571,6 +574,13 @@ fn value<'a>(setting: Row, ctx: &SettingsContext<'_>, lit: bool) -> Vec<Element<
         ],
         Row::Launcher => match ctx.settings.launch_command.as_deref().filter(|c| !c.is_empty()) {
             Some(words) => vec![value_text(crate::launch::join_command(words), Tone::Plain), action_chip("Change", lit, false)],
+            None if let Some((words, stops)) = &ctx.retrodeck_setup => {
+                let mut row = vec![value_text(words.clone(), Tone::Accent)];
+                if *stops {
+                    row.push(action_chip("Stop", lit, true));
+                }
+                row
+            }
             None if ctx.retrodeck => vec![value_text("RetroDECK".to_string(), Tone::Plain), action_chip("Change", lit, false)],
             None => vec![value_text("RetroDECK · not installed".to_string(), Tone::Warn), action_chip("Change", lit, false)],
         },

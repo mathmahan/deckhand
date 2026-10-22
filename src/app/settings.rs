@@ -47,6 +47,8 @@ impl App {
             // Ask, install or restart, whichever is next.
             SettingRow::Updates => self.press_updates(),
             SettingRow::SignOut => self.update(Message::SignOut),
+            // While RetroDECK installs, its row is how the install is stopped.
+            SettingRow::Launcher if matches!(self.retrodeck_setup, RetroDeckSetup::Installing(_)) => self.ask_to_stop_retrodeck(),
             SettingRow::Launcher => self.pick_launcher(),
             SettingRow::SystemEmulators => self.pick_system_emulators(),
             SettingRow::SteamLibrary => self.add_all_to_steam(),
