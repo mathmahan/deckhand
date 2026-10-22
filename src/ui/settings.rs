@@ -86,7 +86,7 @@ impl Section {
         match self {
             Section::Server => "The RomM server your library lives on, and this device's place on it.",
             Section::Playing => "Which emulator starts a game, and how it picks up where you left off.",
-            Section::Saves => "Battery saves and states kept in step with RomM, so a game picks up where it was left on any device.",
+            Section::Saves => "Battery saves and states are kept in sync with RomM, so a game picks up where it was left on any device.",
             Section::Display => "How large the page is drawn, and how many covers a row holds.",
             Section::Storage => "Where downloads go, how much room they may take, and what is kept on this device.",
             Section::About => "This build of Deckhand, its updates, and where its settings are kept.",
@@ -524,7 +524,7 @@ fn sync_card<'a>(ctx: &SettingsContext<'_>) -> Element<'a, Message> {
     // What the run moved, as counts. What each save went through is more than a line here can say.
     if let SaveSync::Done(report) = shown {
         let last = match report.failed.len() {
-            0 => (report.in_sync.to_string(), "already in step", theme::IN_SYNC),
+            0 => (report.in_sync.to_string(), "already in sync", theme::IN_SYNC),
             n => (n.to_string(), "failed", theme::WARNING),
         };
         let counts = [(report.pushed.len().to_string(), "went up", theme::INK), (report.pulled.len().to_string(), "came down", theme::INK), last];
