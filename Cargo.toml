@@ -1,6 +1,6 @@
 [package]
 name = "deckhand"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2024"
 rust-version = "1.93"  # edition 2024; sevenz-rust2 0.23 requires 1.93
 description = "A gamepad-first desktop companion for the RomM ROM manager — Rust/iced port"
