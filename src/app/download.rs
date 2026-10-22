@@ -300,8 +300,6 @@ impl App {
             Action::Saves => self.update(Message::OpenSaves(rom_id)),
             Action::Extras => self.press_extras(rom_id),
             Action::Favourite => self.toggle_favourite(rom_id),
-            // This returned a reason above.
-            Action::LaunchWith => Task::none(),
         }
     }
 }

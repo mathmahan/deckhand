@@ -54,8 +54,7 @@ impl App {
                 // it was.
                 crate::focus::BrowseZone::Chips | crate::focus::BrowseZone::Rail => Task::none(),
             },
-            // The detail page's cursor is one row of buttons, always on screen.
-            Route::Detail { .. } => Task::none(),
+            Route::Detail { .. } => self.reveal_detail_cursor(),
             Route::Saves { rom_id, .. } => {
                 let row = self.saves_focus.row(self.saves_rows(*rom_id));
                 // Under the heading and the tabs, the list has most of the page.
@@ -185,33 +184,7 @@ impl App {
                     Task::none()
                 }
             }
-            Route::Detail { .. } => {
-                // The detail page's cursor is its action row, which is one-dimensional.
-                let last = self.detail_actions().len().saturating_sub(1);
-                match direction {
-                    Direction::Left => {
-                        self.detail_focus.action = self.detail_focus.action.min(last).saturating_sub(1)
-                    }
-                    Direction::Right => {
-                        self.detail_focus.action = (self.detail_focus.action + 1).min(last)
-                    }
-                    // At the page's top, Up goes on to the tab bar.
-                    Direction::Up if self.detail_offset <= 0.5 => {
-                        self.up_stopped = true;
-                        return Task::none();
-                    }
-                    // Up and Down read the page — the description, the screenshots, the
-                    // achievements below the action row — a few lines at a time.
-                    Direction::Up | Direction::Down => {
-                        let step = if direction == Direction::Down { 160.0 } else { -160.0 };
-                        return iced::widget::operation::scroll_by(
-                            crate::ui::detail::detail_id(),
-                            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: step },
-                        );
-                    }
-                }
-                Task::none()
-            }
+            Route::Detail { .. } => self.navigate_detail(direction),
             Route::Search { .. } => {
                 let results = self.search_results().len();
                 if self.search_focus.step(direction, results) {
@@ -335,13 +308,7 @@ impl App {
                     BrowseZone::SystemList => self.leave_system_list(&scope),
                 }
             }
-            Route::Detail { .. } => {
-                let actions = self.detail_actions();
-                match actions.get(self.detail_focus.action.min(actions.len().saturating_sub(1))) {
-                    Some(action) => self.update(Message::DetailAction(*action)),
-                    None => Task::none(),
-                }
-            }
+            Route::Detail { .. } => self.activate_detail(),
             // An in-game save offers to come back; a state says where it is.
             Route::Saves { rom_id, .. } => self.press_save(rom_id),
             Route::Search { .. } => {

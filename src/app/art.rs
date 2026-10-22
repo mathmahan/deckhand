@@ -55,10 +55,26 @@ impl App {
                     if let Some(path) = &game.marquee_path {
                         wanted.push((self.asset_url(path), covers::Target::tall(px(420.0)), covers::Kind::Backdrop));
                     }
-                    for shot in game.screenshots.iter().take(8) {
-                        wanted.push((shot.clone(), covers::Target::tall(px(128.0)), covers::Kind::Art));
+                    for shot in game.screenshots.iter().take(crate::ui::detail::SHOTS_SHOWN) {
+                        wanted.push((shot.clone(), covers::Target::tall(px(crate::ui::detail::SCREENSHOT_H)), covers::Kind::Art));
                     }
-                    if let Some(Ok(game)) = self.achievements.get(rom_id) {
+                    // The screenshot open over the window, fitted to it, and those either side
+                    // ahead of a step.
+                    if let Some(index) = self.detail_focus.viewing {
+                        let shots = crate::ui::detail::shown_shots(game, &self.covers);
+                        let (side, end) = crate::ui::detail::VIEWER_MARGIN;
+                        let (w, h) = ((self.content_width - 2.0 * side).max(1.0), (self.content_height - 2.0 * end).max(1.0));
+                        let fitted = covers::Target { height_px: px(h), box_ratio: Some(w / h) };
+                        for i in [Some(index), index.checked_sub(1), Some(index + 1)].into_iter().flatten() {
+                            if let Some(url) = shots.get(i) {
+                                wanted.push(((*url).clone(), fitted, covers::Kind::Full));
+                            }
+                        }
+                    }
+                    // The badges only while the list showing them is open.
+                    if self.achievements_open
+                        && let Some(Ok(game)) = self.achievements.get(rom_id)
+                    {
                         for achievement in game.list.iter().take(crate::ui::detail::ACHIEVEMENTS_SHOWN) {
                             if let Some(url) = crate::ui::detail::achievement_badge(achievement, game.locked(achievement), self.host()) {
                                 wanted.push((url, covers::Target::tall(px(crate::ui::detail::BADGE)), covers::Kind::Art));

@@ -40,6 +40,7 @@ use crate::ui::tab_bar::{tab_bar, Tab};
 
 mod art;
 mod browse;
+mod detail;
 mod dispatch;
 mod download;
 mod extras;
@@ -133,6 +134,15 @@ pub enum Message {
     /// Scroll the grid to a letter's first game, and put the cursor on it.
     JumpToLetter(usize),
     DetailAction(crate::ui::detail::Action),
+    /// Open the page's screenshot at this place in its row over the whole window, or step the one
+    /// open to it.
+    ViewShot(usize),
+    CloseShot,
+    /// Open the achievements' list under its heading, or fold it away.
+    ToggleAchievements,
+    /// A step up the detail page toward the top of the row the cursor is on: where it scrolled to,
+    /// or None once that top was in view, and the cursor goes on up to the row above.
+    DetailClimbed(Option<f32>),
     Nav(Direction),
     /// The window's size, as iced reports it — divided by the system's scale *and* by the scale this
     /// app gave it. From a resize, or from asking. The grid geometry follows its width, and the row
@@ -449,6 +459,9 @@ pub struct App {
     collections_scroll: f32,
     browse_focus: crate::focus::BrowseFocus,
     detail_focus: crate::ui::detail::DetailFocus,
+    /// The achievements' list is open on game pages. For the session, across games: someone who
+    /// opens it on one is reading them, and finds it open on the next.
+    achievements_open: bool,
     /// The Browse page's filter and sort, kept across systems: they are a way of *reading* a
     /// library, not a property of one system, so walking to the next system keeps your view.
     filter: crate::view_model::Filter,
@@ -673,6 +686,7 @@ impl App {
             collections_scroll: 0.0,
             browse_focus: Default::default(),
             detail_focus: Default::default(),
+            achievements_open: false,
             filter: Default::default(),
             sort: Default::default(),
             favourites: Default::default(),
@@ -1167,6 +1181,11 @@ impl App {
         }
         if self.pick.is_some()
             && let Some(answer) = self.answer_pick(&message)
+        {
+            return answer;
+        }
+        if self.shot_open().is_some()
+            && let Some(answer) = self.answer_viewer(&message)
         {
             return answer;
         }

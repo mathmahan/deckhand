@@ -40,6 +40,20 @@ pub fn reveal_across(scrollable: Id, left: f32, right: f32, margin: f32) -> Task
     iced::advanced::widget::operate(Reveal { axis: Axis::Horizontal, scrollable, top: left, bottom: right, margin, found: None })
 }
 
+/// [`reveal`] for a part of a page whose place is the layout's to say rather than a sum — one under
+/// text that wraps to however many lines the window gives it: the container `part`, found and
+/// measured in the same pass as the scrollable it is in.
+pub fn reveal_part(scrollable: Id, part: Id, margin: f32) -> Task<f32> {
+    iced::advanced::widget::operate(RevealPart { measure: Measure::new(scrollable, part), margin })
+}
+
+/// Up toward the top of the container `part`, `step` at a time: while its top is above the view,
+/// scroll by as much as `step` and produce where to — `Some` — and once it is in view, move nothing
+/// and produce `None`. How a list longer than the screen is read back up before the cursor leaves it.
+pub fn climb(scrollable: Id, part: Id, step: f32, margin: f32) -> Task<Option<f32>> {
+    iced::advanced::widget::operate(Climb { measure: Measure::new(scrollable, part), step, margin })
+}
+
 /// The smallest move of a viewport `len` tall, now at `offset`, that shows `top..bottom` with
 /// `margin` clear on either side. When the span cannot fit, its top wins: the top of a row is the
 /// part that says what it is.
@@ -92,21 +106,132 @@ impl Operation<f32> for Reveal {
     fn finish(&self) -> Outcome<f32> {
         let Some((offset, len)) = self.found else { return Outcome::None };
         match offset_to_reveal(self.top, self.bottom, offset, len, self.margin) {
-            Some(offset) => Outcome::Chain(Box::new(ScrollTo { axis: self.axis, scrollable: self.scrollable.clone(), offset })),
+            Some(offset) => Outcome::Chain(Box::new(ScrollTo { axis: self.axis, scrollable: self.scrollable.clone(), offset, report: |offset| offset })),
             None => Outcome::None,
         }
     }
 }
 
+/// Where a scrollable is and how much of it shows, and where a container inside it is — read in one
+/// pass over the interface.
+struct Measure {
+    scrollable: Id,
+    part: Id,
+    /// The scrollable's offset, its viewport's height, and the top of its content on screen.
+    view: Option<(f32, f32, f32)>,
+    /// The part's top and bottom, on screen as laid out — before the scrollable's offset moves it.
+    span: Option<(f32, f32)>,
+}
+
+impl Measure {
+    fn new(scrollable: Id, part: Id) -> Self {
+        Self { scrollable, part, view: None, span: None }
+    }
+
+    fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, content_bounds: Rectangle, translation: Vector) {
+        if id == Some(&self.scrollable) {
+            self.view = Some((translation.y, bounds.height, content_bounds.y));
+        }
+    }
+
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        if id == Some(&self.part) {
+            self.span = Some((bounds.y, bounds.y + bounds.height));
+        }
+    }
+
+    /// The offset, the viewport's height, and the part's top and bottom in the content's own
+    /// coordinates — what [`offset_to_reveal`] reads.
+    fn read(&self) -> Option<(f32, f32, f32, f32)> {
+        let (offset, len, origin) = self.view?;
+        let (top, bottom) = self.span?;
+        Some((offset, len, top - origin, bottom - origin))
+    }
+}
+
+struct RevealPart {
+    measure: Measure,
+    margin: f32,
+}
+
+impl Operation<f32> for RevealPart {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<f32>)) {
+        operate(self);
+    }
+
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        self.measure.container(id, bounds);
+    }
+
+    fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, content_bounds: Rectangle, translation: Vector, _state: &mut dyn Scrollable) {
+        self.measure.scrollable(id, bounds, content_bounds, translation);
+    }
+
+    fn finish(&self) -> Outcome<f32> {
+        let Some((offset, len, top, bottom)) = self.measure.read() else { return Outcome::None };
+        match offset_to_reveal(top, bottom, offset, len, self.margin) {
+            Some(offset) => Outcome::Chain(Box::new(ScrollTo {
+                axis: Axis::Vertical,
+                scrollable: self.measure.scrollable.clone(),
+                offset,
+                report: |offset| offset,
+            })),
+            None => Outcome::None,
+        }
+    }
+}
+
+struct Climb {
+    measure: Measure,
+    step: f32,
+    margin: f32,
+}
+
+impl Operation<Option<f32>> for Climb {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
+        operate(self);
+    }
+
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        self.measure.container(id, bounds);
+    }
+
+    fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, content_bounds: Rectangle, translation: Vector, _state: &mut dyn Scrollable) {
+        self.measure.scrollable(id, bounds, content_bounds, translation);
+    }
+
+    fn finish(&self) -> Outcome<Option<f32>> {
+        let Some((offset, _, top, _)) = self.measure.read() else { return Outcome::None };
+        match climb_to(top, offset, self.step, self.margin) {
+            Some(offset) => Outcome::Chain(Box::new(ScrollTo {
+                axis: Axis::Vertical,
+                scrollable: self.measure.scrollable.clone(),
+                offset,
+                report: Some,
+            })),
+            None => Outcome::Some(None),
+        }
+    }
+}
+
+/// Where a step up from `offset` toward a part whose top is at `top` lands: as much as `step`, and
+/// no further than shows the top with `margin` above it. None when that top is already in view.
+pub fn climb_to(top: f32, offset: f32, step: f32, margin: f32) -> Option<f32> {
+    let want = (top - margin).max(0.0);
+    (want < offset - 0.5).then(|| (offset - step).max(want))
+}
+
 /// The second half of a reveal: move the scrollable, and report where to.
-struct ScrollTo {
+struct ScrollTo<T> {
     axis: Axis,
     scrollable: Id,
     offset: f32,
+    /// What the move reports, made of where it went.
+    report: fn(f32) -> T,
 }
 
-impl Operation<f32> for ScrollTo {
-    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<f32>)) {
+impl<T> Operation<T> for ScrollTo<T> {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
         operate(self);
     }
 
@@ -126,8 +251,8 @@ impl Operation<f32> for ScrollTo {
         }
     }
 
-    fn finish(&self) -> Outcome<f32> {
-        Outcome::Some(self.offset)
+    fn finish(&self) -> Outcome<T> {
+        Outcome::Some((self.report)(self.offset))
     }
 }
 
@@ -156,6 +281,14 @@ mod tests {
         assert_eq!(offset_to_reveal(900.0, 1000.0, 0.0, 800.0, 60.0), Some(260.0));
         assert_eq!(offset_to_reveal(100.0, 200.0, 300.0, 800.0, 60.0), Some(40.0));
         assert_eq!(offset_to_reveal(10.0, 100.0, 300.0, 800.0, 60.0), Some(0.0), "never before the start");
+    }
+
+    #[test]
+    fn climbing_steps_up_until_the_top_shows_then_stops() {
+        assert_eq!(climb_to(900.0, 1400.0, 160.0, 24.0), Some(1240.0), "a step at a time while the top is far above");
+        assert_eq!(climb_to(900.0, 950.0, 160.0, 24.0), Some(876.0), "no further than shows it");
+        assert_eq!(climb_to(900.0, 876.0, 160.0, 24.0), None, "in view: the cursor may leave");
+        assert_eq!(climb_to(900.0, 200.0, 160.0, 24.0), None, "below the view is not above it");
     }
 
     #[test]

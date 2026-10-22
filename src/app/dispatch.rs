@@ -324,6 +324,10 @@ impl App {
                 ])
             }
             Message::DetailAction(action) => self.detail_action(action),
+            Message::ViewShot(index) => self.view_shot(index),
+            Message::CloseShot => self.close_shot(),
+            Message::ToggleAchievements => self.toggle_achievements(),
+            Message::DetailClimbed(to) => self.detail_climbed(to),
             Message::TabSelected(tab) => self.select_tab(tab),
             Message::Nav(direction) => self.navigate(direction),
             Message::Resized(width, height) => self.resized(width, height),

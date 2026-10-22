@@ -70,6 +70,8 @@ impl App {
             opaque(crate::ui::entry::view(&pending.entry))
         } else if let Some(pending) = &self.pick {
             opaque(crate::ui::picker::view(&pending.picker))
+        } else if let Some((game, index)) = self.shot_open() {
+            opaque(crate::ui::detail::viewer(game, &self.covers, index))
         } else {
             Space::new().into()
         };
@@ -475,6 +477,7 @@ impl App {
                     in_steam: game.builds().any(|id| self.steam_bindings.get(self.host(), id).is_some()),
                     favourite: game.builds().any(|id| self.favourites.contains(&id)),
                     extras: self.has_extras(*rom_id),
+                    achievements_open: self.achievements_open,
                 };
                 crate::ui::detail::detail_view(&ctx)
             }
