@@ -635,6 +635,9 @@ pub struct Firmware {
     pub file_name: String,
     #[serde(default)]
     pub file_size_bytes: i64,
+    /// RomM's MD5 of the file — what says it has changed since it was last put somewhere.
+    #[serde(default)]
+    pub md5_hash: Option<String>,
 }
 
 /// A RomM collection. Home appends one shelf per manual collection, in server order.

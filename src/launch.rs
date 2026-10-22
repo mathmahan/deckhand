@@ -639,11 +639,32 @@ pub async fn ready(ctx: &Context, plan: &Plan) -> Vec<String> {
         None => ctx.client.fetch_rom_detail(conn, plan.rom_id).await.ok().and_then(|d| d.platform_id),
     };
     // A RetroArch without a BIOS folder, or a RomM with no firmware, is the common case and not news.
-    if let (Some(platform_id), Ok(dir)) = (platform_id, sync::retroarch::bios_dir(ctx.retroarch_config.as_deref()))
-        && let Ok(fetched) = crate::bios::sync(&ctx.client, conn, platform_id, &dir).await
+    let bios = sync::retroarch::bios_dir(ctx.retroarch_config.as_deref());
+    if let (Some(platform_id), Ok(dir)) = (platform_id, &bios)
+        && let Ok(fetched) = crate::bios::sync(&ctx.client, conn, platform_id, dir).await
         && !fetched.is_empty()
     {
         notes.push(BIOS_SYNCED.into());
+    }
+    // A Switch emulator of its own takes RomM's keys and firmware into its own folders, from where
+    // the BIOS sync put them — or a folder of Deckhand's, with no RetroArch to have one. Before the
+    // save sync, which reads the keys to tell the game.
+    if let (Some(platform_id), Some(target)) = (platform_id, crate::switch_firmware::target(plan)) {
+        let source = match bios {
+            Ok(dir) => dir,
+            Err(_) => {
+                let own = ctx.store.join("firmware/switch");
+                let _ = crate::bios::sync(&ctx.client, conn, platform_id, &own).await;
+                own
+            }
+        };
+        if let Ok(firmware) = ctx.client.fetch_firmware(conn, platform_id).await {
+            let store = ctx.store.clone();
+            let put = tokio::task::spawn_blocking(move || {
+                crate::switch_firmware::install(&target, &source, &firmware, &store, crate::switch_firmware::running)
+            });
+            notes.extend(put.await.unwrap_or_default());
+        }
     }
 
     notes.extend(sync_any(ctx, conn, plan.rom_id, &plan.game(), true, Vec::new()).await.notes);
