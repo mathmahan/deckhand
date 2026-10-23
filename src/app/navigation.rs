@@ -471,7 +471,7 @@ impl App {
             Tab::Downloads => {
                 self.downloads_focus = Default::default();
                 self.screen = Screen::Browsing(Route::Downloads);
-                self.scroll_page_to_top()
+                Task::batch([self.scroll_page_to_top(), self.fetch_art()])
             }
         }
     }

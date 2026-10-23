@@ -901,6 +901,44 @@ mod render {
         snapshot_sized(&app, "settings-storage", (1280.0, 1800.0));
     }
 
+    /// Downloads with something of everything: two coming, one that failed, and five here with their
+    /// covers, the cursor on one that is here — and the page with nothing on it.
+    #[test]
+    #[ignore = "draws pages to PNGs for a person to look at"]
+    fn render_downloads() {
+        let mut app = paired_fixtures(30);
+        app.banner = None;
+        let _ = app.update(Message::TabSelected(Tab::Downloads));
+        snapshot(&app, "downloads-empty");
+        let mut games: Vec<Game> = app.library.all_games().to_vec();
+        let hues = [[90, 140, 220], [220, 120, 70], [80, 190, 120], [200, 90, 160], [230, 200, 80], [120, 110, 230], [70, 180, 200], [180, 80, 80]];
+        for (game, hue) in games.iter_mut().zip(hues) {
+            let url = format!("http://127.0.0.1:1/cover/{}.png", game.rom_id);
+            game.cover_url = Some(url.clone());
+            app.covers.insert(url, covers::Cover::Ready(picture_sized(144, 200, hue), covers::CoverMeta { ratio: 0.72, dominant: Color::BLACK }));
+        }
+        app.library = Arc::new(Library::new(app.library.systems.clone(), games.clone()));
+        let queue = |game: &Game| QueueItem { rom_id: game.rom_id, title: game.title.clone(), system_id: game.system_id.clone(), ..Default::default() };
+        app.downloads.enqueue(queue(&games[2]));
+        app.downloads.start_next();
+        app.downloads.finish(games[2].rom_id, Err("RomM stopped answering partway through".into()));
+        for game in &games[..2] {
+            app.downloads.enqueue(queue(game));
+        }
+        app.downloads.start_next();
+        app.downloads.progress(games[0].rom_id, 0.4);
+        for (i, game) in games[3..8].iter().enumerate() {
+            let mut record = installed(game.rom_id, &game.title, (900 - i as u64 * 170) * 1024 * 1024);
+            record.system_id = game.system_id.clone();
+            record.pinned = i == 1;
+            app.downloads.finish(game.rom_id, Ok(record));
+        }
+        for _ in 0..4 {
+            let _ = app.update(Message::Nav(Direction::Down));
+        }
+        snapshot(&app, "downloads-list");
+    }
+
     /// Real images, from a folder `DECKHAND_ICONS` names: `<slug>.ico` platform icons as RomM
     /// serves them and a `badge.png`, decoded the way the art pipeline decodes them.
     fn put(app: &mut App, url: String, file: &std::path::Path, height: f32) {

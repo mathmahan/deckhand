@@ -33,7 +33,7 @@ impl App {
             match route {
                 Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
                 Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
-                Route::Settings | Route::Collections | Route::Sync { .. } => stack![crate::ui::home::plain_stage(), page].into(),
+                Route::Settings | Route::Collections | Route::Sync { .. } | Route::Downloads => stack![crate::ui::home::plain_stage(), page].into(),
                 Route::Detail { .. } => stack![self.detail_backdrop(), page].into(),
                 _ => page.into(),
             }
@@ -584,6 +584,7 @@ impl App {
                 &self.downloads_focus,
                 self.downloads.total_bytes(),
                 &self.settings.roms_dir(),
+                &self.covers,
             ),
             Route::Settings => {
                 crate::ui::settings::settings_view(&crate::ui::settings::SettingsContext {

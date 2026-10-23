@@ -11,24 +11,30 @@
 //! The two sections are **one** list to navigate, with a header drawn before the first row of each,
 //! because they read as one page and that is what lets plain Up/Down be the whole of its
 //! navigation.
+//!
+//! Drawn as Home and Settings are, on Home's ground: how much is here where Home has its spotlight,
+//! and each game as a glass row with its cover, the one under the cursor lifted on the ink ring.
 
-use iced::border;
 use iced::widget::text::Wrapping;
-use iced::widget::{self as widget, button, column, container, row, scrollable, text, Space};
-use iced::{Alignment, Background, Border, Element, Length, Padding, Shadow};
+use iced::widget::{self as widget, button, column, container, image, row, scrollable, text, Space};
+use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding, Shadow};
 
 use crate::app::Message;
+use crate::covers::Covers;
 use crate::downloads::{human_bytes, Downloads, SyncState};
 use crate::focus::DownloadsFocus;
 use crate::library::Library;
-use crate::theme;
+use crate::theme::{self, alpha, glass};
 use crate::ui::home::truncate;
 
 /// A row's height, and the gap under it. Uniform — including the band a progress bar or a failure
 /// reason is drawn in — so the cursor's scroll offset is computed rather than measured, the same
 /// way the Settings page's cards work.
-const ROW_H: f32 = 52.0;
-const ROW_GAP: f32 = 4.0;
+const ROW_H: f32 = 76.0;
+const ROW_GAP: f32 = 8.0;
+
+/// The cover at a row's left.
+const COVER: (f32, f32) = (40.0, 56.0);
 
 /// A section header's height, including the space above it.
 const HEADER_H: f32 = 44.0;
@@ -50,6 +56,8 @@ pub struct Entry<'a> {
     pub bytes: Option<u64>,
     /// What else is worth knowing about a game that is here: pinned, an update waiting.
     pub note: Option<String>,
+    /// Its cover, when the library has the game.
+    pub cover: Option<&'a str>,
 }
 
 impl Entry<'_> {
@@ -80,6 +88,7 @@ fn named(item: &crate::downloads::QueueItem) -> String {
 /// to be sayable. The title travels with the queue item for exactly that reason.
 pub fn entries<'a>(library: &'a Library, downloads: &'a Downloads) -> Vec<Entry<'a>> {
     let mut rows = Vec::new();
+    let cover = |rom_id: i64| library.game(rom_id).or_else(|| library.game_of_build(rom_id)).and_then(|g| g.cover_url.as_deref());
     for (item, progress) in downloads.in_progress() {
         let state = match downloads.state(item.rom_id) {
             busy @ SyncState::Unpacking(_) => busy,
@@ -92,6 +101,7 @@ pub fn entries<'a>(library: &'a Library, downloads: &'a Downloads) -> Vec<Entry<
             state,
             bytes: None,
             note: None,
+            cover: cover(item.rom_id),
         });
     }
     for (item, why) in downloads.failures() {
@@ -102,6 +112,7 @@ pub fn entries<'a>(library: &'a Library, downloads: &'a Downloads) -> Vec<Entry<
             state: SyncState::Failed(why.to_string()),
             bytes: None,
             note: None,
+            cover: cover(item.rom_id),
         });
     }
     for installed in downloads.installed_by_size() {
@@ -121,6 +132,7 @@ pub fn entries<'a>(library: &'a Library, downloads: &'a Downloads) -> Vec<Entry<
             state: if state.is_here() { state } else { SyncState::Installed },
             bytes: Some(installed.bytes),
             note: (!note.is_empty()).then_some(note),
+            cover: cover(installed.rom_id),
         });
     }
     rows
@@ -181,67 +193,24 @@ pub fn downloads_view<'a>(
     focus: &DownloadsFocus,
     installed_bytes: u64,
     roms_dir: &std::path::Path,
+    covers: &Covers,
 ) -> Element<'a, Message> {
-    let on_device = rows.iter().filter(|e| e.on_device()).count();
-    let failed = rows.iter().filter(|e| matches!(e.state, SyncState::Failed(_))).count();
-    let downloading = rows.len() - on_device - failed;
-    let summary = [
-        Some(format!("{on_device} on this device")),
-        Some(format!("{} used", human_bytes(installed_bytes))),
-        (downloading > 0).then(|| format!("{downloading} downloading")),
-        (failed > 0).then(|| format!("{failed} failed")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join("  ·  ");
-
-    let heading = column![
-        text("Downloads")
-            .size(theme::text_size::HEADLINE_SMALL)
-            .font(theme::MEDIUM)
-            .color(theme::TEXT_PRIMARY),
-        Space::new().height(Length::Fixed(4.0)),
-        text(summary).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_MUTED),
-        Space::new().height(Length::Fixed(2.0)),
-        // The folder is named here and not only in Settings: this is the page you are on when you
-        // want to know where the bytes went, and a path is the answer to that.
-        text(truncate(&roms_dir.display().to_string(), 80))
-            .size(theme::text_size::LABEL_MEDIUM)
-            .color(theme::TEXT_SECONDARY)
-            .wrapping(Wrapping::None),
-    ]
-    .padding(Padding { top: 20.0, right: 28.0, bottom: 10.0, left: 28.0 });
+    let margin = crate::ui::tab_bar::MARGIN;
+    let top = container(heading(&rows, installed_bytes, roms_dir)).padding(Padding { top: 18.0, right: margin, bottom: 18.0, left: margin });
 
     if rows.is_empty() {
-        return column![
-            heading,
-            container(
-                text("Nothing downloaded yet — press Download on a game to fetch it.")
-                    .size(theme::text_size::BODY_LARGE)
-                    .color(theme::TEXT_SECONDARY),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill),
-        ]
-        .into();
+        return column![top, Space::new().height(Length::Fill)].into();
     }
 
     let cursor = focus.index(rows.len());
     let mut list = column![];
     for (i, entry) in rows.iter().enumerate() {
         if i == 0 {
-            list = list.push(section_header(if entry.on_device() {
-                "On this device"
-            } else {
-                "Downloading"
-            }));
+            list = list.push(section_header(if entry.on_device() { "On this device" } else { "Downloading" }));
         } else if entry.on_device() && !rows[i - 1].on_device() {
             list = list.push(section_header("On this device"));
         }
-        list = list.push(line(i, entry, i == cursor));
+        list = list.push(line(i, entry, i == cursor, covers));
         list = list.push(Space::new().height(Length::Fixed(ROW_GAP)));
     }
     // Room under the last row, so it can scroll up to the same anchor as the rest instead of
@@ -249,62 +218,102 @@ pub fn downloads_view<'a>(
     list = list.push(Space::new().height(Length::Fixed(160.0)));
 
     column![
-        heading,
-        prompts(rows.get(cursor)),
-        scrollable(list.padding([0, 28]))
+        top,
+        scrollable(list.padding([0.0, margin]))
             .id(downloads_id())
             .on_scroll(|_| Message::Scrolled)
+            .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4).scroller_width(4).margin(4)))
             .width(Length::Fill)
             .height(Length::Fill),
+        hints(rows.get(cursor)),
     ]
     .into()
 }
 
-/// What the two keys do on the row under the cursor.
-///
-/// Spelled out on the page rather than left to a tooltip, because Delete is the only key in this
-/// app that removes anything — a key you have to discover is not one to put a deletion behind.
-fn prompts<'a>(focused: Option<&Entry<'_>>) -> Element<'a, Message> {
-    let hint = match focused.map(|e| &e.state) {
-        Some(SyncState::Installed | SyncState::UpdateAvailable) => "Enter opens the game  ·  Del removes it from this device",
-        Some(SyncState::Failed(_)) => "Enter tries again  ·  Del dismisses",
-        _ => "Enter opens the game  ·  Del cancels",
+/// The page's heading, where Home has its spotlight: what is on its way or here, where it went —
+/// the folder is named here and not only in Settings, since this is the page you are on when you
+/// want to know where the bytes went — and how much room it all takes, set large at the right.
+fn heading<'a>(rows: &[Entry<'_>], installed_bytes: u64, roms_dir: &std::path::Path) -> Element<'a, Message> {
+    let on_device = rows.iter().filter(|e| e.on_device()).count();
+    let failed = rows.iter().filter(|e| matches!(e.state, SyncState::Failed(_))).count();
+    let downloading = rows.len() - on_device - failed;
+    let games = |n: usize| if n == 1 { "1 game".to_string() } else { format!("{n} games") };
+    let eyebrow = [
+        (downloading > 0).then(|| format!("{downloading} DOWNLOADING")),
+        (failed > 0).then(|| format!("{failed} FAILED")),
+        Some(format!("{on_device} ON THIS DEVICE")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("  ·  ");
+    let (headline, under) = match (downloading, on_device) {
+        (0, 0) if failed == 0 => ("Nothing downloaded yet".to_string(), "Press Download on a game to fetch it.".to_string()),
+        (0, 0) => (format!("{} didn't download", games(failed)), "Try again, or dismiss it.".to_string()),
+        (0, n) => (format!("{} on this device", games(n)), "Largest first: the ones to remove when room is short.".to_string()),
+        (n, _) => (format!("Downloading {}", games(n)), "Open a game while it comes down, or cancel it here.".to_string()),
     };
-    container(text(hint).size(theme::text_size::LABEL_MEDIUM).color(theme::TEXT_MUTED))
-        .padding(Padding { right: 28.0, bottom: 8.0, left: 28.0, ..Padding::ZERO })
-        .into()
+    let left = column![
+        row![crate::ui::home::tag("DOWNLOADS".into(), true), text(eyebrow).size(13.0).font(theme::SEMIBOLD).color(alpha(theme::INK, 0.82))]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        text(headline).size(40.0).font(theme::DISPLAY).color(theme::INK),
+        text(under).size(16.0).color(alpha(theme::INK, 0.82)),
+        text(truncate(&roms_dir.display().to_string(), 80)).size(13.0).color(theme::TEXT_SECONDARY).wrapping(Wrapping::None),
+    ]
+    .spacing(10)
+    .width(Length::Fill);
+    let used = column![
+        text(human_bytes(installed_bytes)).size(40.0).font(theme::DISPLAY).color(theme::INK),
+        text("used on this device").size(13.0).color(theme::TEXT_SECONDARY),
+    ]
+    .spacing(2)
+    .align_x(Alignment::End);
+    row![left, used].spacing(40).align_y(Alignment::End).into()
+}
+
+/// What A and Delete do on the row under the cursor.
+///
+/// Delete spelled out at the foot rather than left to be found, because it is the only key in this
+/// app that removes anything — a key you have to discover is not one to put a deletion behind. The
+/// pad has none: the game's own page removes it.
+fn hints<'a>(focused: Option<&Entry<'_>>) -> Element<'a, Message> {
+    let (press, delete) = match focused.map(|e| &e.state) {
+        Some(SyncState::Installed | SyncState::UpdateAvailable) => ("Open the game", "Remove"),
+        Some(SyncState::Failed(_)) => ("Try again", "Dismiss"),
+        _ => ("Open the game", "Cancel"),
+    };
+    crate::ui::tab_bar::hint_line(vec![("A", press.to_string()), ("Del", delete.to_string())])
 }
 
 fn section_header<'a>(title: &'a str) -> Element<'a, Message> {
-    container(
-        text(title.to_uppercase())
-            .size(theme::text_size::LABEL_MEDIUM)
-            .font(theme::BOLD)
-            .color(theme::TEXT_MUTED),
-    )
-    .height(Length::Fixed(HEADER_H))
-    .align_y(iced::alignment::Vertical::Bottom)
-    .padding(Padding { bottom: 8.0, ..Padding::ZERO })
-    .into()
+    container(text(title.to_uppercase()).size(12.0).font(theme::BOLD).color(alpha(theme::INK, 0.6)))
+        .height(Length::Fixed(HEADER_H))
+        .align_y(iced::alignment::Vertical::Bottom)
+        .padding(Padding { bottom: 10.0, ..Padding::ZERO })
+        .into()
 }
 
-/// One row: the game, its system, what it is doing, and the one thing pressing it does.
-fn line<'a>(index: usize, entry: &Entry<'a>, lit: bool) -> Element<'a, Message> {
+/// One row: the game's cover, its name, its system and what else is worth knowing — or the bar of
+/// something in flight, the reason for something that stopped — its size or how far it has got,
+/// and the one thing removing it does. A glass row, lifted on the ink ring under the cursor.
+fn line<'a>(index: usize, entry: &Entry<'a>, lit: bool, covers: &Covers) -> Element<'a, Message> {
     let downloading = match &entry.state {
         SyncState::Downloading(progress) | SyncState::Unpacking(progress) => Some(*progress),
         _ => None,
     };
     let failed = matches!(entry.state, SyncState::Failed(_));
 
-    // The glowing left edge, as on the Settings cards — drawn clear on every other row rather than
-    // left out, so the labels do not shift sideways as the cursor passes.
-    let edge = container(Space::new().width(Length::Fixed(4.0)).height(Length::Fixed(28.0))).style(
-        move |_| container::Style {
-            background: lit.then_some(Background::Color(theme::ACCENT)),
-            border: Border { radius: border::right(4.0), ..Default::default() },
+    let (w, h) = COVER;
+    let cover: Element<Message> = match entry.cover.and_then(|url| covers.handle(url)) {
+        Some(handle) => image(handle.clone()).content_fit(ContentFit::Cover).width(Length::Fixed(w)).height(Length::Fixed(h)).border_radius(6.0).into(),
+        None => container(Space::new()).width(Length::Fixed(w)).height(Length::Fixed(h)).style(|_| container::Style {
+            background: Some(Background::Color(glass(0.06))),
+            border: Border { radius: 6.0.into(), ..Default::default() },
             ..Default::default()
-        },
-    );
+        })
+        .into(),
+    };
 
     let figure = match (&entry.state, entry.bytes) {
         (SyncState::Downloading(progress), _) => format!("{}%", (progress * 100.0) as i32),
@@ -314,128 +323,105 @@ fn line<'a>(index: usize, entry: &Entry<'a>, lit: bool) -> Element<'a, Message> 
         _ => "—".to_string(),
     };
 
-    let top = row![
-        edge,
-        text(truncate(&entry.title, 52))
-            .size(theme::text_size::BODY_LARGE)
-            .font(if lit { theme::MEDIUM } else { theme::REGULAR })
-            .color(if lit { theme::TEXT_PRIMARY } else { theme::TEXT_BODY })
-            .wrapping(Wrapping::None)
-            .width(Length::Fill),
-        text(entry.system)
-            .size(theme::text_size::LABEL_LARGE)
-            .color(theme::TEXT_SECONDARY)
-            .wrapping(Wrapping::None),
-        container(
-            text(figure)
-                .size(theme::text_size::LABEL_LARGE)
-                .font(theme::MEDIUM)
-                .color(if failed { theme::ERROR } else { theme::TEXT_SECONDARY })
-                .wrapping(Wrapping::None),
-        )
-        .width(Length::Fixed(64.0))
-        .align_right(Length::Fixed(64.0)),
+    // Under the name: the bar for something in flight — a percentage that only moves every 250 ms
+    // reads as static without something moving beside it — the reason for something that stopped,
+    // and otherwise the system and the notes.
+    let under: Element<Message> = match (&entry.state, downloading) {
+        (_, Some(progress)) => row![text(entry.system).size(13.0).color(theme::TEXT_SECONDARY).wrapping(Wrapping::None), progress_bar(progress)]
+            .spacing(14)
+            .align_y(Alignment::Center)
+            .into(),
+        (SyncState::Failed(why), _) => text(truncate(why, 90)).size(13.0).color(theme::ERROR).wrapping(Wrapping::None).into(),
+        _ => {
+            let mut words = row![text(entry.system).size(13.0).color(theme::TEXT_SECONDARY).wrapping(Wrapping::None)].spacing(8);
+            if let Some(note) = &entry.note {
+                let tone = if entry.state == SyncState::UpdateAvailable { theme::WARNING } else { theme::TEXT_SECONDARY };
+                words = words.push(text("·").size(13.0).color(theme::TEXT_SECONDARY)).push(text(truncate(note, 80)).size(13.0).color(tone).wrapping(Wrapping::None));
+            }
+            words.into()
+        }
+    };
+
+    let body = row![
+        cover,
+        column![
+            text(truncate(&entry.title, 60)).size(17.0).font(theme::SEMIBOLD).color(theme::INK).wrapping(Wrapping::None),
+            under,
+        ]
+        .spacing(5)
+        .width(Length::Fill),
+        container(text(figure).size(15.0).font(theme::SEMIBOLD).color(if failed { theme::ERROR } else { alpha(theme::INK, 0.86) }).wrapping(Wrapping::None))
+            .width(Length::Fixed(90.0))
+            .align_right(Length::Fixed(90.0)),
         // A chip rather than a bare label: the mouse needs its own way to remove a game, since
         // Delete is a key the pointer does not have.
         remove_chip(entry.rom_id, &entry.state, lit),
     ]
-    .spacing(12)
-    .align_y(Alignment::Center)
-    .height(Length::Fixed(28.0));
+    .spacing(16)
+    .align_y(Alignment::Center);
 
-    // The lower band of the row: the bar for something in flight, the reason for something that
-    // stopped, and nothing at all for a game that is simply here. Fixed height either way, so
-    // `row_top` stays exact.
-    let under: Element<Message> = match (&entry.state, downloading) {
-        // The bar carries the same job it does on a tile: a percentage that only moves every
-        // 250 ms reads as static without something moving beside it.
-        (_, Some(progress)) => progress_bar(progress),
-        (SyncState::Failed(why), _) => text(truncate(why, 90))
-            .size(theme::text_size::LABEL_MEDIUM)
-            .color(theme::ERROR)
-            .wrapping(Wrapping::None)
-            .into(),
-        (_, None) if entry.note.is_some() => text(truncate(entry.note.as_deref().unwrap_or_default(), 90))
-            .size(theme::text_size::LABEL_MEDIUM)
-            .color(if entry.state == SyncState::UpdateAvailable { theme::WARNING } else { theme::TEXT_MUTED })
-            .wrapping(Wrapping::None)
-            .into(),
-        _ => Space::new().into(),
-    };
-    let has_under = downloading.is_some() || failed || entry.note.is_some();
-
-    // Centred in the row as one block: the title alone for a game that is simply here, the title
-    // over its bar or its note otherwise — that band starting where the title does.
-    let mut body = column![top].padding(Padding { right: 14.0, ..Padding::ZERO });
-    if has_under {
-        body = body
-            .push(Space::new().height(Length::Fixed(4.0)))
-            .push(container(under).padding(Padding { left: 16.0, ..Padding::ZERO }));
-    }
-    button(container(body).height(Length::Fill).center_y(Length::Fill))
-    .width(Length::Fill)
-    .height(Length::Fixed(ROW_H))
-    .padding(0)
-    .on_press(Message::DownloadsClicked(index))
-    .style(crate::ui::style::row(lit, 12.0))
-    .into()
+    let row = button(container(body).height(Length::Fill).center_y(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fixed(ROW_H))
+        .padding([0, 16])
+        .on_press(Message::DownloadsClicked(index))
+        .style(crate::ui::style::glass_row(lit, 16.0));
+    row.into()
 }
 
 fn progress_bar<'a>(progress: f32) -> Element<'a, Message> {
     let filled = progress.clamp(0.0, 1.0);
     container(
         row![
-            container(Space::new().height(Length::Fixed(4.0)))
+            container(Space::new().height(Length::Fixed(6.0)))
                 .width(Length::FillPortion((filled * 1000.0) as u16 + 1))
                 .style(|_| container::Style {
-                    background: Some(Background::Color(theme::ACCENT)),
-                    border: Border { radius: 2.0.into(), ..Default::default() },
+                    background: Some(Background::Color(theme::ACCENT_400)),
+                    border: Border { radius: 3.0.into(), ..Default::default() },
                     ..Default::default()
                 }),
             Space::new().width(Length::FillPortion(((1.0 - filled) * 1000.0) as u16 + 1)),
         ]
-        .height(Length::Fixed(4.0)),
+        .height(Length::Fixed(6.0)),
     )
     .width(Length::Fill)
-    .height(Length::Fixed(4.0))
+    .height(Length::Fixed(6.0))
     .style(|_| container::Style {
-        background: Some(Background::Color(theme::alpha(theme::NEUTRAL_100, 0.12))),
-        border: Border { radius: 2.0.into(), ..Default::default() },
+        background: Some(Background::Color(glass(0.08))),
+        border: Border { radius: 3.0.into(), ..Default::default() },
         ..Default::default()
     })
     .into()
 }
 
-/// The chip naming what removing this row does — and doing it, for the pointer.
+/// The pill naming what removing this row does — and doing it, for the pointer. Glass, and filled
+/// with the warning red under the cursor, as a Settings row's chip is for what takes something away.
 fn remove_chip<'a>(rom_id: i64, state: &SyncState, lit: bool) -> Element<'a, Message> {
     let label = match state {
         SyncState::Installed | SyncState::UpdateAvailable => "Remove",
         SyncState::Failed(_) => "Dismiss",
         _ => "Cancel",
     };
-    button(
-        text(label)
-            .size(theme::text_size::LABEL_LARGE)
-            .font(theme::MEDIUM)
-            .wrapping(Wrapping::None),
-    )
-    .padding([5, 12])
-    .on_press(if matches!(state, SyncState::Failed(_)) { Message::DismissDownload(rom_id) } else { Message::RemoveDownload(rom_id) })
-    .style(move |_, status| {
-        let hovered = matches!(status, button::Status::Hovered);
-        button::Style {
-            background: hovered.then_some(Background::Color(theme::alpha(theme::ERROR, 0.18))),
-            text_color: if lit || hovered { theme::ERROR } else { theme::TEXT_SECONDARY },
-            border: Border {
-                color: if lit { theme::alpha(theme::ERROR, 0.6) } else { theme::BORDER },
-                width: 1.0,
-                radius: 9.0.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        }
-    })
-    .into()
+    button(container(text(label).size(13.0).font(theme::SEMIBOLD).wrapping(Wrapping::None)).center_y(Length::Fill))
+        .height(Length::Fixed(30.0))
+        .padding([0, 14])
+        .on_press(if matches!(state, SyncState::Failed(_)) { Message::DismissDownload(rom_id) } else { Message::RemoveDownload(rom_id) })
+        .style(move |_, status| {
+            let hovered = matches!(status, button::Status::Hovered);
+            let (fill, ink) = match (lit, hovered) {
+                (true, _) => (theme::ERROR, Color::WHITE),
+                (false, true) => (alpha(theme::ERROR, 0.18), theme::ERROR),
+                (false, false) => (glass(0.08), theme::INK),
+            };
+            button::Style {
+                background: Some(Background::Color(fill)),
+                text_color: ink,
+                border: Border { color: if lit { Color::TRANSPARENT } else { glass(0.14) }, width: 1.0, radius: 15.0.into() },
+                shadow: Shadow::default(),
+                snap: true,
+            }
+        })
+        .into()
 }
 
 #[cfg(test)]
