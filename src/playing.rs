@@ -391,6 +391,20 @@ mod tests {
             path(&self.0, Path::new(ROM))
         }
 
+        /// [`left`], just after a holder let go. Another test spawning a process at that moment hands
+        /// the child a copy of the holder's file until it execs, and with it the lock: the app finds
+        /// such a marker on its next look, so this looks again for a moment before it gives up.
+        fn left_soon(&self) -> Vec<Left> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let found = left(&self.0);
+                if !found.is_empty() || Instant::now() >= deadline {
+                    return found;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
         /// A marker as one left by a session that started `ago` and was last touched `quiet` ago.
         fn left(&self, kept: bool, ago: u64, quiet: u64) {
             let now = SystemTime::now();
@@ -428,14 +442,14 @@ mod tests {
         // Played ten minutes, then ended with Deckhand: last touched as it went.
         held.file.set_modified(held.start + Duration::from_secs(600)).unwrap();
         drop(held);
-        let found = left(&store.0);
+        let found = store.left_soon();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].game(), Some(&game()), "with what syncing its saves needs");
         assert_eq!(found[0].session().map(|p| p.duration_ms / 1000), Some(600));
         assert!(left(&store.0).is_empty(), "held while it is finished, so nothing else finishes it too");
 
         drop(found);
-        let found = left(&store.0);
+        let found = store.left_soon();
         assert_eq!(found.len(), 1, "not done, so it stays for the next time");
         found.into_iter().for_each(Left::done);
         assert!(!store.marker().exists());
@@ -527,7 +541,7 @@ mod tests {
         let held = hold(&store.0, 7, game(), None).unwrap();
         held.file.set_modified(held.start + Duration::from_secs(600)).unwrap();
         held.sent();
-        let found = left(&store.0);
+        let found = store.left_soon();
         assert_eq!(found.len(), 1, "still owed, for its saves");
         assert_eq!((found[0].session(), found[0].game()), (None, Some(&game())));
         let touched = found[0].file.metadata().unwrap().modified().unwrap();
@@ -550,14 +564,16 @@ mod tests {
             let store = store.0.clone();
             std::thread::spawn(move || keep(&store, Path::new(ROM)))
         };
+        // Held, and rewritten to say so: the keeper takes the lock before it rewrites the note, so a
+        // look between the two finds the lock taken and the note as it was.
         let deadline = Instant::now() + Duration::from_secs(5);
         let held = || OpenOptions::new().read(true).open(store.marker()).is_ok_and(|f| f.try_lock().is_err());
-        while !held() {
+        let note = || fs::read_to_string(store.marker()).ok().and_then(|text| Note::read(&text));
+        while !(held() && note().is_some_and(|note| note.kept)) {
             assert!(Instant::now() < deadline, "the keeper never took hold");
             std::thread::sleep(Duration::from_millis(20));
         }
-        let note = Note::read(&fs::read_to_string(store.marker()).unwrap()).unwrap();
-        assert!(note.kept && note.game == Some(game()), "kept now, and still says what its saves need");
+        assert_eq!(note().and_then(|note| note.game), Some(game()), "kept now, and still says what its saves need");
 
         // A second keeper finds it held, and leaves.
         keep(&store.0, rom);

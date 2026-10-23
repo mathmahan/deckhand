@@ -542,8 +542,32 @@ mod render {
     #[ignore = "draws pages to PNGs for a person to look at"]
     fn render_saves_page() {
         let (mut app, game) = with_saves();
+        app.banner = None;
+        // A screenshot of the game's behind the page, as its game page draws it.
+        let shot = format!("{}/assets/screenshots/behind.png", app.host());
+        let mut games = app.library.all_games().to_vec();
+        for each in games.iter_mut().filter(|g| g.rom_id == game.rom_id) {
+            each.screenshots = vec![shot.clone()];
+        }
+        app.library = Arc::new(Library::new(app.library.systems.clone(), games));
+        let png = {
+            let iced::widget::image::Handle::Rgba { width, height, pixels, .. } = picture_sized(512, 448, [160, 90, 200]) else { unreachable!() };
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::RgbaImage::from_raw(width, height, pixels.to_vec()).unwrap().write_to(&mut png, image::ImageFormat::Png).unwrap();
+            png.into_inner()
+        };
+        let (w, h) = crate::ui::home::PICTURE;
+        for (kind, target) in [
+            (covers::Kind::Spotlight, covers::Target { height_px: (crate::ui::detail::PICTURE_ENDS + 70.0).min(h), box_ratio: Some(w / h) }),
+            (covers::Kind::Ambient, covers::Target::tall(40.0)),
+        ] {
+            let (handle, meta) = covers::prepare(&png, target, kind).unwrap();
+            app.covers.insert(covers::key(&shot, kind), covers::Cover::Ready(handle, meta));
+        }
         let detail = Route::Detail { rom_id: game.rom_id, from: Box::new(Route::Home) };
         app.screen = Screen::Browsing(Route::Saves { rom_id: game.rom_id, from: Box::new(detail) });
+        app.follow_spotlight();
+        app.backdrop = settled(std::mem::take(&mut app.backdrop));
         app.saves_focus = SavesFocus::opening(None);
         let _ = app.update(Message::Nav(Direction::Down));
         snapshot(&app, "saves-states");

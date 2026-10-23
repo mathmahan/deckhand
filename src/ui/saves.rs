@@ -10,6 +10,10 @@
 //! Each row says whether this device holds that version ("on this device") and, for a RetroArch
 //! state, which of RetroArch's slots it is here — the one to load it from. One in no slot can be put
 //! into one.
+//!
+//! Drawn on the game page's backdrop, the game's picture and light behind it: the tabs on the
+//! Library's glass strip, walked by the triggers as well as Left and Right, the records as glass
+//! rows lifted on the ink ring under the cursor, and the one under it on a glass card.
 
 use iced::widget::text::Wrapping;
 use iced::widget::{self as widget, button, column, container, image, row, scrollable, text, Space};
@@ -21,17 +25,17 @@ use crate::downloads::human_bytes;
 use crate::game_saves::{GameSaves, SavesFocus, Tab};
 use crate::library::Game;
 use crate::romm::models::SaveAsset;
-use crate::theme;
+use crate::theme::{self, alpha, glass};
 use crate::ui::home::truncate;
 
 /// A row's height and the gap under it — fixed, so the cursor's scroll offset is computed.
-const ROW_H: f32 = 64.0;
-const ROW_GAP: f32 = 6.0;
-const THUMB_W: f32 = 72.0;
-const THUMB_H: f32 = 48.0;
+const ROW_H: f32 = 72.0;
+const ROW_GAP: f32 = 8.0;
+const THUMB_W: f32 = 78.0;
+const THUMB_H: f32 = 52.0;
 /// How tall the preview's screenshot is drawn — and so the size the art is fetched at.
 pub const PREVIEW_H: f32 = 270.0;
-const LIST_W: f32 = 460.0;
+const LIST_W: f32 = 480.0;
 
 pub fn list_id() -> widget::Id {
     widget::Id::new("saves-list")
@@ -62,23 +66,26 @@ pub struct SavesContext<'a> {
 }
 
 pub fn saves_view<'a>(ctx: &SavesContext<'a>) -> Element<'a, Message> {
+    let margin = crate::ui::tab_bar::MARGIN;
     let loaded = ctx.saves.and_then(|r| r.as_ref().ok());
     let count = |tab: Tab| loaded.map(|s| s.list(tab).len());
 
-    let back = button(text(format!("←  {}", truncate(&ctx.game.title, 60))).size(theme::text_size::BODY_MEDIUM))
+    let back = button(text(format!("←  {}", truncate(&ctx.game.title, 60))).size(theme::text_size::BODY_MEDIUM).color(alpha(theme::INK, 0.72)))
         .padding([4, 2])
         .on_press(Message::Back)
         .style(crate::ui::style::link);
-    let heading = column![
+    let top = column![
         back,
-        text("Saves & states").size(theme::text_size::HEADLINE_SMALL).font(theme::MEDIUM).color(theme::TEXT_PRIMARY),
+        Space::new().height(Length::Fixed(10.0)),
+        row![crate::ui::home::tag("SAVES".into(), true), text("AS ROMM HOLDS THEM").size(13.0).font(theme::SEMIBOLD).color(alpha(theme::INK, 0.82))]
+            .spacing(12)
+            .align_y(Alignment::Center),
+        Space::new().height(Length::Fixed(10.0)),
+        text("Saves & states").size(40.0).font(theme::DISPLAY).color(theme::INK),
+        Space::new().height(Length::Fixed(18.0)),
+        tabs(ctx.focus.tab, count(Tab::States), count(Tab::Saves)),
     ]
-    .spacing(6);
-    let tabs = row![
-        tab_button(Tab::States, "Save states", count(Tab::States), ctx.focus.tab == Tab::States),
-        tab_button(Tab::Saves, "In-game saves", count(Tab::Saves), ctx.focus.tab == Tab::Saves),
-    ]
-    .spacing(28);
+    .padding(Padding { top: 0.0, right: margin, bottom: 18.0, left: margin });
 
     let body: Element<Message> = match ctx.saves {
         None => note("Asking RomM…"),
@@ -97,60 +104,55 @@ pub fn saves_view<'a>(ctx: &SavesContext<'a>) -> Element<'a, Message> {
                     rows = rows.push(list_row(i, record, saves, ctx, i == cursor));
                 }
                 row![
-                    scrollable(column![rows, Space::new().height(Length::Fixed(160.0))])
+                    scrollable(column![rows, Space::new().height(Length::Fixed(160.0))].padding(Padding { right: 14.0, ..Padding::ZERO }))
                         .id(list_id())
                         .on_scroll(|_| Message::Scrolled)
+                        .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::new().width(4).scroller_width(4).margin(4)))
                         .width(Length::Fixed(LIST_W))
                         .height(Length::Fill),
                     preview(&list[cursor], saves, ctx),
                 ]
-                .spacing(28)
+                .spacing(24)
                 .into()
             }
         }
     };
 
-    let hint = text(match ctx.focus.tab {
-        Tab::States => "Up / Down to look through  ·  Enter or A puts a state into a slot  ·  Left / Right for the other tab  ·  Esc goes back",
-        Tab::Saves => "Up / Down to look through  ·  Enter or A restores an in-game save  ·  Left / Right for the other tab  ·  Esc goes back",
-    })
-        .size(theme::text_size::LABEL_MEDIUM)
-        .color(theme::TEXT_MUTED);
-
-    column![heading, tabs, hint, body]
-        .spacing(14)
-        .padding(Padding { top: 16.0, right: 28.0, bottom: 0.0, left: 28.0 })
-        .into()
+    let press = match ctx.focus.tab {
+        Tab::States => "Put into a slot",
+        Tab::Saves => "Restore",
+    };
+    let mut hints = Vec::new();
+    if loaded.is_some_and(|s| !s.list(ctx.focus.tab).is_empty()) {
+        hints.push(("A", press.to_string()));
+    }
+    hints.push(("B", "Back".to_string()));
+    column![top, container(body).padding([0.0, margin]).height(Length::Fill), crate::ui::tab_bar::hint_line(hints)].into()
 }
 
 fn note<'a>(message: &str) -> Element<'a, Message> {
-    container(text(message.to_string()).size(theme::text_size::BODY_LARGE).color(theme::TEXT_SECONDARY))
-        .padding(Padding { top: 24.0, ..Padding::ZERO })
+    container(text(message.to_string()).size(17.0).color(alpha(theme::INK, 0.82)))
+        .padding(Padding { top: 12.0, ..Padding::ZERO })
         .into()
 }
 
-/// A tab: its label, how many it holds, and an underline when it is the one shown.
-fn tab_button<'a>(tab: Tab, label: &str, count: Option<usize>, active: bool) -> Element<'a, Message> {
-    let label = match count {
-        Some(n) => format!("{label}  {n}"),
-        None => label.to_string(),
+/// The two tabs, on the glass strip the Library's filters stand in, with the triggers that walk
+/// them — as Left and Right do from the list.
+fn tabs<'a>(shown: Tab, states: Option<usize>, saves: Option<usize>) -> Element<'a, Message> {
+    use crate::ui::browse::{chip, key, strip};
+    let label = |words: &str, count: Option<usize>| match count {
+        Some(n) => format!("{words}  {n}"),
+        None => words.to_string(),
     };
-    let underline = container(Space::new().height(Length::Fixed(3.0)).width(Length::Fixed(if active { 112.0 } else { 0.0 })))
-        .style(|_| container::Style { background: Some(Background::Color(theme::ACCENT)), border: Border { radius: 2.0.into(), ..Default::default() }, ..Default::default() });
-    button(
-        column![
-            text(label)
-                .size(theme::text_size::BODY_LARGE)
-                .font(if active { theme::BOLD } else { theme::REGULAR })
-                .color(if active { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }),
-            underline,
-        ]
-        .spacing(6),
-    )
-    .padding([4, 0])
-    .on_press(Message::SavesTab(tab))
-    .style(crate::ui::style::bare)
-    .into()
+    let pills = row![
+        container(key("L2")).padding([0, 4]),
+        chip(label("Save states", states), shown == Tab::States, false, Message::SavesTab(Tab::States)),
+        chip(label("In-game saves", saves), shown == Tab::Saves, false, Message::SavesTab(Tab::Saves)),
+        container(key("R2")).padding([0, 4]),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    strip(pills)
 }
 
 /// What a record is called on the page: a RetroArch state by the slot it is here, anything else by
@@ -175,6 +177,8 @@ fn when(record: &SaveAsset) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
+/// A record as a glass row, lifted on the ink ring under the cursor: a state's picture small, its
+/// name and what made it, and when — with whether this device holds that version.
 fn list_row<'a>(index: usize, record: &SaveAsset, saves: &GameSaves, ctx: &SavesContext<'a>, lit: bool) -> Element<'a, Message> {
     let here = saves.on_device.contains(&record.id);
     let detail = [
@@ -194,32 +198,25 @@ fn list_row<'a>(index: usize, record: &SaveAsset, saves: &GameSaves, ctx: &Saves
     }
     line = line.push(
         column![
-            text(truncate(&title(record, saves), 40))
-                .size(theme::text_size::BODY_LARGE)
-                .font(if lit { theme::MEDIUM } else { theme::REGULAR })
-                .color(if lit { theme::TEXT_PRIMARY } else { theme::TEXT_BODY })
-                .wrapping(Wrapping::None),
-            text(detail).size(theme::text_size::LABEL_MEDIUM).color(theme::TEXT_SECONDARY).wrapping(Wrapping::None),
+            text(truncate(&title(record, saves), 36)).size(16.0).font(theme::SEMIBOLD).color(theme::INK).wrapping(Wrapping::None),
+            text(detail).size(13.0).color(theme::TEXT_SECONDARY).wrapping(Wrapping::None),
         ]
-        .spacing(2)
+        .spacing(3)
         .width(Length::Fill),
     );
-    line = line.push(
-        column![
-            text(when(record)).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY).wrapping(Wrapping::None),
-            text(if here { "ON THIS DEVICE" } else { "" }).size(10.0).font(theme::BOLD).color(theme::ACCENT),
-        ]
-        .spacing(4)
-        .align_x(Alignment::End),
-    );
+    let mut right = column![text(when(record)).size(13.0).color(alpha(theme::INK, 0.8)).wrapping(Wrapping::None)].spacing(6).align_x(Alignment::End);
+    if here {
+        right = right.push(text("ON THIS DEVICE").size(10.0).font(theme::BOLD).color(theme::ACCENT_400));
+    }
+    line = line.push(right);
 
     // Centred in the row's height, which a thumbnail would otherwise be the only thing to set.
     button(container(line).height(Length::Fill).center_y(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fixed(ROW_H))
-        .padding([0, 12])
+        .padding([0, 14])
         .on_press(Message::SavesRowClicked(index))
-        .style(crate::ui::style::row(lit, 12.0))
+        .style(crate::ui::style::glass_row(lit, 14.0))
         .into()
 }
 
@@ -234,15 +231,17 @@ fn thumbnail<'a>(handle: Option<image::Handle>) -> Element<'a, Message> {
         .width(Length::Fixed(THUMB_W))
         .height(Length::Fixed(THUMB_H))
         .style(|_| container::Style {
-            background: Some(Background::Color(theme::SURFACE_VARIANT)),
-            border: Border { color: theme::BORDER, width: 1.0, radius: 6.0.into() },
+            background: Some(Background::Color(alpha(theme::GROUND, 0.6))),
+            border: Border { color: glass(0.10), width: 1.0, radius: 6.0.into() },
             ..Default::default()
         })
         .clip(true)
         .into()
 }
 
-/// The record under the cursor: its picture, and what RomM records about it.
+/// The record under the cursor, on a card of smoked glass — it stands on the game's picture, which
+/// would show through clear glass and fight its own — with its picture, and what RomM records about
+/// it.
 fn preview<'a>(record: &SaveAsset, saves: &GameSaves, ctx: &SavesContext<'a>) -> Element<'a, Message> {
     let mut panel = column![].spacing(18).width(Length::Fill);
 
@@ -254,7 +253,7 @@ fn preview<'a>(record: &SaveAsset, saves: &GameSaves, ctx: &SavesContext<'a>) ->
             Some(handle) => image(handle).content_fit(ContentFit::Contain).height(Length::Fixed(PREVIEW_H)).into(),
             None => text(if record.screenshot.is_some() { "Loading the screenshot…" } else { "No screenshot was saved with this state." })
                 .size(theme::text_size::BODY_MEDIUM)
-                .color(theme::TEXT_MUTED)
+                .color(theme::TEXT_SECONDARY)
                 .into(),
         };
         panel = panel.push(
@@ -264,8 +263,8 @@ fn preview<'a>(record: &SaveAsset, saves: &GameSaves, ctx: &SavesContext<'a>) ->
                 .center_x(Length::Fill)
                 .center_y(Length::Fixed(PREVIEW_H))
                 .style(|_| container::Style {
-                    background: Some(Background::Color(theme::SURFACE_VARIANT)),
-                    border: Border { color: theme::BORDER, width: 1.0, radius: 10.0.into() },
+                    background: Some(Background::Color(alpha(theme::GROUND, 0.6))),
+                    border: Border { radius: 12.0.into(), ..Default::default() },
                     ..Default::default()
                 })
                 .clip(true),
@@ -297,11 +296,7 @@ fn preview<'a>(record: &SaveAsset, saves: &GameSaves, ctx: &SavesContext<'a>) ->
     }
 
     let fact = |label: &'static str, value: String| {
-        column![
-            text(label).size(10.0).font(theme::BOLD).color(theme::TEXT_MUTED),
-            text(value).size(theme::text_size::BODY_MEDIUM).color(theme::TEXT_PRIMARY),
-        ]
-        .spacing(3)
+        column![text(label).size(11.0).font(theme::BOLD).color(alpha(theme::INK, 0.55)), text(value).size(16.0).color(theme::INK)].spacing(4)
     };
     let mut strip = row![].spacing(32);
     for (label, value) in cells {
@@ -310,6 +305,11 @@ fn preview<'a>(record: &SaveAsset, saves: &GameSaves, ctx: &SavesContext<'a>) ->
     // Wrapped, since how many facts there are depends on the record and the page on the scale.
     panel = panel.push(fact("FILE", record.file_name.clone())).push(strip.wrap().vertical_spacing(14.0));
 
+    let card = container(panel).padding(18).width(Length::Fill).style(|_| container::Style {
+        background: Some(Background::Color(alpha(theme::GROUND, 0.82))),
+        border: Border { color: glass(0.10), width: 1.0, radius: 18.0.into() },
+        ..Default::default()
+    });
     // A scroll as insurance only: at the default scale it all fits, at the largest it may not.
-    scrollable(panel).on_scroll(|_| Message::Scrolled).width(Length::Fill).height(Length::Fill).into()
+    scrollable(column![card, Space::new().height(Length::Fixed(16.0))]).on_scroll(|_| Message::Scrolled).width(Length::Fill).height(Length::Fill).into()
 }
