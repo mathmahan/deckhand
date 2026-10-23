@@ -83,6 +83,12 @@ impl App {
                     }
                 }
             }
+            // The covers beside the search's results, at a shelf's size: the first few dozen.
+            Screen::Browsing(Route::Search { .. }) => {
+                for url in self.search_results().iter().filter_map(|g| g.cover_url.as_deref()).take(40) {
+                    wanted.push((url.to_string(), covers::Target::tall(px(crate::ui::home::COVER_H)), covers::Kind::Art));
+                }
+            }
             // The covers at the Downloads rows' left, at a shelf's size, so the two share one copy: the
             // first few dozen, which is more than a window shows.
             Screen::Browsing(Route::Downloads) => {

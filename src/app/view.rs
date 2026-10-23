@@ -33,7 +33,7 @@ impl App {
             match route {
                 Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
                 Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
-                Route::Settings | Route::Collections | Route::Sync { .. } | Route::Downloads => stack![crate::ui::home::plain_stage(), page].into(),
+                Route::Settings | Route::Collections | Route::Sync { .. } | Route::Downloads | Route::Search { .. } => stack![crate::ui::home::plain_stage(), page].into(),
                 Route::Detail { .. } => stack![self.detail_backdrop(), page].into(),
                 _ => page.into(),
             }
@@ -578,6 +578,7 @@ impl App {
                 &self.search_results(),
                 &self.library,
                 &self.downloads,
+                &self.covers,
             ),
             Route::Downloads => crate::ui::downloads::downloads_view(
                 self.download_rows(),

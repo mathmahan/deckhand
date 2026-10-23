@@ -201,14 +201,20 @@ impl SearchFocus {
         self.result.min(results.saturating_sub(1))
     }
 
-    /// Move. Down off the keyboard's last row goes into the results, and Up off the first result
-    /// comes back to it. Answers whether anything moved.
+    /// Move. The results stand beside the keyboard and under its last row both: Right off a row's
+    /// end and Down off the last row go into them, Left and Up off the first result come back.
+    /// Answers whether anything moved.
     pub fn step(&mut self, direction: Direction, results: usize) -> bool {
         let before = (self.in_results, self.key_row, self.key_col, self.result(results));
         let width = |row: usize| ROWS[row].chars().count();
         match (self.in_results, direction) {
             (false, Direction::Left) => self.key_col = self.key_col.saturating_sub(1),
+            (false, Direction::Right) if self.key_col + 1 >= width(self.key_row) && results > 0 => {
+                self.in_results = true;
+                self.result = 0;
+            }
             (false, Direction::Right) => self.key_col = (self.key_col + 1).min(width(self.key_row) - 1),
+            (true, Direction::Left) => self.in_results = false,
             (false, Direction::Up) => {
                 self.key_row = self.key_row.saturating_sub(1);
                 self.key_col = self.key_col.min(width(self.key_row) - 1);
@@ -293,5 +299,19 @@ mod tests {
         f.type_char('f');
         f.type_char(BACKSPACE);
         assert_eq!(f.query, "f");
+    }
+
+    #[test]
+    fn the_results_beside_the_keyboard_are_right_of_every_row_and_left_goes_back() {
+        let mut f = SearchFocus::default();
+        for _ in 0..9 {
+            f.step(Direction::Right, 5);
+        }
+        assert_eq!(f.key(), 'p');
+        assert!(!f.step(Direction::Right, 0), "no results, the row's end is the end");
+        assert!(f.step(Direction::Right, 5) && f.in_results, "right off the row's end");
+        f.step(Direction::Down, 5);
+        assert!(f.step(Direction::Left, 5) && !f.in_results, "left from any result is the keyboard");
+        assert_eq!(f.key(), 'p', "where it left");
     }
 }

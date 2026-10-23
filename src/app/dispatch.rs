@@ -273,7 +273,7 @@ impl App {
                             self.search_focus.type_char(c);
                         }
                     }
-                    return self.scroll_cursor_into_view();
+                    return Task::batch([self.scroll_cursor_into_view(), self.fetch_art()]);
                 }
                 match (key.as_str(), control) {
                     // Deckhand's own keyboard convenience: bracket keys step system without
@@ -286,7 +286,7 @@ impl App {
             }
             Message::SearchKey(key) => {
                 self.search_focus.type_char(key);
-                Task::none()
+                self.fetch_art()
             }
             Message::SearchResultClicked(index) => {
                 self.search_focus.focus_result(index);
