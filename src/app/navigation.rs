@@ -64,8 +64,8 @@ impl App {
             }
             Route::Search { .. } => {
                 let results = self.search_results().len();
-                // Under the keyboard, the list has roughly half the page.
-                let y = crate::ui::search::scroll_offset(self.search_focus.result(results), self.content_height / 2.0);
+                // Beside the keyboard, the list has the page's height but for its count and the hints.
+                let y = crate::ui::search::scroll_offset(self.search_focus.result(results), self.content_height - 100.0);
                 scroll_to(crate::ui::search::results_id(), AbsoluteOffset { x: 0.0, y })
             }
             Route::Downloads => {

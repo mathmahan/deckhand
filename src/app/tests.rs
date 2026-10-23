@@ -901,6 +901,36 @@ mod render {
         snapshot_sized(&app, "settings-storage", (1280.0, 1800.0));
     }
 
+    /// Search with a query that finds several games, their covers on hand, one on this device, the
+    /// cursor on the second result — and the page before anything is typed.
+    #[test]
+    #[ignore = "draws pages to PNGs for a person to look at"]
+    fn render_search() {
+        let mut app = paired_fixtures(30);
+        app.banner = None;
+        let _ = app.update(Message::TabSelected(Tab::Search));
+        snapshot(&app, "search-start");
+        let mut games: Vec<Game> = app.library.all_games().to_vec();
+        for (i, game) in games.iter_mut().enumerate() {
+            let url = format!("http://127.0.0.1:1/cover/{}.png", game.rom_id);
+            game.cover_url = Some(url.clone());
+            let hue = [[90, 140, 220], [220, 120, 70], [80, 190, 120], [200, 90, 160], [230, 200, 80]][i % 5];
+            app.covers.insert(url, covers::Cover::Ready(picture_sized(144, 200, hue), covers::CoverMeta { ratio: 0.72, dominant: Color::BLACK }));
+        }
+        app.library = Arc::new(Library::new(app.library.systems.clone(), games.clone()));
+        let _ = app.update(Message::KeyChar("e".into(), false));
+        if let Some(game) = app.search_results().first().map(|g| (*g).clone()) {
+            app.downloads.finish(game.rom_id, Ok(installed(game.rom_id, &game.title, 1024)));
+        }
+        let _ = app.update(Message::KeyChar("\u{8}".into(), false));
+        let _ = app.update(Message::KeyChar("e".into(), false));
+        for _ in 0..4 {
+            let _ = app.update(Message::Nav(Direction::Down));
+        }
+        let _ = app.update(Message::Nav(Direction::Down));
+        snapshot(&app, "search-results");
+    }
+
     /// Downloads with something of everything: two coming, one that failed, and five here with their
     /// covers, the cursor on one that is here — and the page with nothing on it.
     #[test]
