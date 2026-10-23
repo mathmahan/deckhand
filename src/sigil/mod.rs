@@ -940,6 +940,29 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_3ds_cia_is_known_by_the_program_id_of_its_first_content() {
+        let dir = temp("3ds-cia");
+        // Header, certificates, ticket and TMD, each starting on a 0x40 boundary; content 0's NCCH
+        // follows at 0x3940.
+        let mut cia = vec![0u8; 0x3940 + 0x200];
+        for (at, size) in [(0x00, 0x2020u32), (0x08, 0x0A00), (0x0C, 0x0350), (0x10, 0x0B64)] {
+            cia[at..at + 4].copy_from_slice(&size.to_le_bytes());
+        }
+        cia[0x20] = 0x80; // content 0 is there
+        cia[0x3940 + 0x100..0x3940 + 0x104].copy_from_slice(b"NCCH");
+        cia[0x3940 + 0x118..0x3940 + 0x120].copy_from_slice(&0x0004_0000_0012_3456u64.to_le_bytes());
+        fs::write(dir.join("game.cia"), &cia).unwrap();
+        let game = identify(&dir.join("game.cia"), Some("3ds")).unwrap();
+        assert_eq!(game.title_id(), "0004000000123456");
+        assert_eq!(game.save_id(), "00040000/00123456", "Azahar's title/<high>/<low> folder");
+
+        cia[0x3940 + 0x100..0x3940 + 0x104].copy_from_slice(&[0xA5; 4]);
+        fs::write(dir.join("encrypted.cia"), &cia).unwrap();
+        assert!(identify(&dir.join("encrypted.cia"), Some("3ds")).is_err(), "an encrypted content 0 has no id to read");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// An Eden NAND under `root` with one user: `profiles.dat` holds the UUID, and the user's save
     /// folder is named by it with its bytes reversed.
     fn eden_nand(root: &Path, uuid: [u8; 16]) -> String {
