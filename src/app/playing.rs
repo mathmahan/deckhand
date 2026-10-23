@@ -137,6 +137,7 @@ impl App {
                     self.save_synced_at = Some(std::time::Instant::now());
                 }
                 let no_emulator = matches!(&result, Err(why) if why == crate::launch::NO_EMULATOR);
+                let no_switch_emulator = matches!(&result, Err(why) if why == crate::launch::NO_SWITCH_EMULATOR);
                 let words = match result {
                     Err(why) => format!("\"{title}\" could not be launched: {why}."),
                     Ok(session) => {
@@ -164,9 +165,16 @@ impl App {
                     }
                 };
                 self.say(words);
-                // Nothing to start it with: RetroDECK is offered, where it can be installed. A state of it
-                // went up without a picture: RetroArch's state pictures are.
-                let retrodeck = if no_emulator { self.look_for_retrodeck(Offering::NoEmulator) } else { Task::none() };
+                // Nothing to start it with: RetroDECK is offered, where it can be installed — or Eden, for
+                // a Switch game, which RetroDECK cannot play. A state of it went up without a picture:
+                // RetroArch's state pictures are.
+                let retrodeck = if no_emulator {
+                    self.look_for_retrodeck(Offering::NoEmulator)
+                } else if no_switch_emulator {
+                    self.look_for_eden(Some(rom_id))
+                } else {
+                    Task::none()
+                };
                 let pictures = if pictureless { self.offer_state_pictures() } else { Task::none() };
                 // Back to the front for the result. A compositor may refuse; then it is one click away.
                 Task::batch([iced::window::latest().and_then(iced::window::gain_focus), refresh, retrodeck, pictures])

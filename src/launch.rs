@@ -56,6 +56,16 @@ pub const RETRODECK: &str = "net.retrodeck.retrodeck";
 /// which the window answers by offering to install RetroDECK.
 pub const NO_EMULATOR: &str = "no emulator is set up for it — install RetroDECK, or choose an emulator in Settings ▸ Playing";
 
+/// The Switch emulator Deckhand installs where there is none, from Flathub.
+pub const EDEN: &str = "dev.eden_emu.eden";
+
+/// Ryubing's Flatpak, the other Switch emulator ES-DE knows.
+const RYUBING: &str = "io.github.ryubing.Ryujinx";
+
+/// Why a Switch game cannot start: there is no Switch emulator here, and RetroDECK has none — which
+/// the window answers by offering to install Eden.
+pub const NO_SWITCH_EMULATOR: &str = "there is no Switch emulator here — install Eden, or choose an emulator in Settings ▸ Playing";
+
 /// The ES-DE system a RomM platform slug is, which is the name RetroDECK knows it by.
 ///
 /// The two mostly agree; these are the ones that do not, from the Kotlin app's `romFolderFor`. It
@@ -211,6 +221,9 @@ impl Launcher {
         let own = settings.system_commands.get(system).into_iter().chain(&settings.launch_command);
         if let Some(command) = own.into_iter().find(|c| !c.is_empty()) {
             return Ok(Launcher::Custom(command.clone()));
+        }
+        if system == "switch" {
+            return switch_emulator().map(Launcher::Custom).ok_or_else(|| NO_SWITCH_EMULATOR.to_string());
         }
         RetroDeck::detect().map(Launcher::RetroDeck).ok_or_else(|| NO_EMULATOR.to_string())
     }
@@ -370,6 +383,41 @@ pub fn preset(program: &Path) -> Vec<String> {
         .chain(options.iter().map(|o| o.to_string()))
         .chain(["{rom}".to_string()])
         .collect()
+}
+
+/// The Switch emulator on this device, as the command a game starts in it with: Eden's Flatpak, an
+/// Eden AppImage in `~/Applications`, or Ryubing's Flatpak, in that order. RetroDECK ships none, and
+/// from inside its own Flatpak it can start neither another Flatpak nor an AppImage, though ES-DE's
+/// table names both — so a Switch game starts in one of these directly, or not at all.
+pub fn switch_emulator() -> Option<Vec<String>> {
+    // Never the real ones from a test: the run's own folders, where a test can put one.
+    #[cfg(test)]
+    let (home, system) = (crate::config::test_root().join("home"), crate::config::test_root().join("flatpak"));
+    #[cfg(not(test))]
+    let (home, system) = (dirs::home_dir()?, PathBuf::from("/var/lib/flatpak"));
+    switch_emulator_in(&home, &system)
+}
+
+/// [`switch_emulator`], with the home folder and the system's Flatpak installation at `home` and
+/// `system`.
+fn switch_emulator_in(home: &Path, system: &Path) -> Option<Vec<String>> {
+    let exports = [home.join(".local/share/flatpak/exports/bin"), system.join("exports/bin")];
+    let flatpak = |app: &str| exports.iter().map(|dir| dir.join(app)).find(|launcher| launcher.is_file());
+    let appimage = || {
+        let mut found: Vec<PathBuf> = fs::read_dir(home.join("Applications"))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                name.starts_with("eden") && name.ends_with(".appimage")
+            })
+            .collect();
+        // Of several, the last by name, which is the newest version as they are usually named.
+        found.sort();
+        found.pop()
+    };
+    flatpak(EDEN).or_else(appimage).or_else(|| flatpak(RYUBING)).map(|program| preset(&program))
 }
 
 /// A folder RetroDECK's own config, `retrodeck.json`, names under `paths` — where its storage is.
@@ -1475,6 +1523,46 @@ mod tests {
         assert_eq!(bare.emulator("gc", rom), Emulator::Other("dolphin-emu".into()));
         let ra = Launcher::Custom(vec!["retroarch".into(), "-L".into(), "/c/mgba_libretro.so".into()]);
         assert_eq!(ra.emulator("gba", rom), Emulator::Core("mgba".into()));
+    }
+
+    /// RetroDECK has no Switch emulator and cannot start one: a Switch game starts in the one here,
+    /// Eden first, or says there is none.
+    #[test]
+    fn a_switch_game_starts_in_the_switch_emulator_here_and_never_in_retrodeck() {
+        use crate::sync::standalone::Emulator as Standalone;
+        let root = std::env::temp_dir().join(format!("deckhand-launch-switch-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (home, system) = (root.join("home"), root.join("flatpak"));
+        let words = |w: &[&str]| w.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        let put = |path: PathBuf| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "").unwrap();
+            path.display().to_string()
+        };
+        assert_eq!(switch_emulator_in(&home, &system), None);
+        let ryubing = put(system.join("exports/bin").join(RYUBING));
+        assert_eq!(switch_emulator_in(&home, &system), Some(words(&[&ryubing, "{rom}"])));
+        put(home.join("Applications/Eden-Linux-v0.2.0-amd64.AppImage"));
+        let appimage = put(home.join("Applications/Eden-Linux-v0.2.1-amd64.AppImage"));
+        assert_eq!(switch_emulator_in(&home, &system), Some(words(&[&appimage, "-f", "-g", "{rom}"])), "Eden before Ryubing, the newest");
+        let eden = put(system.join("exports/bin").join(EDEN));
+        assert_eq!(switch_emulator_in(&home, &system), Some(words(&[&eden, "-f", "-g", "{rom}"])), "its Flatpak before an AppImage");
+        let own = put(home.join(".local/share/flatpak/exports/bin").join(EDEN));
+        assert_eq!(switch_emulator_in(&home, &system).unwrap()[0], own, "this user's installation first");
+
+        // Found, it is Eden whose saves sync.
+        let Emulator::Other(name) = Launcher::Custom(preset(Path::new(&eden))).emulator("switch", Path::new("/g/switch/Game.nsp")) else {
+            panic!("a program")
+        };
+        assert_eq!(Standalone::for_launch("switch", &name), Some(Standalone::Eden));
+
+        // None here: never RetroDECK, but the reason the window offers Eden for. A command of the
+        // player's own comes first.
+        let mut settings = Settings::default();
+        assert_eq!(Launcher::find(&settings, "switch").unwrap_err(), NO_SWITCH_EMULATOR);
+        settings.system_commands.insert("switch".into(), words(&["eden", "{rom}"]));
+        assert!(matches!(Launcher::find(&settings, "switch"), Ok(Launcher::Custom(command)) if command[0] == "eden"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     const SYSTEMS: &str = r#"<?xml version="1.0"?>

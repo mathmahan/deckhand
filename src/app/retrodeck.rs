@@ -107,7 +107,7 @@ impl App {
                 let mut setting_up = output.clone();
                 let done = off_thread(move || {
                     // Dropped rather than waited for when the window is behind: only the latest counts.
-                    crate::retrodeck::install(scope, &cancel, |p| {
+                    crate::retrodeck::install(crate::launch::RETRODECK, scope, &cancel, |p| {
                         let _ = progress.try_send(Event::Progress(p));
                     })?;
                     let _ = setting_up.try_send(Event::SettingUp);

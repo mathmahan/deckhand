@@ -43,6 +43,7 @@ mod browse;
 mod detail;
 mod dispatch;
 mod download;
+mod eden;
 mod extras;
 mod installs;
 mod library;
@@ -327,6 +328,11 @@ pub enum Message {
     RetroDeckLooked(Offering, crate::retrodeck::Look),
     /// News from RetroDECK's install, or its first-run setup.
     RetroDeckEvent(crate::retrodeck::Event),
+    /// Where Eden would be installed, read for an offer of it: the game to start once it is in, and
+    /// the installation, or None with no Flatpak to put it in — see [`App::look_for_eden`].
+    EdenLooked(Option<i64>, Option<crate::retrodeck::Scope>),
+    /// News from Eden's install.
+    EdenEvent(EdenEvent),
     /// The window is asked to close by a signal: Steam's *Exit game* on Deckhand's own shortcut, or
     /// the session ending — see [`App::stop_asked`].
     StopAsked,
@@ -587,6 +593,8 @@ pub struct App {
     retrodeck_setup: RetroDeckSetup,
     /// How to stop RetroDECK's install while it runs.
     retrodeck_cancel: Option<crate::retrodeck::Cancel>,
+    /// Eden's install, while one runs — see [`App::install_eden`].
+    eden_install: Option<EdenInstall>,
     /// Every save has been synced once since the window opened — see [`App::sweep_once`].
     swept: bool,
     /// Paired just now: once the library is in, RetroDECK is offered if it is not here.
@@ -750,6 +758,7 @@ impl App {
             retrodeck: fixtures.is_none() && crate::launch::RetroDeck::detect().is_some(),
             retrodeck_setup: RetroDeckSetup::Idle,
             retrodeck_cancel: None,
+            eden_install: None,
             offer_retrodeck: false,
             swept: false,
             steam_bindings: crate::steam::Bindings::load(),
@@ -1453,6 +1462,8 @@ enum Then {
     RetroDeck(Option<crate::retrodeck::Scope>),
     /// Stop RetroDECK's install: the first row says yes.
     StopRetroDeck,
+    /// Install Eden into this installation, then start `play`: the first row says yes.
+    Eden { scope: crate::retrodeck::Scope, play: Option<i64> },
     /// Install ES-DE's hooks: the first row says yes.
     EsDeHooks,
     /// Turn RetroArch's state pictures on: the first row says yes, the second no for good.
@@ -1467,6 +1478,20 @@ pub enum RetroDeckSetup {
     Installing(Option<crate::retrodeck::Progress>),
     /// Installed and open for its first-run setup, which has the screen and the pad.
     SettingUp,
+}
+
+/// Eden's install, while it runs: the game that asked for it, to start once it is in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdenInstall {
+    play: Option<i64>,
+}
+
+/// What Eden's install says while it runs.
+#[derive(Debug, Clone)]
+pub enum EdenEvent {
+    Progress(crate::retrodeck::Progress),
+    /// It is over: installed, or why it went no further.
+    Done(Result<(), crate::retrodeck::Stop>),
 }
 
 /// What an offer of RetroDECK answers.
@@ -1560,6 +1585,8 @@ enum EmulatorChoice {
     Type,
     /// No command of its own: the system starts the way every game does.
     Shared,
+    /// Install Eden, the Switch emulator, where there is none.
+    InstallEden,
 }
 
 /// A row of the RetroArch config picker.
