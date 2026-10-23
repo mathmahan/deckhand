@@ -45,22 +45,30 @@ pub fn glass_row(lit: bool, radius: f32) -> impl Fn(&Theme, Status) -> Style {
     }
 }
 
-/// A key of an on-screen keyboard: filled with the accent under the cursor. `on` is a key held
-/// down — the shift, say — which keeps a fill of its own.
+/// A key of an on-screen keyboard, on glass: filled with the brightest ink under the cursor, as a
+/// selected pill is, and stood off the keys round it. `on` is a key held down — the shift, say —
+/// which keeps an accent edge of its own.
 pub fn key(lit: bool, on: bool) -> impl Fn(&Theme, Status) -> Style {
-    move |_, status| {
-        let fill = if lit {
-            theme::ACCENT
+    move |_, status| Style {
+        background: Some(Background::Color(if lit {
+            theme::INK
         } else if on || hovered(status) {
-            theme::FOCUS_FILL
+            theme::glass(0.14)
         } else {
-            theme::SURFACE
-        };
-        style(
-            Some(fill),
-            if lit { theme::BACKGROUND } else { theme::TEXT_PRIMARY },
-            Border { color: if on { theme::FOCUS_RING } else { theme::BORDER }, width: 1.0, radius: 6.0.into() },
-        )
+            theme::glass(0.06)
+        })),
+        text_color: if lit { theme::GROUND } else { theme::INK },
+        border: Border {
+            color: if on && !lit { theme::ACCENT_400 } else { theme::glass(0.12) },
+            width: if on && !lit { 1.5 } else { 1.0 },
+            radius: 10.0.into(),
+        },
+        shadow: if lit {
+            Shadow { color: theme::alpha(Color::BLACK, 0.45), offset: iced::Vector::new(0.0, 8.0), blur_radius: 20.0 }
+        } else {
+            Shadow::default()
+        },
+        snap: true,
     }
 }
 

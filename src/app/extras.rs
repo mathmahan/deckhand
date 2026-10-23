@@ -84,7 +84,7 @@ impl App {
             .collect();
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
-                title: format!("Extras of \"{title}\""),
+                title: format!("Extras of “{title}”"),
                 note: "What RomM keeps beside the game. Picking one puts it on this device, in its folder beside the game — or takes it off again, when it's here.".into(),
                 rows,
                 cursor: 0,

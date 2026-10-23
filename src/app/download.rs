@@ -130,7 +130,7 @@ impl App {
         let cursor = choices.iter().position(|c| !c.installed).unwrap_or(0);
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
-                title: format!("Download \"{}\"", game.title),
+                title: format!("Download “{}”", game.title),
                 note: "Choose what to put on this device. Each build keeps saves of its own; discs fetched one at a time join the ones already here.".into(),
                 rows,
                 cursor,
@@ -213,7 +213,7 @@ impl App {
                     .collect();
                 self.pick = Some(PendingPick {
                     picker: crate::ui::picker::Picker {
-                        title: format!("Play \"{title}\""),
+                        title: format!("Play “{title}”"),
                         note: "More than one build of it is on this device. Each keeps saves of its own.".into(),
                         rows,
                         cursor: 0,
@@ -246,7 +246,7 @@ impl App {
                     .collect();
                 self.pick = Some(PendingPick {
                     picker: crate::ui::picker::Picker {
-                        title: format!("Remove \"{title}\""),
+                        title: format!("Remove “{title}”"),
                         note: "Which build should go? Its saves stay on RomM, and one press downloads it again.".into(),
                         rows,
                         cursor: 0,

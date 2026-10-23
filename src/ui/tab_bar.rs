@@ -245,17 +245,18 @@ fn gear<'a>(current: Tab, focused: bool) -> Element<'a, Message> {
 }
 
 /// A pad button's letter in a ring — the button that does a thing, set beside the thing. `solid`
-/// for the one on a filled button, where a ring alone would vanish into the fill.
+/// for the one on a filled button, where a ring alone would vanish into the fill. A button named in
+/// more than a letter, Start, is a pill round its name.
 pub fn glyph<'a>(letter: &'a str, solid: bool) -> Element<'a, Message> {
     let size = if solid { 24.0 } else { 20.0 };
-    container(text(letter).size(if solid { 12.0 } else { 11.0 }).font(theme::BOLD).color(if solid { theme::ACCENT_800 } else { theme::INK }))
-        .center(Length::Fixed(size))
-        .style(move |_| container::Style {
-            background: solid.then_some(Background::Color(Color::WHITE)),
-            border: Border { color: if solid { Color::TRANSPARENT } else { alpha(theme::INK, 0.7) }, width: if solid { 0.0 } else { 1.5 }, radius: (size / 2.0).into() },
-            ..Default::default()
-        })
-        .into()
+    let name = container(text(letter).size(if solid { 12.0 } else { 11.0 }).font(theme::BOLD).color(if solid { theme::ACCENT_800 } else { theme::INK }));
+    let name = if letter.chars().count() > 1 { name.center_y(Length::Fixed(size)).padding([0.0, 7.0]) } else { name.center(Length::Fixed(size)) };
+    name.style(move |_| container::Style {
+        background: solid.then_some(Background::Color(Color::WHITE)),
+        border: Border { color: if solid { Color::TRANSPARENT } else { alpha(theme::INK, 0.7) }, width: if solid { 0.0 } else { 1.5 }, radius: (size / 2.0).into() },
+        ..Default::default()
+    })
+    .into()
 }
 
 /// The quiet line at a page's foot saying what the pad's buttons do there: each button's glyph and

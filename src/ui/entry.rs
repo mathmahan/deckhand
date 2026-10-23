@@ -10,7 +10,7 @@ use iced::widget::{button, column, container, row, text, Space};
 use iced::{Alignment, Background, Border, Element, Length};
 
 use crate::app::{Direction, Message};
-use crate::theme;
+use crate::theme::{self, glass};
 
 const LETTERS: [&str; 4] = ["1234567890", "qwertyuiop", "asdfghjkl-", "zxcvbnm_./"];
 const CAPITALS: [&str; 4] = ["1234567890", "QWERTYUIOP", "ASDFGHJKL-", "ZXCVBNM_./"];
@@ -199,48 +199,37 @@ impl Entry {
     }
 }
 
+/// The question as a sheet's heading, the field under it in glass with the accent edge of the one
+/// being typed into, and the keyboard below — glass keys, the cursor's filled with the ink.
 pub fn view<'a>(entry: &Entry) -> Element<'a, Message> {
-    let field = container(
-        text(format!("{}▌", entry.text))
-            .size(theme::text_size::TITLE_MEDIUM)
-            .color(theme::TEXT_PRIMARY)
-            .wrapping(Wrapping::Glyph),
-    )
-    .width(Length::Fill)
-    .padding([12, 16])
-    .style(|_| container::Style {
-        background: Some(Background::Color(theme::SURFACE)),
-        border: Border { color: theme::FOCUS_RING, width: 2.0, radius: 12.0.into() },
-        ..Default::default()
-    });
+    let field = container(text(format!("{}▌", entry.text)).size(20.0).color(theme::INK).wrapping(Wrapping::Glyph))
+        .width(Length::Fill)
+        .padding([14, 18])
+        .style(|_| container::Style {
+            background: Some(Background::Color(glass(0.06))),
+            border: Border { color: theme::ACCENT_400, width: 2.0, radius: 14.0.into() },
+            ..Default::default()
+        });
 
-    let mut card = column![
-        text(entry.title.clone()).size(theme::text_size::HEADLINE_SMALL).font(theme::MEDIUM).color(theme::TEXT_PRIMARY),
-        text(entry.note.clone()).size(theme::text_size::BODY_MEDIUM).color(theme::TEXT_SECONDARY),
-        Space::new().height(Length::Fixed(4.0)),
+    let mut page = column![
+        crate::ui::picker::heading("EDIT", None, entry.title.clone(), entry.note.clone()),
+        Space::new().height(Length::Fixed(8.0)),
         field,
     ]
-    .spacing(12)
-    .max_width(KEYBOARD_W + 120.0);
+    .spacing(12);
     if let Some(error) = &entry.error {
-        card = card.push(text(error.clone()).size(theme::text_size::BODY_MEDIUM).color(theme::ERROR));
+        page = page.push(text(error.clone()).size(theme::text_size::BODY_MEDIUM).color(theme::ERROR));
     }
-    card = card
-        .push(Space::new().height(Length::Fixed(8.0)))
-        .push(container(keyboard(entry)).center_x(Length::Fill))
-        .push(
-            text("Type, or walk the keys and press A  ·  X erases  ·  Y capitals  ·  Enter or Start saves  ·  Esc or B cancels")
-                .size(theme::text_size::LABEL_MEDIUM)
-                .color(theme::TEXT_MUTED),
-        );
+    page = page.push(Space::new().height(Length::Fixed(8.0))).push(container(keyboard(entry)).center_x(Length::Fill));
 
-    container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding([40, 28])
-        .center_x(Length::Fill)
-        .style(|_| container::Style { background: Some(Background::Color(theme::BACKGROUND)), ..Default::default() })
-        .into()
+    let hints = vec![
+        ("A", "Press the key".to_string()),
+        ("X", "Erase".to_string()),
+        ("Y", "Capitals".to_string()),
+        ("Start", "Save".to_string()),
+        ("B", "Cancel".to_string()),
+    ];
+    crate::ui::picker::sheet(page.into(), hints)
 }
 
 fn keyboard<'a>(entry: &Entry) -> Element<'a, Message> {

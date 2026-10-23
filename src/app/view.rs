@@ -81,56 +81,62 @@ impl App {
         stack![page, over].into()
     }
 
-    /// The whole window while a game is handed to its emulator or back — see [`Handover`]. Its
-    /// cover when that is on hand, what it is waiting on, and on the way out that Deckhand has to
-    /// stay open for it.
+    /// The whole window while a game is handed to its emulator or back — see [`Handover`]. Drawn as
+    /// Home's spotlight is, on its ground: what is happening and to which game at the left, the sweep
+    /// under it, and on the way out that Deckhand has to stay open for it; the cover at the right,
+    /// when it is on hand.
     fn handover_view(&self, handover: &Handover) -> Element<'_, Message> {
-        const COVER_H: f32 = 220.0;
+        use crate::theme::alpha;
+        const COVER_H: f32 = 340.0;
+        let game = self.library.game_of_build(handover.rom_id);
         let title = self.title_of(handover.rom_id);
-        let (headline, status) = match (handover.closing, self.settings.connection.is_some()) {
-            (true, _) => (format!("Saving {title}"), "Syncing its saves to RomM…"),
-            (false, true) => (format!("Opening {title}"), "Syncing BIOS and saves with RomM…"),
-            (false, false) => (format!("Opening {title}"), "Starting…"),
+        let (tag, status) = match (handover.closing, self.settings.connection.is_some()) {
+            (true, _) => ("SAVING", "Syncing its saves to RomM…"),
+            (false, true) => ("OPENING", "Syncing BIOS and saves with RomM…"),
+            (false, false) => ("OPENING", "Starting…"),
         };
-        let mut card = column![].spacing(14).align_x(Alignment::Center).max_width(640);
-        let url = self.library.game_of_build(handover.rom_id).and_then(|g| g.cover_url.as_deref());
-        if let Some((handle, meta)) = url.and_then(|u| self.covers.feature(u)) {
-            card = card.push(
-                iced::widget::image(handle)
-                    .content_fit(iced::ContentFit::Cover)
-                    .width(Length::Fixed(COVER_H * meta.ratio))
-                    .height(Length::Fixed(COVER_H))
-                    .border_radius(8.0),
-            );
-            card = card.push(Space::new().height(Length::Fixed(10.0)));
+        let mut top = row![crate::ui::home::tag(tag.into(), true)].spacing(12).align_y(Alignment::Center);
+        if let Some(game) = game {
+            top = top.push(text(self.library.system_name(&game.system_id).to_uppercase()).size(13.0).font(theme::SEMIBOLD).color(alpha(theme::INK, 0.82)));
         }
-        card = card
-            .push(
-                text(headline)
-                    .size(theme::text_size::HEADLINE_SMALL)
-                    .font(theme::BOLD)
-                    .color(theme::TEXT_PRIMARY)
-                    .width(Length::Fill)
-                    .align_x(Alignment::Center),
-            )
-            .push(text(status).size(theme::text_size::BODY_LARGE).color(theme::TEXT_SECONDARY))
-            .push(sweep(handover.since, std::time::Instant::now()));
+        let mut left = column![
+            top,
+            text(title.clone()).size(crate::ui::home::title_size(&title)).font(theme::DISPLAY).color(theme::INK),
+            text(status).size(17.0).color(alpha(theme::INK, 0.86)),
+            Space::new().height(Length::Fixed(4.0)),
+            sweep(handover.since, std::time::Instant::now()),
+        ]
+        .spacing(12)
+        .max_width(crate::ui::home::SPOTLIGHT_W);
         if handover.closing {
-            card = card.push(
-                text("Don't close Deckhand yet")
-                    .size(theme::text_size::LABEL_LARGE)
-                    .font(theme::MEDIUM)
-                    .color(theme::ACCENT_SOFT),
+            left = left.push(Space::new().height(Length::Fixed(4.0))).push(
+                text("Don't close Deckhand yet").size(theme::text_size::LABEL_LARGE).font(theme::SEMIBOLD).color(theme::ACCENT_400),
             );
         }
-        container(card)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(24)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .style(|_| container::Style { background: Some(Background::Color(theme::BACKGROUND)), ..Default::default() })
-            .into()
+
+        let mut content = row![container(left).width(Length::Fill)].spacing(48).align_y(Alignment::Center);
+        if let Some((handle, meta)) = game.and_then(|g| g.cover_url.as_deref()).and_then(|u| self.covers.feature(u)) {
+            content = content.push(
+                container(
+                    iced::widget::image(handle)
+                        .content_fit(iced::ContentFit::Cover)
+                        .width(Length::Fixed(COVER_H * meta.ratio))
+                        .height(Length::Fixed(COVER_H))
+                        .border_radius(14.0),
+                )
+                .style(|_| container::Style {
+                    border: Border { radius: 14.0.into(), ..Default::default() },
+                    shadow: iced::Shadow { color: alpha(iced::Color::BLACK, 0.5), offset: iced::Vector::new(0.0, 18.0), blur_radius: 40.0 },
+                    ..Default::default()
+                }),
+            );
+        }
+        let margin = crate::ui::tab_bar::MARGIN;
+        stack![
+            crate::ui::home::plain_stage(),
+            container(content).padding([0.0, margin + 48.0]).width(Length::Fill).center_y(Length::Fill),
+        ]
+        .into()
     }
 
     /// The rom under the Browse cursor, if that is where the cursor is.
@@ -656,7 +662,7 @@ fn sweep<'a>(since: std::time::Instant, now: std::time::Instant) -> Element<'a, 
         row![
             Space::new().width(portion(at)),
             container(Space::new().height(Length::Fixed(4.0))).width(portion(BAR)).style(|_| container::Style {
-                background: Some(Background::Color(theme::ACCENT)),
+                background: Some(Background::Color(theme::ACCENT_400)),
                 border: Border { radius: 2.0.into(), ..Default::default() },
                 ..Default::default()
             }),
@@ -664,10 +670,10 @@ fn sweep<'a>(since: std::time::Instant, now: std::time::Instant) -> Element<'a, 
         ]
         .height(Length::Fixed(4.0)),
     )
-    .width(Length::Fixed(240.0))
+    .width(Length::Fixed(320.0))
     .height(Length::Fixed(4.0))
     .style(|_| container::Style {
-        background: Some(Background::Color(theme::alpha(theme::NEUTRAL_100, 0.12))),
+        background: Some(Background::Color(theme::glass(0.10))),
         border: Border { radius: 2.0.into(), ..Default::default() },
         ..Default::default()
     })

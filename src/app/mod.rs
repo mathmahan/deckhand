@@ -1618,53 +1618,50 @@ struct PendingConflict {
 }
 
 /// The chooser: the two copies side by side, when each was made and how big, the newer marked.
-/// The whole window — the game is waiting on it, and nothing else can be done meanwhile.
+/// The whole window — the game is waiting on it, and nothing else can be done meanwhile — drawn as
+/// a sheet, the two copies as glass cards with the cursor's lifted on the ink ring.
 fn conflict_view<'a>(pending: &PendingConflict, title: &str) -> Element<'a, Message> {
     use crate::sync::Choice;
-    let when = |t: Option<std::time::SystemTime>| t.map_or_else(|| "unknown".to_string(), |t| crate::sync::format_timestamp(t).replace('T', " ").replace('Z', " UTC"));
-    let side = |choice: Choice, label: &str, detail: String| {
-        let lit = pending.keep == choice;
-        let newer = pending.conflict.newer == choice;
-        button(
-            column![
-                text(label.to_string()).size(theme::text_size::TITLE_MEDIUM).font(theme::MEDIUM).color(theme::TEXT_PRIMARY),
-                text(detail).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY),
-                text(if newer { "newer" } else { "" }).size(theme::text_size::LABEL_MEDIUM).font(theme::BOLD).color(theme::ACCENT),
-            ]
-            .spacing(6),
-        )
-        .width(Length::Fixed(300.0))
-        .padding(18)
-        .on_press(Message::ConflictChosen(choice))
-        .style(crate::ui::style::row(lit, 14.0))
-    };
+    use crate::theme::{alpha, glass};
+    use iced_fonts::lucide;
+    let when = |t: Option<std::time::SystemTime>| t.map_or_else(|| "When: not known".to_string(), |t| crate::sync::format_timestamp(t).replace('T', " ").replace('Z', " UTC"));
     let c = &pending.conflict;
-    let card = column![
-        text(format!("\"{title}\": {} changed here and on RomM", c.name))
-            .size(theme::text_size::TITLE_MEDIUM)
-            .font(theme::MEDIUM)
-            .color(theme::TEXT_PRIMARY),
-        text("Which one should the game use? The other is kept: RomM holds its copy in the game's history, and this device's is copied to save-backups first.")
-            .size(theme::text_size::BODY_MEDIUM)
-            .color(theme::TEXT_SECONDARY),
+    let side = |choice: Choice, icon: iced::widget::Text<'a>, label: &'a str, when: String, about: &'a str| {
+        let lit = pending.keep == choice;
+        let badge = container(icon.size(22.0).color(theme::ACCENT_400)).center(Length::Fixed(44.0)).style(|_| container::Style {
+            background: Some(Background::Color(glass(0.08))),
+            border: Border { radius: 22.0.into(), ..Default::default() },
+            ..Default::default()
+        });
+        let mut head = row![badge, text(label).size(20.0).font(theme::SEMIBOLD).color(theme::INK)].spacing(14).align_y(Alignment::Center);
+        if c.newer == choice {
+            head = head.push(Space::new().width(Length::Fill)).push(crate::ui::home::tag("NEWER".into(), true));
+        }
+        button(column![head, text(when).size(16.0).color(alpha(theme::INK, 0.86)), text(about).size(13.0).color(theme::TEXT_SECONDARY)].spacing(10))
+            .width(Length::Fixed(400.0))
+            .padding(22)
+            .on_press(Message::ConflictChosen(choice))
+            .style(crate::ui::style::glass_row(lit, 18.0))
+    };
+    let here = format!("{} · {}", when(c.local_time), crate::downloads::human_bytes(c.local_bytes));
+    let page = column![
+        crate::ui::picker::heading(
+            "SAVE CONFLICT",
+            Some(crate::ui::home::truncate(title, 48).to_uppercase()),
+            "Which save should it use?".to_string(),
+            format!(
+                "{} changed on this device and on RomM since they last matched. The other is kept too: RomM holds its copy in the game's history, and this device's is copied to save-backups first.",
+                c.name
+            ),
+        ),
+        Space::new().height(Length::Fixed(28.0)),
         row![
-            side(Choice::Local, "This device", format!("{} · {}", when(c.local_time), crate::downloads::human_bytes(c.local_bytes))),
-            side(Choice::Remote, "RomM", when(c.remote_time)),
+            side(Choice::Local, lucide::hard_drive(), "This device", here, "Copied to save-backups if RomM's is kept"),
+            side(Choice::Remote, lucide::cloud(), "RomM", when(c.remote_time), "Kept in the game's history on RomM if this device's is kept"),
         ]
         .spacing(16),
-        text("Left / Right to choose  ·  Enter or A keeps it  ·  Esc or B keeps the newer")
-            .size(theme::text_size::LABEL_MEDIUM)
-            .color(theme::TEXT_MUTED),
-    ]
-    .spacing(16)
-    .max_width(680);
-    container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .style(|_| container::Style { background: Some(Background::Color(theme::BACKGROUND)), ..Default::default() })
-        .into()
+    ];
+    crate::ui::picker::sheet(page.into(), vec![("A", "Keep this one".to_string()), ("B", "Keep the newer".to_string())])
 }
 
 /// How long a banner stays up, as long as the Kotlin app's: enough to read a line, short enough

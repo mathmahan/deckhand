@@ -1108,6 +1108,30 @@ mod render {
         snapshot(&app, "handover-no-cover");
     }
 
+    /// A save changed on both sides, the cursor on this device's though RomM's is newer.
+    #[test]
+    #[ignore = "draws pages to PNGs for a person to look at"]
+    fn render_conflict() {
+        use crate::sync::{Choice, Conflict};
+        let mut app = paired_fixtures(12);
+        let game = app.library.all_games()[0].clone();
+        app.playing = Some(game.rom_id);
+        let (reply, _answer) = futures::channel::oneshot::channel();
+        let at = |s: u64| Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+        let conflict = Conflict {
+            name: format!("{}.srm", game.title),
+            local_time: at(1_790_000_000),
+            remote_time: at(1_790_003_600),
+            local_bytes: 8192,
+            newer: Choice::Remote,
+        };
+        let _ = app.update(Message::LaunchEvent(crate::launch::Event::Conflict(game.rom_id, conflict, crate::launch::Reply::new(reply))));
+        if let Some(pending) = app.conflict.as_mut() {
+            pending.keep = Choice::Local;
+        }
+        snapshot(&app, "conflict");
+    }
+
     #[test]
     #[ignore = "writes PNGs; run explicitly"]
     fn render_collections_favourites() {
