@@ -109,20 +109,8 @@ pub fn tab_bar<'a>(current: Tab, focused: bool, status: Status) -> Element<'a, M
         .spacing(10)
         .align_y(Alignment::Center);
 
-    // The pixel wordmark, three pixels a cell: about the height the name had as text.
-    let (letters, cells_w, cells_h) = theme::wordmark();
-    let wordmark = row![
-        iced::widget::image(theme::logo()).width(Length::Fixed(30.0)).height(Length::Fixed(30.0)),
-        iced::widget::image(letters)
-            .width(Length::Fixed(cells_w as f32 * 3.0))
-            .height(Length::Fixed(cells_h as f32 * 3.0))
-            .filter_method(iced::widget::image::FilterMethod::Nearest),
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center);
-
     row![
-        wordmark,
+        wordmark(),
         pill,
         Space::new().width(Length::Fill),
         right,
@@ -132,6 +120,22 @@ pub fn tab_bar<'a>(current: Tab, focused: bool, status: Status) -> Element<'a, M
     .padding([0.0, MARGIN])
     .height(Length::Fixed(TAB_BAR_HEIGHT))
     .width(Length::Fill)
+    .into()
+}
+
+/// The ship and the pixel wordmark at the bar's left, three pixels a cell: about the height the name
+/// had as text. The sign-in screens have it there too, with no bar.
+pub fn wordmark<'a>() -> Element<'a, Message> {
+    let (letters, cells_w, cells_h) = theme::wordmark();
+    row![
+        iced::widget::image(theme::logo()).width(Length::Fixed(30.0)).height(Length::Fixed(30.0)),
+        iced::widget::image(letters)
+            .width(Length::Fixed(cells_w as f32 * 3.0))
+            .height(Length::Fixed(cells_h as f32 * 3.0))
+            .filter_method(iced::widget::image::FilterMethod::Nearest),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center)
     .into()
 }
 

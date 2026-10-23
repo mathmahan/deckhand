@@ -6,19 +6,37 @@
 //! the pad: Up and Down walk it, and A on a field opens the on-screen keyboard — so a Deck pairs
 //! without a keyboard at all, by QR code, typing only the address.
 //!
+//! Drawn as Settings is, on Home's ground with the wordmark where the header has it: what this is
+//! for where Home has its spotlight, and beside it the form as glass rows, the one under the pad's
+//! cursor lifted on the ink ring. The library's loading screen after it is drawn the same way, so
+//! pairing runs into the library without a change of look.
+//!
 //! Kept free of network code so the flow stays testable: [`LoginState`] only decides what is
 //! typed and whether it is ready.
 
-use iced::widget::{button, checkbox, column, container, row, text, text_input, Space};
-use iced::{Alignment, Background, Border, Element, Length, Shadow};
+use iced::widget::{button, column, container, row, stack, text, text_input, Space};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow};
+use iced_fonts::lucide;
 
 use crate::app::Message;
 use crate::romm::normalize_code;
-use crate::theme;
+use crate::theme::{self, alpha, glass};
+use crate::ui::tab_bar::{glyph, MARGIN, TAB_BAR_HEIGHT};
 
 /// The pairing code is 8 alphanumerics. RomM shows it grouped `ABCD-EFGH`, and its copy button
 /// includes the dash — so what is *typed* may be longer than what is sent.
 pub const CODE_LEN: usize = 8;
+
+/// The heading's width, beside the form.
+const HEADING_W: f32 = 500.0;
+/// The form's width, at the right; the heading takes what is left, up to its own.
+const FORM_W: f32 = 560.0;
+/// A row of the form, as tall as a Settings row.
+const ROW_H: f32 = 60.0;
+/// The column the rows' names stand in.
+const LABEL_W: f32 = 150.0;
+/// The QR code's side.
+const QR_SIDE: f32 = 300.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct LoginState {
@@ -77,281 +95,277 @@ impl LoginState {
 }
 
 pub fn login_view(state: &LoginState) -> Element<'_, Message> {
-    let heading = column![
-        iced::widget::image(theme::logo()).width(Length::Fixed(96.0)).height(Length::Fixed(96.0)),
-        Space::new().height(Length::Fixed(14.0)),
-        text("Deckhand").size(theme::text_size::DISPLAY_SMALL).font(theme::EXTRABOLD),
-        Space::new().height(Length::Fixed(6.0)),
-        text("Connect to your RomM server")
-            .size(theme::text_size::BODY_LARGE)
-            .color(theme::TEXT_SECONDARY),
-    ]
-    // Fill, not shrink: an alignment on a shrink-wrapped column only centres the lines against
-    // each other, which left the heading sitting wherever its longest line happened to start.
-    .width(Length::Fill)
-    .align_x(Alignment::Center);
-
-    if let Some(qr) = &state.qr {
-        return qr_view(heading, qr, state.status.as_deref());
+    match &state.qr {
+        Some(qr) => screen(qr_page(qr, state.status.as_deref()), vec![("B", "Back".to_string())]),
+        None => screen(form_page(state), form_hints(state)),
     }
+}
 
-    let steps = column![
-        step(1, "Enter your RomM server address."),
-        step(2, "Pair with a QR code: scan it with your phone, and approve Deckhand in RomM."),
-        step(3, "Or, in RomM's web UI, press Pair Device and type the 8-character code it shows."),
+/// The library on its way in, after pairing and at every start: the same ground and wordmark, and
+/// where it has got to.
+pub fn loading_view(status: &str) -> Element<'_, Message> {
+    let body = column![
+        crate::ui::home::tag("LIBRARY".into(), true),
+        text("Loading your library").size(theme::text_size::DISPLAY_MEDIUM).font(theme::DISPLAY).color(theme::INK),
+        text(status).size(17.0).color(alpha(theme::INK, 0.82)),
     ]
-    .spacing(6);
+    .spacing(12)
+    .width(Length::Fixed(HEADING_W));
+    screen(body.into(), Vec::new())
+}
+
+/// A sign-in screen: Home's ground with the accent wash, the wordmark where the header has it,
+/// `page` in the middle of the height, and what the pad's buttons do at the foot.
+fn screen<'a>(page: Element<'a, Message>, hints: Vec<(&'a str, String)>) -> Element<'a, Message> {
+    let head = container(crate::ui::tab_bar::wordmark()).padding([0.0, MARGIN]).center_y(Length::Fixed(TAB_BAR_HEIGHT));
+    let foot: Element<Message> = if hints.is_empty() {
+        Space::new().height(Length::Fixed(44.0)).into()
+    } else {
+        crate::ui::tab_bar::hint_line(hints)
+    };
+    stack![
+        crate::ui::home::plain_stage(),
+        column![head, container(page).padding([0.0, MARGIN]).width(Length::Fill).center_y(Length::Fill), foot],
+    ]
+    .into()
+}
+
+/// The heading where Home has its spotlight: the tag, what is being asked, and why.
+fn heading<'a>(eyebrow: &'a str, headline: &'a str, under: &'a str) -> iced::widget::Column<'a, Message> {
+    column![
+        row![
+            crate::ui::home::tag("SIGN IN".into(), true),
+            text(eyebrow).size(13.0).font(theme::SEMIBOLD).color(alpha(theme::INK, 0.82)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+        text(headline).size(theme::text_size::DISPLAY_MEDIUM).font(theme::DISPLAY).color(theme::INK),
+        text(under).size(17.0).color(alpha(theme::INK, 0.86)),
+    ]
+    .spacing(12)
+    .width(Length::Fill)
+}
+
+/// The address and the two ways in: the heading and its steps at the left, the form at the right.
+fn form_page(state: &LoginState) -> Element<'_, Message> {
+    let steps = column![
+        step(1, "Enter your RomM server's address."),
+        step(2, "Pair with a QR code: scan it with your phone, and approve Deckhand in RomM."),
+        step(3, "Or press Pair Device in RomM's web UI and type the 8-character code it shows."),
+    ]
+    .spacing(12);
+    let left = heading(
+        "PAIR THIS DEVICE",
+        "Connect to RomM",
+        "Your library, downloads and saves come from your RomM server. Pair once and Deckhand stays signed in.",
+    )
+    .push(Space::new().height(Length::Fixed(14.0)))
+    .push(steps);
 
     let lit = |row: Row| state.focus == row;
-    let url_field = field(
+    let frozen = state.connecting;
+    let server = field_row(
         lit(Row::Server),
         "Server",
         text_input("https://romm.local", &state.url)
-            .on_input_maybe((!state.connecting).then_some(Message::UrlChanged))
+            .on_input_maybe((!frozen).then_some(Message::UrlChanged))
             .on_submit(Message::Connect)
-            .size(theme::text_size::BODY_LARGE)
-            .padding(12)
+            .size(theme::text_size::BODY_MEDIUM)
+            .padding([8, 12])
             .style(input_style)
             .into(),
     );
-
-    let mut qr_button = button(
-        container(text("Pair with a QR code").size(theme::text_size::TITLE_MEDIUM).font(theme::MEDIUM)).center_x(Length::Fill),
-    )
-    .width(Length::Fill)
-    .padding([12, 26])
-    .style(move |_, status| {
-        let on = lit(Row::Qr) || matches!(status, button::Status::Hovered);
-        button::Style {
-            background: Some(Background::Color(if on { theme::FOCUS_FILL } else { theme::BACKGROUND })),
-            text_color: match status {
-                button::Status::Disabled => theme::TEXT_MUTED,
-                _ => theme::TEXT_PRIMARY,
-            },
-            border: Border { color: if on { theme::ACCENT } else { theme::BORDER }, width: if lit(Row::Qr) { 2.0 } else { 1.0 }, radius: 12.0.into() },
-            shadow: Shadow::default(),
-            snap: true,
-        }
-    });
-    if !state.connecting {
-        qr_button = qr_button.on_press(Message::StartQr);
-    }
-
-    let code_field = field(
+    let qr = wide_button(
+        row![lucide::qr_code().size(20.0), text("Pair with a QR code").size(16.0).font(theme::BOLD)].spacing(12).align_y(Alignment::Center),
+        // The way on until a code is typed in full; then Connect is.
+        !state.complete(),
+        lit(Row::Qr),
+        (!frozen).then_some(Message::StartQr),
+    );
+    let or = row![rule(), text("or with a pairing code").size(13.0).color(theme::TEXT_SECONDARY), rule()].spacing(14).align_y(Alignment::Center);
+    let code = field_row(
         lit(Row::Code),
         "Pairing code",
         text_input("ABCD-EFGH", &state.code)
-            .on_input_maybe((!state.connecting).then_some(Message::CodeChanged))
+            .on_input_maybe((!frozen).then_some(Message::CodeChanged))
             .on_submit(Message::Connect)
-            .size(theme::text_size::BODY_LARGE)
-            .padding(12)
+            .size(theme::text_size::BODY_MEDIUM)
+            .padding([8, 12])
             .style(input_style)
             .into(),
     );
+    let insecure = field_row(
+        lit(Row::Insecure),
+        "Certificate",
+        row![
+            text("Accept a self-signed one").size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY).width(Length::Fill),
+            off_on(state.insecure, frozen),
+        ]
+        .align_y(Alignment::Center)
+        .into(),
+    );
+    let ready = state.complete() && !frozen;
+    let connect = wide_button(
+        text(if frozen { "Connecting…" } else { "Connect" }).size(16.0).font(theme::BOLD),
+        ready,
+        lit(Row::Connect),
+        ready.then_some(Message::Connect),
+    );
 
-    let connect_lit = lit(Row::Connect);
-    let mut connect = button(
-        container(
-            text(if state.connecting { "Connecting…" } else { "Connect" })
-                .size(theme::text_size::TITLE_MEDIUM)
-                .font(theme::BOLD),
-        )
-        .center_x(Length::Fill),
-    )
-    .width(Length::Fill)
-    .padding([13, 26])
-    .style(move |_, status| {
-        let hovered = matches!(status, button::Status::Hovered) || connect_lit;
-        button::Style {
-            background: Some(Background::Color(match status {
-                // The dark tinted step, not a translucent accent: at 30% the accent still
-                // composites to a confidently purple button, so the only thing saying "not yet"
-                // was the label colour.
-                button::Status::Disabled => theme::FOCUS_FILL,
-                _ if hovered => theme::ACCENT_SOFT,
-                _ => theme::ACCENT,
-            })),
-            text_color: match status {
-                button::Status::Disabled => theme::TEXT_MUTED,
-                _ => iced::Color::WHITE,
-            },
-            border: Border {
-                color: if connect_lit { theme::TEXT_PRIMARY } else { iced::Color::TRANSPARENT },
-                width: if connect_lit { 2.0 } else { 0.0 },
-                radius: 12.0.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        }
-    });
-    if state.complete() && !state.connecting {
-        connect = connect.on_press(Message::Connect);
+    let mut right = column![server, qr, or, code, insecure, connect].spacing(10).width(Length::Fixed(FORM_W));
+    if let Some(message) = &state.status {
+        // A failure and the standing hint share the line, so the colour is what separates them.
+        right = right.push(text(message.clone()).size(theme::text_size::LABEL_LARGE).color(if frozen { theme::TEXT_SECONDARY } else { theme::ERROR }));
     }
 
-    let insecure = container(
-        checkbox(state.insecure)
-            .label("Accept a self-signed certificate")
-            .on_toggle_maybe((!state.connecting).then_some(Message::InsecureToggled))
-            .size(16.0)
-            .text_size(theme::text_size::LABEL_LARGE)
-            .spacing(10),
-    )
-    .padding([4, 6])
-    .style(move |_| container::Style {
-        border: Border { color: if lit(Row::Insecure) { theme::ACCENT } else { iced::Color::TRANSPARENT }, width: 2.0, radius: 8.0.into() },
-        ..Default::default()
-    });
+    row![container(left.max_width(HEADING_W)).width(Length::Fill), right].spacing(48).align_y(Alignment::Center).into()
+}
 
-    let status: Element<Message> = match &state.status {
-        Some(message) => text(message.clone())
-            .size(theme::text_size::LABEL_LARGE)
-            // A failure and the standing hint share the line, so the colour is what separates them.
-            .color(if state.connecting { theme::TEXT_SECONDARY } else { theme::ERROR })
-            .into(),
-        None => Space::new().height(Length::Fixed(0.0)).into(),
+/// What the pad's buttons do where the cursor is.
+fn form_hints(state: &LoginState) -> Vec<(&'static str, String)> {
+    let press = match state.focus {
+        Row::Server | Row::Code => "Type",
+        Row::Qr => "Pair with a QR code",
+        Row::Insecure => "Change",
+        Row::Connect => "Connect",
     };
+    vec![("A", press.to_string())]
+}
 
-    let card = container(
-        column![
-            heading,
-            Space::new().height(Length::Fixed(24.0)),
-            steps,
-            Space::new().height(Length::Fixed(26.0)),
-            url_field,
-            Space::new().height(Length::Fixed(14.0)),
-            qr_button,
-            Space::new().height(Length::Fixed(14.0)),
-            text("or with a pairing code").size(theme::text_size::LABEL_MEDIUM).color(theme::TEXT_MUTED).width(Length::Fill).align_x(Alignment::Center),
-            Space::new().height(Length::Fixed(8.0)),
-            code_field,
-            Space::new().height(Length::Fixed(14.0)),
-            insecure,
-            Space::new().height(Length::Fixed(22.0)),
-            connect,
-            Space::new().height(Length::Fixed(14.0)),
-            status,
-        ]
-        .width(Length::Fixed(560.0)),
-    )
-    .padding(36)
-    .style(|_| container::Style {
-        background: Some(Background::Color(theme::SURFACE)),
-        border: Border { color: theme::BORDER, width: 1.0, radius: 16.0.into() },
+/// One of the steps under the heading, its number in a glass ring.
+fn step<'a>(n: u8, body: &'a str) -> Element<'a, Message> {
+    let number = container(text(n.to_string()).size(13.0).font(theme::BOLD).color(theme::ACCENT_400)).center(Length::Fixed(28.0)).style(|_| container::Style {
+        background: Some(Background::Color(glass(0.08))),
+        border: Border { color: glass(0.14), width: 1.0, radius: 14.0.into() },
         ..Default::default()
     });
+    row![number, text(body).size(15.0).color(alpha(theme::INK, 0.8)).width(Length::Fill)].spacing(14).align_y(Alignment::Center).into()
+}
 
-    container(card)
+/// A row of the form: its name, and what it holds. A glass row, lifted on the ink ring under the
+/// pad's cursor — the input inside answers the pointer and a keyboard itself.
+fn field_row<'a>(lit: bool, label: &'a str, content: Element<'a, Message>) -> Element<'a, Message> {
+    button(
+        row![text(label).size(16.0).font(theme::SEMIBOLD).color(theme::INK).width(Length::Fixed(LABEL_W)), content]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(ROW_H))
+    .padding([0, 20])
+    .style(crate::ui::style::glass_row(lit, 16.0))
+    .into()
+}
+
+/// One of the form's two buttons, as wide as its rows: the accent when it is the way on, glass when
+/// it is not ready yet, ringed in the ink under the pad's cursor.
+fn wide_button<'a>(label: impl Into<Element<'a, Message>>, primary: bool, lit: bool, press: Option<Message>) -> Element<'a, Message> {
+    let spotlight = crate::ui::style::spotlight(primary, lit);
+    button(container(label).center(Length::Fill))
         .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
+        .height(Length::Fixed(56.0))
+        .padding([0, 20])
+        .on_press_maybe(press)
+        .style(move |theme, status| {
+            let mut style = spotlight(theme, status);
+            if matches!(status, button::Status::Disabled) && !primary {
+                style.text_color = alpha(theme::INK, 0.45);
+            }
+            style
+        })
+        .into()
+}
+
+/// The certificate row's two settings, as a Settings row steps between them.
+fn off_on<'a>(on: bool, frozen: bool) -> Element<'a, Message> {
+    let mut pills = row![].spacing(3).align_y(Alignment::Center);
+    for (words, value) in [("Off", false), ("On", true)] {
+        let set = on == value;
+        pills = pills.push(
+            button(container(text(words).size(13.0).font(if set { theme::SEMIBOLD } else { theme::MEDIUM })).center_y(Length::Fill))
+                .height(Length::Fixed(28.0))
+                .padding([0, 16])
+                .on_press_maybe((!frozen).then_some(Message::InsecureToggled(value)))
+                .style(move |_, status| button::Style {
+                    background: match (set, matches!(status, button::Status::Hovered)) {
+                        (true, _) => Some(Background::Color(theme::INK)),
+                        (false, true) => Some(Background::Color(glass(0.12))),
+                        (false, false) => None,
+                    },
+                    text_color: if set { theme::GROUND } else { alpha(theme::INK, 0.82) },
+                    border: Border { radius: 999.0.into(), ..Default::default() },
+                    shadow: Shadow::default(),
+                    snap: true,
+                }),
+        );
+    }
+    container(pills)
+        .padding(3)
         .style(|_| container::Style {
-            background: Some(Background::Color(theme::BACKGROUND)),
+            background: Some(Background::Color(glass(0.06))),
+            border: Border { color: glass(0.12), width: 1.0, radius: 999.0.into() },
             ..Default::default()
         })
         .into()
 }
 
-fn step<'a>(n: u8, body: &'a str) -> Element<'a, Message> {
-    row![
-        text(format!("{n}."))
-            .size(theme::text_size::LABEL_LARGE)
-            .font(theme::BOLD)
-            .color(theme::ACCENT)
-            .width(Length::Fixed(20.0)),
-        text(body).size(theme::text_size::LABEL_LARGE).color(theme::TEXT_BODY),
-    ]
-    .spacing(4)
-    .into()
+/// A faint line either side of the "or".
+fn rule<'a>() -> Element<'a, Message> {
+    container(Space::new().height(Length::Fixed(1.0)))
+        .width(Length::Fill)
+        .style(|_| container::Style { background: Some(Background::Color(glass(0.12))), ..Default::default() })
+        .into()
 }
 
-/// A labelled input. `lit` is the pad's cursor on it, ringed outside the input's own focus ring —
-/// the two are different cursors, a pointer's and a pad's.
-fn field<'a>(lit: bool, label: &'a str, input: Element<'a, Message>) -> Element<'a, Message> {
-    column![
-        text(if lit { format!("{}  ·  A to type", label.to_uppercase()) } else { label.to_uppercase() })
-            .size(11.0)
-            .font(theme::BOLD)
-            .color(if lit { theme::ACCENT } else { theme::TEXT_MUTED }),
-        Space::new().height(Length::Fixed(6.0)),
-        container(input).padding(2).style(move |_| container::Style {
-            border: Border { color: if lit { theme::ACCENT } else { iced::Color::TRANSPARENT }, width: 2.0, radius: 12.0.into() },
-            ..Default::default()
-        }),
-    ]
-    .into()
-}
-
-/// The QR code, waiting on a phone: what to do with it, the short code to check it against, and
-/// the way back.
-fn qr_view<'a>(heading: iced::widget::Column<'a, Message>, qr: &crate::qr_pairing::QrPairing, status: Option<&str>) -> Element<'a, Message> {
-    let code: Element<Message> = match &qr.qr {
-        Some(handle) => iced::widget::image(handle.clone()).width(Length::Fixed(280.0)).height(Length::Fixed(280.0)).into(),
-        None => Space::new().height(Length::Fixed(0.0)).into(),
-    };
-    let mut body = column![
-        heading,
-        Space::new().height(Length::Fixed(20.0)),
-        text("Scan this with your phone, sign in to RomM there, and approve Deckhand.")
-            .size(theme::text_size::BODY_LARGE)
-            .color(theme::TEXT_BODY)
-            .width(Length::Fill)
-            .align_x(Alignment::Center),
-        Space::new().height(Length::Fixed(18.0)),
-        container(code).center_x(Length::Fill),
-        Space::new().height(Length::Fixed(16.0)),
-        text(qr.user_code.clone()).size(theme::text_size::HEADLINE_SMALL).font(theme::BOLD).color(theme::ACCENT).width(Length::Fill).align_x(Alignment::Center),
-        text(qr.url.clone()).size(theme::text_size::LABEL_MEDIUM).color(theme::TEXT_MUTED).width(Length::Fill).align_x(Alignment::Center),
-        Space::new().height(Length::Fixed(16.0)),
-        text("Waiting for approval…").size(theme::text_size::LABEL_LARGE).color(theme::TEXT_SECONDARY).width(Length::Fill).align_x(Alignment::Center),
-    ]
-    .width(Length::Fixed(560.0));
+/// The QR code, waiting on a phone: what to do with it, the short code to check it against and the
+/// address it opens at the left, the code itself on a white card at the right, and the way back.
+fn qr_page<'a>(qr: &crate::qr_pairing::QrPairing, status: Option<&str>) -> Element<'a, Message> {
+    let mut left = heading("WAITING FOR YOUR PHONE", "Scan to pair", "Scan this with your phone, sign in to RomM there, and approve Deckhand.")
+        .push(Space::new().height(Length::Fixed(10.0)))
+        .push(text("THE CODE ROMM WILL SHOW").size(12.0).font(theme::BOLD).color(theme::TEXT_SECONDARY))
+        .push(text(qr.user_code.clone()).size(40.0).font(theme::DISPLAY).color(theme::ACCENT_400))
+        .push(text(qr.url.clone()).size(13.0).color(theme::TEXT_SECONDARY))
+        .push(Space::new().height(Length::Fixed(6.0)))
+        .push(
+            row![lucide::clock_four().size(16.0).color(alpha(theme::INK, 0.7)), text("Waiting for approval…").size(15.0).color(alpha(theme::INK, 0.82))]
+                .spacing(10)
+                .align_y(Alignment::Center),
+        );
     if let Some(status) = status {
-        body = body.push(text(status.to_string()).size(theme::text_size::LABEL_LARGE).color(theme::ERROR));
+        left = left.push(text(status.to_string()).size(theme::text_size::LABEL_LARGE).color(theme::ERROR));
     }
-    body = body.push(Space::new().height(Length::Fixed(18.0))).push(
-        button(container(text("Back").size(theme::text_size::LABEL_LARGE)).center_x(Length::Fill))
-            .width(Length::Fill)
-            .padding([10, 20])
-            .on_press(Message::CancelQr)
-            .style(|_, status| button::Style {
-                background: Some(Background::Color(if matches!(status, button::Status::Hovered) { theme::FOCUS_FILL } else { theme::BACKGROUND })),
-                text_color: theme::TEXT_PRIMARY,
-                border: Border { color: theme::BORDER, width: 1.0, radius: 10.0.into() },
-                shadow: Shadow::default(),
-                snap: true,
-            }),
-    );
-    body = body.push(
-        text("B or Esc goes back").size(theme::text_size::LABEL_MEDIUM).color(theme::TEXT_MUTED).width(Length::Fill).align_x(Alignment::Center),
-    );
-    container(
-        container(body).padding(36).style(|_| container::Style {
-            background: Some(Background::Color(theme::SURFACE)),
-            border: Border { color: theme::BORDER, width: 1.0, radius: 16.0.into() },
-            ..Default::default()
-        }),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .style(|_| container::Style { background: Some(Background::Color(theme::BACKGROUND)), ..Default::default() })
-    .into()
+    let back = button(row![glyph("B", false), text("Back").size(15.0).font(theme::SEMIBOLD)].spacing(9).align_y(Alignment::Center))
+        .padding(Padding { top: 9.0, right: 18.0, bottom: 9.0, left: 10.0 })
+        .on_press(Message::CancelQr)
+        .style(crate::ui::style::spotlight(false, false));
+    left = left.push(Space::new().height(Length::Fixed(8.0))).push(back);
+
+    let code: Element<Message> = match &qr.qr {
+        Some(handle) => iced::widget::image(handle.clone()).width(Length::Fixed(QR_SIDE)).height(Length::Fixed(QR_SIDE)).into(),
+        None => Space::new().width(Length::Fixed(QR_SIDE)).height(Length::Fixed(QR_SIDE)).into(),
+    };
+    // White to the edge of a quiet zone, as a phone's camera wants it, and stood off the ground.
+    let card = container(code).padding(18).style(|_| container::Style {
+        background: Some(Background::Color(Color::WHITE)),
+        border: Border { radius: 20.0.into(), ..Default::default() },
+        shadow: Shadow { color: alpha(Color::BLACK, 0.45), offset: iced::Vector::new(0.0, 14.0), blur_radius: 32.0 },
+        ..Default::default()
+    });
+
+    row![container(left.max_width(HEADING_W)).width(Length::Fill), card, Space::new().width(Length::Fixed(80.0))].spacing(48).align_y(Alignment::Center).into()
 }
 
+/// A field inside a glass row: a shade darker than the row, with the accent edge while it has the
+/// keyboard's focus.
 fn input_style(_theme: &iced::Theme, status: text_input::Status) -> text_input::Style {
     let focused = matches!(status, text_input::Status::Focused { .. });
     text_input::Style {
-        background: Background::Color(theme::BACKGROUND),
-        border: Border {
-            color: if focused { theme::ACCENT } else { theme::BORDER },
-            width: if focused { 2.0 } else { 1.0 },
-            radius: 10.0.into(),
-        },
+        background: Background::Color(alpha(theme::GROUND, 0.55)),
+        border: Border { color: if focused { theme::ACCENT_400 } else { glass(0.10) }, width: 1.0, radius: 10.0.into() },
         icon: theme::TEXT_MUTED,
-        placeholder: theme::TEXT_MUTED,
-        value: theme::TEXT_PRIMARY,
+        placeholder: alpha(theme::INK, 0.38),
+        value: theme::INK,
         selection: theme::ACCENT_800,
     }
 }

@@ -33,7 +33,7 @@ use crate::romm::{host_candidates, normalize_code, ApiError, RommClient, RomQuer
 use crate::systems;
 use crate::theme;
 use crate::ui::home::{home_view, HomeContext};
-use crate::ui::login::{login_view, LoginState};
+use crate::ui::login::{loading_view, login_view, LoginState};
 use crate::sync::retroarch::StatePictures;
 use crate::ui::settings::{Check, Installs, Row as SettingRow, SaveSync};
 use crate::ui::tab_bar::{tab_bar, Tab};
@@ -685,7 +685,7 @@ impl App {
         let host = settings_host(&settings);
         let mut app = Self {
             screen: if paired {
-                Screen::Loading { status: "Connecting...".into() }
+                Screen::Loading { status: "Connecting to RomM…".into() }
             } else {
                 Screen::Login(LoginState::new("https://".into()))
             },
@@ -1392,26 +1392,6 @@ fn reveal_system_row(index: usize) -> Task<Message> {
     use crate::ui::browse::{system_list_id, system_row_span, SYSTEM_ROW_PITCH};
     let (top, bottom) = system_row_span(index);
     reveal::reveal(system_list_id(), top, bottom, SYSTEM_ROW_PITCH).discard()
-}
-
-fn loading_view(status: &str) -> Element<'_, Message> {
-    container(
-        column![
-            iced::widget::image(theme::logo()).width(Length::Fixed(96.0)).height(Length::Fixed(96.0)),
-            Space::new().height(Length::Fixed(14.0)),
-            text("Deckhand").size(theme::text_size::DISPLAY_SMALL).font(theme::EXTRABOLD),
-            Space::new().height(Length::Fixed(10.0)),
-            text(status)
-                .size(theme::text_size::BODY_LARGE)
-                .color(theme::TEXT_SECONDARY),
-        ]
-        .align_x(Alignment::Center),
-    )
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .into()
 }
 
 /// A game on its way into its emulator, or back out of it, while its BIOS and saves move. The whole

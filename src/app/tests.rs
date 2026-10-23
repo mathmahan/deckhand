@@ -917,10 +917,19 @@ mod render {
         let mut state = LoginState::new("https://romm.example.com".into());
         state.focus = crate::ui::login::Row::Qr;
         app.screen = Screen::Login(state.clone());
-        snapshot_sized(&app, "login", (1280.0, 900.0));
+        snapshot(&app, "login");
+        let mut typed = state.clone();
+        typed.code = "ABCD-EFGH".into();
+        typed.insecure = true;
+        typed.focus = crate::ui::login::Row::Connect;
+        typed.status = Some("RomM turned the code down: it may have run out. Ask for a new one.".into());
+        app.screen = Screen::Login(typed);
+        snapshot(&app, "login-ready");
         state.qr = Some(Box::new(crate::qr_pairing::start_for_test("https://romm.example.com")));
         app.screen = Screen::Login(state);
-        snapshot_sized(&app, "login-qr", (1280.0, 900.0));
+        snapshot(&app, "login-qr");
+        app.screen = Screen::Loading { status: "Super Nintendo — 4 of 12 systems".into() };
+        snapshot(&app, "login-loading");
     }
 
     #[test]

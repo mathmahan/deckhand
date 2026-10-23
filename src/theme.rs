@@ -135,8 +135,6 @@ pub mod ui_scale {
 pub mod text_size {
     /// 46 — the Detail hero title, the one place in the app that shouts.
     pub const DISPLAY_MEDIUM: f32 = 46.0;
-    /// 34 — view-level titles, and Home's hero title.
-    pub const DISPLAY_SMALL: f32 = 34.0;
     /// 24 — page titles (the Systems heading, a system's name).
     pub const HEADLINE_SMALL: f32 = 24.0;
     /// 18 — stat values, the Play button.
