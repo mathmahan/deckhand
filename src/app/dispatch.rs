@@ -557,6 +557,8 @@ impl App {
             Message::LaunchEvent(event) => self.on_launch_event(event),
             Message::RetroDeckLooked(offering, look) => self.offer_retrodeck(offering, look),
             Message::RetroDeckEvent(event) => self.on_retrodeck_event(event),
+            Message::EdenLooked(play, scope) => self.offer_eden(play, scope),
+            Message::EdenEvent(event) => self.on_eden_event(event),
             Message::StopAsked => self.stop_asked(),
             // Answered in `update`, before dispatch; one arriving with nothing waiting is stale.
             Message::ConflictChosen(_) => Task::none(),

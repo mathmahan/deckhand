@@ -224,9 +224,10 @@ pub enum Stop {
     Failed(String),
 }
 
-/// Install RetroDECK into `scope` from Flathub, telling `tell` how far it has got. Blocks until
+/// Install `app` into `scope` from Flathub, telling `tell` how far it has got: RetroDECK, or Eden
+/// for Switch games, which RetroDECK cannot play ([`crate::launch::switch_emulator`]). Blocks until
 /// `flatpak` is done — or until [`Cancel::cancel`].
-pub fn install(scope: Scope, cancel: &Cancel, mut tell: impl FnMut(Progress)) -> Result<(), Stop> {
+pub fn install(app: &str, scope: Scope, cancel: &Cancel, mut tell: impl FnMut(Progress)) -> Result<(), Stop> {
     let failed = |e: std::io::Error| Stop::Failed(format!("flatpak could not be started ({e})"));
     if scope == Scope::User {
         let added = Command::new("flatpak")
@@ -240,7 +241,7 @@ pub fn install(scope: Scope, cancel: &Cancel, mut tell: impl FnMut(Progress)) ->
         }
     }
     let mut child = Command::new("flatpak")
-        .args(["install", scope.flag(), "-y", "--noninteractive", "flathub", RETRODECK])
+        .args(["install", scope.flag(), "-y", "--noninteractive", "flathub", app])
         .env("LC_ALL", "C.UTF-8")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -162,6 +162,10 @@ impl App {
                 }
                 Task::none()
             }
+            Then::Eden { scope, play } => match chosen {
+                0 => self.install_eden(scope, play),
+                _ => Task::none(),
+            },
             Then::EsDeHooks => match chosen {
                 0 => self.activate_setting(SettingRow::EsDeHooks),
                 _ => Task::none(),
@@ -182,6 +186,7 @@ impl App {
                     self.write_settings();
                     Task::none()
                 }
+                Some(EmulatorChoice::InstallEden) => self.look_for_eden(None),
                 None => Task::none(),
             },
         })
@@ -354,6 +359,18 @@ impl App {
         }
     }
 
+    /// What `system` starts its games with when it has no emulator of its own: the default one — but a
+    /// Switch game never goes to RetroDECK, which cannot play it, rather to the Switch emulator here.
+    pub(super) fn uses_shared(&self, system: &str, default: &str) -> String {
+        if system != "switch" {
+            return default.to_string();
+        }
+        match crate::launch::switch_emulator() {
+            Some(words) => format!("Uses the Switch emulator here: {}", crate::launch::join_command(&words)),
+            None => "No Switch emulator yet: Eden can be installed".into(),
+        }
+    }
+
     /// The library's systems, each with the emulator it starts with — its own, or the shared one — to
     /// pick one to change. A system with a command but no games left in the library is listed too, so
     /// the command can still be cleared.
@@ -378,7 +395,7 @@ impl App {
                 let own = self.settings.system_commands.get(es);
                 Row {
                     label: name.clone(),
-                    detail: own.map_or_else(|| default.clone(), |words| crate::launch::join_command(words)),
+                    detail: own.map_or_else(|| self.uses_shared(es, &default), |words| crate::launch::join_command(words)),
                     aside: String::new(),
                     mark: own.map(|_| "own emulator".to_string()),
                 }
@@ -418,14 +435,34 @@ impl App {
             mark: own.is_some().then(|| "in use".to_string()),
         });
         choices.push(EmulatorChoice::Type);
-        let (default, works) = self.default_emulator();
-        rows.push(Row {
-            label: "Use RetroDeck".into(),
-            detail: if works { default } else { format!("{default} is not installed, please install RetroDeck") },
-            aside: String::new(),
-            mark: own.is_none().then(|| "in use".to_string()),
-        });
-        choices.push(EmulatorChoice::Shared);
+        if system == "switch" {
+            // Not RetroDECK, which has no Switch emulator: the one here, or Eden, installed.
+            match crate::launch::switch_emulator() {
+                Some(words) => {
+                    rows.push(Row {
+                        label: "Use the Switch emulator here".into(),
+                        detail: crate::launch::join_command(&words),
+                        aside: String::new(),
+                        mark: own.is_none().then(|| "in use".to_string()),
+                    });
+                    choices.push(EmulatorChoice::Shared);
+                }
+                None => {
+                    let size = downloads::human_bytes(super::eden::EDEN_DOWNLOAD_BYTES);
+                    rows.push(Row::new("Install Eden", format!("The Switch emulator, from Flathub: about {size}")));
+                    choices.push(EmulatorChoice::InstallEden);
+                }
+            }
+        } else {
+            let (default, works) = self.default_emulator();
+            rows.push(Row {
+                label: "Use RetroDeck".into(),
+                detail: if works { default } else { format!("{default} is not installed, please install RetroDeck") },
+                aside: String::new(),
+                mark: own.is_none().then(|| "in use".to_string()),
+            });
+            choices.push(EmulatorChoice::Shared);
+        }
         self.pick = Some(PendingPick {
             picker: crate::ui::picker::Picker {
                 title: format!("Emulator for {name}"),

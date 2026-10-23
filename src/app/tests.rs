@@ -3637,6 +3637,78 @@ fn retrodeck_is_only_offered_once_paired() {
     assert_eq!(rows.last().map(|r| r.label.as_str()), Some("Install RetroDECK…"));
 }
 
+// ---- Eden, for Switch games ---------------------------------------------------------------------
+
+#[test]
+fn a_switch_game_with_no_emulator_offers_eden_and_starts_once_it_is_in() {
+    use crate::retrodeck::{Progress, Scope, Stop};
+    let mut app = paired_fixtures(12);
+    let game = app.library.all_games()[0].clone();
+    let _ = app.update(Message::DownloadEvent(crate::downloads::Event::Finished(
+        game.rom_id,
+        Ok(Box::new(installed(game.rom_id, &game.title, 1 << 20))),
+    )));
+
+    // It could not start for want of a Switch emulator: Eden is offered, to start it once it is in.
+    app.playing = Some(game.rom_id);
+    let _ = app.update(Message::LaunchEvent(crate::launch::Event::Ended(game.rom_id, Err(crate::launch::NO_SWITCH_EMULATOR.into()))));
+    let pick = app.pick.as_ref().expect("the offer");
+    assert_eq!(pick.picker.title, "Install Eden?");
+    assert!(pick.picker.note.contains("starts once it's in"), "{}", pick.picker.note);
+    assert_eq!(pick.picker.rows[0].label, "Install Eden");
+    assert!(matches!(pick.then, Then::Eden { scope: Scope::User, play: Some(id) } if id == game.rom_id));
+    let _ = app.view();
+    let _ = app.update(Message::Picked(1));
+    assert!(app.pick.is_none() && app.eden_install.is_none(), "not now");
+
+    // Installing: its progress in the banner. In: said, and the game started.
+    app.eden_install = Some(EdenInstall { play: Some(game.rom_id) });
+    let _ = app.update(Message::EdenEvent(EdenEvent::Progress(Progress { step: 2, of: 2, percent: 45 })));
+    assert_eq!(app.banner.as_deref(), Some("Installing Eden · 2 of 2 · 45%"));
+    let _ = app.update(Message::EdenEvent(EdenEvent::Done(Ok(()))));
+    assert!(app.eden_install.is_none());
+    assert_eq!(app.playing, Some(game.rom_id), "the game that asked for it");
+    app.playing = None;
+    app.handover = None;
+
+    // With a command of the player's own for Switch, that one still starts them, and says so.
+    app.settings.system_commands.insert("switch".into(), vec!["eden".into()]);
+    app.eden_install = Some(EdenInstall { play: Some(game.rom_id) });
+    let _ = app.update(Message::EdenEvent(EdenEvent::Done(Ok(()))));
+    assert!(app.banner.as_deref().is_some_and(|b| b.contains("your own command")), "{:?}", app.banner);
+    assert_eq!(app.playing, None);
+
+    // Failed: why.
+    app.eden_install = Some(EdenInstall { play: None });
+    let _ = app.update(Message::EdenEvent(EdenEvent::Done(Err(Stop::Failed("No remote refs found".into())))));
+    assert_eq!(app.banner.as_deref(), Some("Eden could not be installed: No remote refs found"));
+
+    // No Flatpak to put it in: said, with where to choose one instead.
+    let _ = app.update(Message::EdenLooked(None, None));
+    assert!(app.banner.as_deref().is_some_and(|b| b.contains("Flatpak")), "{:?}", app.banner);
+}
+
+#[test]
+fn switch_s_emulator_in_settings_is_the_one_here_or_eden_to_install() {
+    let mut app = paired_fixtures(12);
+    // No Switch emulator in the test's home: RetroDECK is not offered for it, Eden is.
+    let _ = app.pick_emulator_for("switch".into());
+    let pick = app.pick.as_ref().unwrap();
+    assert!(!pick.picker.rows.iter().any(|r| r.label.contains("RetroDeck")), "RetroDECK can't play Switch games");
+    let Then::SystemEmulator { choices, .. } = &pick.then else { panic!("its emulator") };
+    let install = choices.iter().position(|c| *c == EmulatorChoice::InstallEden).expect("Eden, to install");
+    assert_eq!(pick.picker.rows[install].label, "Install Eden");
+    let _ = app.update(Message::Picked(install));
+    let pick = app.pick.as_ref().expect("the offer");
+    assert!(matches!(pick.then, Then::Eden { play: None, .. }));
+    assert!(!pick.picker.note.contains("starts once"), "no game asked");
+    app.pick = None;
+
+    // The list of systems says the same.
+    assert_eq!(app.uses_shared("switch", "Uses the default emulator: RetroDECK"), "No Switch emulator yet: Eden can be installed");
+    assert_eq!(app.uses_shared("psx", "Uses the default emulator: RetroDECK"), "Uses the default emulator: RetroDECK");
+}
+
 #[test]
 fn pairing_offers_retrodeck_once_the_library_is_in() {
     let (mut app, _) = App::new(Some(12));
