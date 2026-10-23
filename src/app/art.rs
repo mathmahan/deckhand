@@ -118,6 +118,10 @@ impl App {
                 }
             }
             Screen::Browsing(Route::Saves { rom_id, .. }) => {
+                // The game's picture and light behind the page, as its game page has them.
+                if let Some(game) = self.library.game(*rom_id) {
+                    wanted.extend(pictures_of(game, &px));
+                }
                 // Every screenshot the game's records carry, at the preview's size; a row draws the
                 // same picture small rather than asking for a second copy.
                 if let Some(Ok(saves)) = self.game_saves.get(rom_id) {

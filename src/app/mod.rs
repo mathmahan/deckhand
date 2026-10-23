@@ -1126,8 +1126,8 @@ impl App {
         match &self.screen {
             Screen::Browsing(Route::Browse { .. }) => self.library_spotlit().first().map(|game| game.rom_id),
             // The game page stands on its game's picture: opened from Home or the Library, the one
-            // already behind it.
-            Screen::Browsing(Route::Detail { rom_id, .. }) => Some(*rom_id),
+            // already behind it. So do its saves, opened from it.
+            Screen::Browsing(Route::Detail { rom_id, .. } | Route::Saves { rom_id, .. }) => Some(*rom_id),
             _ => self.focus.spotlit(&self.shelves).map(|game| game.rom_id),
         }
     }

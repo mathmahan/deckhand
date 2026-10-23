@@ -29,13 +29,13 @@ impl App {
             let body: Element<Message> = stack![body, scrim].into();
             let page = column![tab_bar(route.tab(), self.chrome == Some(Chrome::Tabs), self.header_status()), body];
             // Home's picture runs to the top of the window, under the header: the bar floats on it.
-            // So does the Library's, over its grid.
+            // So does the Library's, over its grid, and a game's behind its page and its saves; every
+            // other page has Home's ground and the accent wash.
             match route {
                 Route::Home => stack![crate::ui::home::page_backdrop(&self.home_context()), page].into(),
                 Route::Browse { .. } => stack![self.library_backdrop(), page].into(),
                 Route::Settings | Route::Collections | Route::Sync { .. } | Route::Downloads | Route::Search { .. } => stack![crate::ui::home::plain_stage(), page].into(),
-                Route::Detail { .. } => stack![self.detail_backdrop(), page].into(),
-                _ => page.into(),
+                Route::Detail { .. } | Route::Saves { .. } => stack![self.detail_backdrop(), page].into(),
             }
         } else {
             body

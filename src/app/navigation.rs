@@ -559,6 +559,14 @@ impl App {
         if matches!(route, Route::Sync { .. }) {
             return self.cycle_sync_filter(delta);
         }
+        // Nor has a game's Saves page: they walk its two tabs, as Left and Right do.
+        if matches!(route, Route::Saves { .. }) {
+            let tab = if delta < 0 { crate::game_saves::Tab::States } else { crate::game_saves::Tab::Saves };
+            if self.saves_focus.tab == tab {
+                return Task::none();
+            }
+            return self.update(Message::SavesTab(tab));
+        }
         // Nor has Collections: they walk its kinds, the cursor staying in the band it is in.
         if *route == Route::Collections {
             let kinds = self.all_collections.kinds().len();

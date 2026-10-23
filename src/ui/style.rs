@@ -18,17 +18,6 @@ fn style(background: Option<Color>, text: Color, border: Border) -> Style {
     Style { background: background.map(Background::Color), text_color: text, border, shadow: Shadow::default(), snap: true }
 }
 
-/// A row of a list, or a card: the surface, lit with the focus fill and a 2 px ring.
-pub fn row(lit: bool, radius: f32) -> impl Fn(&Theme, Status) -> Style {
-    move |_, status| {
-        style(
-            Some(if lit || hovered(status) { theme::FOCUS_FILL } else { theme::SURFACE }),
-            theme::TEXT_PRIMARY,
-            Border { color: if lit { theme::FOCUS_RING } else { theme::BORDER }, width: if lit { 2.0 } else { 1.0 }, radius: radius.into() },
-        )
-    }
-}
-
 /// A row on glass, as Home's look has it: lifted under the cursor on a ring of the brightest ink and
 /// a shadow, and only brightened under the pointer.
 pub fn glass_row(lit: bool, radius: f32) -> impl Fn(&Theme, Status) -> Style {
