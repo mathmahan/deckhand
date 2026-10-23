@@ -135,16 +135,12 @@ pub mod ui_scale {
 pub mod text_size {
     /// 46 — the Detail hero title, the one place in the app that shouts.
     pub const DISPLAY_MEDIUM: f32 = 46.0;
-    /// 24 — page titles (the Systems heading, a system's name).
-    pub const HEADLINE_SMALL: f32 = 24.0;
     /// 18 — body.
     pub const BODY_LARGE: f32 = 18.0;
     /// 16 — tile titles, section labels. The floor for must-read text.
     pub const BODY_MEDIUM: f32 = 16.0;
     /// 14 — meta, counts, chips, prompt bar.
     pub const LABEL_LARGE: f32 = 14.0;
-    /// 12 — muted micro-labels, never for must-read content.
-    pub const LABEL_MEDIUM: f32 = 12.0;
 }
 
 use iced::font::{Family, Weight};
