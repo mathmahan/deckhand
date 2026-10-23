@@ -188,6 +188,7 @@ impl App {
         rom_ids.dedup();
         // The build on this device, the tile's own first: its core decides which states land in a slot.
         let installed = std::iter::once(rom_id).chain(rom_ids.iter().copied()).find_map(|id| self.downloads.installed(id)).cloned();
+        let roms = rom_ids.into_iter().map(|id| (id, self.library.stamp(id))).collect();
         let (client, settings) = (self.client.clone(), self.settings.clone());
         Task::perform(
             async move {
@@ -195,7 +196,7 @@ impl App {
                     Some(installed) => off_thread(move || crate::sync::states::Core::for_game(&settings, &installed)).await.unwrap_or_default(),
                     None => crate::sync::states::Core::default(),
                 };
-                crate::game_saves::load(client, connection, rom_ids, Settings::config_dir(), core).await
+                crate::game_saves::load(client, connection, roms, Settings::config_dir(), core).await
             },
             move |result| Message::SavesLoaded(rom_id, result.map(Arc::new)),
         )
