@@ -107,16 +107,22 @@ async fn choose(name: &str, local_time: Option<SystemTime>, remote_time: Option<
     }
 }
 
-/// The RomM saves and states this device holds right now: what its sync last agreed with RomM on,
-/// for every save, state and standalone save set still on disk. Read from the three indexes, so it
-/// costs no request — and it is exact, since an entry records the very save id the content came from
-/// or went up as.
-pub fn on_device(store: &Path) -> HashSet<i64> {
+/// The RomM saves and states of the roms `of`, each with its stamp, that this device holds right
+/// now: what its sync last agreed with RomM on, for every save, state and standalone save set still
+/// on disk. Read from the three indexes, so it costs no request — and it is exact, since an entry
+/// records the very save id the content came from or went up as.
+///
+/// Only an entry that follows one of `of` counts ([`Entry::follows`]). The indexes hold what was
+/// agreed with every server this device was paired with, and a save id is one server's: another
+/// server, or a rebuilt RomM, numbers its saves from 1 too, so one of them would otherwise be taken
+/// for a save held from the first.
+pub fn on_device(store: &Path, of: &[(i64, Option<Stamp>)]) -> HashSet<i64> {
     ["save-index.json", "state-index.json", "standalone-index.json"]
         .iter()
         .flat_map(|file| {
             Index::load(store.join(file))
                 .iter()
+                .filter(|(_, entry)| of.iter().any(|(rom_id, stamp)| entry.follows(*rom_id, stamp.as_ref())))
                 .filter(|(key, entry)| {
                     // A set that lies flat on a card it shares records its own files: a Dolphin
                     // memory card's folder is there as long as Dolphin is, so without them the save
@@ -1661,8 +1667,29 @@ mod tests {
         sets.set(&gci.join("GALE01.gci.zip"), flat(40, "01-GALE-here.gci")).unwrap();
         sets.set(&gci.join("GMSE01.gci.zip"), flat(41, "01-GMSE-deleted.gci")).unwrap();
 
-        let ids = on_device(&store);
+        let ids = on_device(&store, &[(1, None)]);
         assert_eq!(ids, [10, 20, 40].into_iter().collect(), "a deleted save, a missing folder or an emptied card is not here");
+        let _ = fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn a_save_held_from_another_server_is_not_on_this_device_for_this_one() {
+        let store = std::env::temp_dir().join(format!("deckhand-on-device-servers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&store);
+        fs::create_dir_all(&store).unwrap();
+        let here = store.join("here.srm");
+        fs::write(&here, "progress").unwrap();
+        let stamp = |born: &str| Some(Stamp { stem: "here".into(), born: Some(born.into()) });
+        let first = stamp("2026-08-01T22:26:48+00:00");
+        let entry = Entry { rom_id: 7, hash: "h".into(), save_id: 10, stamp: first.clone(), ..Default::default() };
+        Index::load(store.join("save-index.json")).set(&here, entry).unwrap();
+
+        assert_eq!(on_device(&store, &[(7, first)]), [10].into_iter().collect());
+        assert!(on_device(&store, &[(9, stamp("2026-10-12T19:00:00+00:00"))]).is_empty(), "another game's page");
+        assert!(
+            on_device(&store, &[(7, stamp("2026-10-12T19:00:00+00:00"))]).is_empty(),
+            "the same id on another server, whose save 10 is some other save"
+        );
         let _ = fs::remove_dir_all(&store);
     }
 

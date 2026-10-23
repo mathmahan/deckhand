@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use crate::app::Direction;
 use crate::config::Connection;
+use crate::library::Stamp;
 use crate::romm::RommClient;
 use crate::romm::models::SaveAsset;
 use crate::sync::{parse_timestamp, states};
@@ -56,15 +57,17 @@ impl GameSaves {
 }
 
 /// Fetch them: the records from RomM, the "on this device" ids from the indexes in `store` — and from
-/// RomM's own record of which devices hold which save, where it keeps one. `core` is the one the game
-/// runs under here, which decides the states that land in a slot.
+/// RomM's own record of which devices hold which save, where it keeps one. `roms` are the game's,
+/// each with its stamp, which an index entry has to follow to count ([`crate::sync::on_device`]).
+/// `core` is the one the game runs under here, which decides the states that land in a slot.
 pub async fn load(
     client: RommClient,
     connection: Connection,
-    rom_ids: Vec<i64>,
+    roms: Vec<(i64, Option<Stamp>)>,
     store: PathBuf,
     core: states::Core,
 ) -> Result<GameSaves, String> {
+    let rom_ids: Vec<i64> = roms.iter().map(|(rom_id, _)| *rom_id).collect();
     let (mut saves, mut states) = client.fetch_game_saves(&connection, &rom_ids).await.map_err(|e| e.to_string())?;
     let newest_first = |list: &mut Vec<SaveAsset>| {
         list.sort_by_key(|s| std::cmp::Reverse((s.updated_at.as_deref().and_then(parse_timestamp), s.id)));
@@ -72,7 +75,7 @@ pub async fn load(
     };
     newest_first(&mut saves);
     newest_first(&mut states);
-    let mut on_device = tokio::task::spawn_blocking(move || crate::sync::on_device(&store)).await.unwrap_or_default();
+    let mut on_device = tokio::task::spawn_blocking(move || crate::sync::on_device(&store, &roms)).await.unwrap_or_default();
     let mut elsewhere = HashMap::new();
     for save in &saves {
         for sync in save.device_syncs.iter().filter(|s| s.is_current && !s.is_untracked) {

@@ -1722,7 +1722,7 @@ mod tests {
         assert_eq!(fs::read(card.join("01-GALE-save.gci")).unwrap(), b"progress");
         // Against the file it landed in, not the none it was built from — otherwise the Saves page
         // would say the set it has just taken is not on this device.
-        assert_eq!(super::super::on_device(&store), [40].into_iter().collect());
+        assert_eq!(super::super::on_device(&store, &[(1, None)]), [40].into_iter().collect());
         let _ = fs::remove_dir_all(&dir);
     }
 
