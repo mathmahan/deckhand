@@ -137,8 +137,6 @@ pub mod text_size {
     pub const DISPLAY_MEDIUM: f32 = 46.0;
     /// 24 — page titles (the Systems heading, a system's name).
     pub const HEADLINE_SMALL: f32 = 24.0;
-    /// 18 — stat values, the Play button.
-    pub const TITLE_MEDIUM: f32 = 18.0;
     /// 18 — body.
     pub const BODY_LARGE: f32 = 18.0;
     /// 16 — tile titles, section labels. The floor for must-read text.
