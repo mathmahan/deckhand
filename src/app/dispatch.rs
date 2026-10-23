@@ -85,7 +85,7 @@ impl App {
                     // would burn a code that is already spent.
                     self.say(format!("Paired, but the settings file could not be written: {e}"));
                 }
-                self.screen = Screen::Loading { status: "Loading your library…".into() };
+                self.screen = Screen::Loading { status: "Asking RomM for your systems…".into() };
                 // Paired: once the library is in, RetroDECK is offered if it is not here.
                 self.offer_retrodeck = true;
                 Task::batch([Task::done(Message::LoadLibrary), self.ensure_device()])
