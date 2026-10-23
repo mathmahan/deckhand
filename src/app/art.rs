@@ -83,6 +83,13 @@ impl App {
                     }
                 }
             }
+            // The covers at the Downloads rows' left, at a shelf's size, so the two share one copy: the
+            // first few dozen, which is more than a window shows.
+            Screen::Browsing(Route::Downloads) => {
+                for url in self.download_rows().iter().filter_map(|row| row.cover).take(60) {
+                    wanted.push((url.to_string(), covers::Target::tall(px(crate::ui::home::COVER_H)), covers::Kind::Art));
+                }
+            }
             // The covers beside the save sync page's games, at a shelf's size, so the two share one copy.
             Screen::Browsing(Route::Sync { .. }) => {
                 for game in self.sync_covers() {
