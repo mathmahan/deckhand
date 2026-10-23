@@ -94,8 +94,8 @@ pub fn es_system(slug: &str) -> String {
 /// is what lets the emulator swap discs, and RetroArch names the save after it. Otherwise the one
 /// file, or the one entry point (`.cue`, `.chd`…) among several — never a `.bin` track — or the one
 /// file among notes, pictures and patches that can be the game (a cartridge rom). A folder of
-/// files with no entry point (a PS3 game's tree) is the folder, which is how RetroDECK takes a
-/// "directory as a file" game.
+/// files with no entry point (a PS3 game's tree) is the folder, which RPCS3 boots as it is;
+/// RetroDECK is handed what is in it ([`for_retrodeck`]).
 ///
 /// Never a file beside the game — its update, its DLC, an extra, each in a folder of its own below
 /// the game's ([`crate::downloads::layout::beside_the_game`]): an update is not the game, and an
@@ -215,12 +215,18 @@ impl Launcher {
         RetroDeck::detect().map(Launcher::RetroDeck).ok_or_else(|| NO_EMULATOR.to_string())
     }
 
-    /// The argv that plays `rom` as `system`.
-    pub fn command(&self, system: &str, rom: &Path) -> Vec<String> {
-        let rom = rom.to_string_lossy();
+    /// The argv that plays `rom` as `system`. RetroDECK chooses the command itself, unless it would
+    /// choose one that cannot run the game ([`in_place_of_first`]): then it is handed the one that can.
+    pub fn command(&self, system: &str, game: &Path) -> Vec<String> {
+        let rom = game.to_string_lossy();
         match self {
-            Launcher::RetroDeck(_) => {
-                ["flatpak", "run", RETRODECK, "-s", system, &rom].map(String::from).to_vec()
+            Launcher::RetroDeck(rd) => {
+                let mut command = ["flatpak", "run", RETRODECK].map(String::from).to_vec();
+                if let Some(text) = rd.instead(system, game) {
+                    command.extend(["-e".into(), text]);
+                }
+                command.extend(["-s".into(), system.into(), for_retrodeck(game).to_string_lossy().into_owned()]);
+                command
             }
             Launcher::Custom(words) => {
                 let mut command: Vec<String> =
@@ -419,11 +425,13 @@ impl RetroDeck {
 
     /// The emulator RetroDECK will pick for `rom` as `system`, decided the way its `run_game.sh`
     /// decides it: the game's own `<altemulator>` in ES-DE's gamelist, else the system's
-    /// `<alternativeEmulator>`, else the system's first command. The label picks a `<command>` out of
-    /// the first table that defines the system at all — tables are searched per system rather than
-    /// first-file-wins, because RetroDECK ships a custom table that is all comments.
+    /// `<alternativeEmulator>`, else the system's first command — or, where that one cannot run the
+    /// game, the one that can, which RetroDECK is then told ([`in_place_of_first`]). The label picks
+    /// a `<command>` out of the first table that defines the system at all — tables are searched per
+    /// system rather than first-file-wins, because RetroDECK ships a custom table that is all
+    /// comments.
     pub fn emulator(&self, system: &str, rom: &Path) -> Emulator {
-        let (command, label) = self.chosen(system, rom);
+        let Chosen { command, label, .. } = self.chosen(system, rom);
         match (command, label) {
             (Some((label, text)), _) => from_command(&label, &text),
             // No table could be read. ES-DE calls every standalone command "<Name> (Standalone)" and
@@ -438,11 +446,18 @@ impl RetroDeck {
     /// `%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/snes9x_libretro.so %ROM%` — chosen as [`Self::emulator`]
     /// chooses it. What RetroDECK's `-e` takes, filled in by RetroDECK itself.
     pub fn command_text(&self, system: &str, rom: &Path) -> Option<String> {
-        self.chosen(system, rom).0.map(|(_, text)| text)
+        self.chosen(system, rom).command.map(|(_, text)| text)
     }
 
-    /// The command chosen for `rom`, by its label, and the label asked for.
-    fn chosen(&self, system: &str, rom: &Path) -> (Option<(String, String)>, Option<String>) {
+    /// The command to hand RetroDECK with `-e` for `rom`, where it would take another itself — see
+    /// [`in_place_of_first`]. None where its own choice stands.
+    pub fn instead(&self, system: &str, rom: &Path) -> Option<String> {
+        let chosen = self.chosen(system, rom);
+        chosen.replaced.then_some(chosen.command).flatten().map(|(_, text)| text)
+    }
+
+    /// The command chosen for `rom`, and the label asked for.
+    fn chosen(&self, system: &str, rom: &Path) -> Chosen {
         let gamelist = fs::read_to_string(self.es_de.join("gamelists").join(system).join("gamelist.xml")).unwrap_or_default();
         let gamelist = strip_comments(&gamelist);
         let name = rom.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -455,12 +470,49 @@ impl RetroDeck {
             .map(|xml| commands_for(&xml, system))
             .find(|commands| !commands.is_empty())
             .unwrap_or_default();
+        let instead = label.is_none().then(|| in_place_of_first(&commands, rom)).flatten();
         let command = match &label {
             Some(label) => commands.iter().find(|(l, _)| l == label),
-            None => commands.first(),
+            None => instead.or(commands.first()),
         };
-        (command.cloned(), label)
+        Chosen { command: command.cloned(), label, replaced: instead.is_some() }
     }
+}
+
+/// A command out of ES-DE's tables, as [`RetroDeck::chosen`] chooses it.
+struct Chosen {
+    /// Its label and its text.
+    command: Option<(String, String)>,
+    /// The label ES-DE's gamelist asks for, if it asks for one.
+    label: Option<String>,
+    /// Chosen in place of the one RetroDECK would take itself — see [`in_place_of_first`].
+    replaced: bool,
+}
+
+/// Where a PS3 game's tree keeps the program RPCS3 boots.
+const EBOOT: &str = "PS3_GAME/USRDIR/EBOOT.BIN";
+
+/// The command to run `rom` with in place of its system's first, where that one would run it as a
+/// script and it is none. RetroDECK lists *RPCS3 Shortcut*, `%EMULATOR_OS-SHELL% %ROM%`, first for
+/// PS3, for the `.desktop` files RPCS3 writes, and with no emulator chosen in ES-DE it hands that
+/// command a disc image all the same, which then runs as `/bin/sh <game>.iso`. The one whose label
+/// names what `rom` is goes instead: *RPCS3 ISO* for an `.iso`, *RPCS3 Directory* for a game's
+/// folder or its `EBOOT.BIN`. None where the first is fine, or no label says.
+fn in_place_of_first<'a>(commands: &'a [(String, String)], rom: &Path) -> Option<&'a (String, String)> {
+    let (_, first) = commands.first()?;
+    let kind = if rom.is_dir() || rom.ends_with(EBOOT) { "directory".to_string() } else { extension(&rom.to_string_lossy()) };
+    if !first.contains("%EMULATOR_OS-SHELL%") || ["desktop", "sh", "appimage"].contains(&kind.as_str()) {
+        return None;
+    }
+    commands.iter().find(|(label, _)| label.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|word| word == kind))
+}
+
+/// The file RetroDECK is handed for `rom`. A PS3 game's folder goes as its `EBOOT.BIN`, which RPCS3
+/// boots: RetroDECK takes any folder for an ES-DE "directory as a file" and looks inside it for a
+/// file named like the folder, which a PS3 game's tree does not have.
+fn for_retrodeck(rom: &Path) -> PathBuf {
+    let eboot = rom.join(EBOOT);
+    if eboot.is_file() { eboot } else { rom.to_path_buf() }
 }
 
 /// An ES-DE command read for what it runs: `%EMULATOR_RETROARCH% -L %CORE_RETROARCH%/snes9x_libretro.so
@@ -1488,6 +1540,13 @@ mod tests {
     <name>gc</name>
     <command label="Dolphin (Standalone)">%EMULATOR_DOLPHIN% -b -e %ROM%</command>
   </system>
+  <system>
+    <name>ps3</name>
+    <command label="RPCS3 Shortcut (Standalone)">%ENABLESHORTCUTS% %EMULATOR_OS-SHELL% %ROM%</command>
+    <command label="RPCS3 Game Serial (Standalone)">%EMULATOR_RPCS3% --no-gui %RPCS3_GAMEID%:%INJECT%=%BASENAME%.ps3</command>
+    <command label="RPCS3 Directory (Standalone)">%EMULATOR_RPCS3% --no-gui %ROM%</command>
+    <command label="RPCS3 ISO (Standalone)">%EMULATOR_RPCS3% --no-gui %ROM%</command>
+  </system>
 </systemList>"#;
 
     struct Tree(PathBuf);
@@ -1644,6 +1703,45 @@ mod tests {
         );
         assert_eq!(rd.emulator("snes", rom), Emulator::Core("snes9x".into()));
         assert_eq!(rd.emulator("snes", Path::new("/g/snes/Other.sfc")), Emulator::Core("bsnes".into()));
+    }
+
+    /// RetroDECK's PS3 table starts with the command for RPCS3's `.desktop` shortcuts, which runs the
+    /// game as a script: what Deckhand downloads is handed the command for what it is instead.
+    #[test]
+    fn a_ps3_game_is_started_with_the_command_for_what_it_is() {
+        let tree = Tree::new("ps3");
+        let rd = Launcher::RetroDeck(tree.retrodeck());
+        let rpcs3 = "%EMULATOR_RPCS3% --no-gui %ROM%";
+        let label = |rom: &Path| match rd.emulator("ps3", rom) {
+            Emulator::Other(label) => label,
+            other => panic!("{other:?}"),
+        };
+
+        let iso = tree.0.join("roms/ps3/Game/Game.dec.iso");
+        assert_eq!(label(&iso), "RPCS3 ISO (Standalone)");
+        assert_eq!(rd.command("ps3", &iso), ["flatpak", "run", RETRODECK, "-e", rpcs3, "-s", "ps3", &iso.to_string_lossy()]);
+
+        // A game's tree goes as its EBOOT.BIN: RetroDECK would look for Game/Game in the folder.
+        let folder = tree.0.join("roms/ps3/Game");
+        fs::create_dir_all(folder.join("PS3_GAME/USRDIR")).unwrap();
+        fs::write(folder.join(EBOOT), "elf").unwrap();
+        assert_eq!(label(&folder), "RPCS3 Directory (Standalone)");
+        let eboot = folder.join(EBOOT);
+        assert_eq!(rd.command("ps3", &folder), ["flatpak", "run", RETRODECK, "-e", rpcs3, "-s", "ps3", &eboot.to_string_lossy()]);
+
+        // A shortcut is what the first command is for, and RetroDECK chooses it itself.
+        let shortcut = tree.0.join("roms/ps3/Game.desktop");
+        assert_eq!(label(&shortcut), "RPCS3 Shortcut (Standalone)");
+        assert_eq!(rd.command("ps3", &shortcut), ["flatpak", "run", RETRODECK, "-s", "ps3", &shortcut.to_string_lossy()]);
+
+        // A choice made in ES-DE stands, and RetroDECK reads it itself.
+        tree.gamelist("ps3", "<alternativeEmulator><label>RPCS3 Shortcut (Standalone)</label></alternativeEmulator>");
+        assert_eq!(label(&iso), "RPCS3 Shortcut (Standalone)");
+        assert_eq!(rd.command("ps3", &iso), ["flatpak", "run", RETRODECK, "-s", "ps3", &iso.to_string_lossy()]);
+
+        // A system whose first command is not a script is left to RetroDECK, as ever.
+        let snes = Path::new("/g/snes/Game.sfc");
+        assert_eq!(rd.command("snes", snes), ["flatpak", "run", RETRODECK, "-s", "snes", "/g/snes/Game.sfc"]);
     }
 
     #[test]
