@@ -159,14 +159,16 @@ mod tests {
     }
 
     /// A launcher script around an "emulator" that writes its save when asked to close — the shape
-    /// of RetroDECK's launcher and RetroArch, with no sandbox.
+    /// of RetroDECK's launcher and RetroArch, with no sandbox. The emulator is asked only once it says
+    /// it has its trap: seen the moment it is forked, it would end on the request without saving, as
+    /// an emulator asked to close before it has started does.
     #[test]
     fn a_game_asked_to_close_hears_it_where_it_runs_and_ends() {
         let dir = std::env::temp_dir().join(format!("deckhand-processes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let save = dir.join("save");
-        let emulator = format!("trap 'echo written > {}; exit 0' TERM; while :; do sleep 0.1; done", save.display());
+        let (save, ready) = (dir.join("save"), dir.join("ready"));
+        let emulator = format!("trap 'echo written > {}; exit 0' TERM; : > {}; while :; do sleep 0.1; done", save.display(), ready.display());
         let mut launcher = Command::new("sh")
             .args(["-c", &format!("sh -c \"{emulator}\"; echo after")])
             .stdout(Stdio::null())
@@ -175,9 +177,9 @@ mod tests {
         let root = launcher.id();
 
         let mut tree = Tree::default();
-        until("the emulator under the launcher is seen", || {
+        until("the emulator under the launcher is seen, ready to be asked", || {
             tree.look(root);
-            tree.procs.iter().any(|p| p.depth == 1)
+            ready.exists() && tree.procs.iter().any(|p| p.depth == 1)
         });
         assert!(!tree.gone());
         tree.ask_to_close();
