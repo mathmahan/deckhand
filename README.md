@@ -23,7 +23,7 @@ in sync.
 - Every system and RomM collection as a cover grid, and search across them all
 - Downloads to any drive, with multi-disc games, BIOS, updates and DLC taken care of
 - Play through RetroDECK, or an emulator of your own for each system
-- Saves and save states synced both ways, around every launch and as they change
+- Saves and save states synced both ways through [argosy-sigil](https://github.com/rommapp/argosy-sigil)
 - Add games to Steam; games started from ES-DE sync too
 - Made for a gamepad, and updates itself
 
