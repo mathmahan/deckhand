@@ -112,17 +112,17 @@ async fn choose(name: &str, local_time: Option<SystemTime>, remote_time: Option<
 /// on disk. Read from the three indexes, so it costs no request — and it is exact, since an entry
 /// records the very save id the content came from or went up as.
 ///
-/// Only an entry that follows one of `of` counts ([`Entry::follows`]). The indexes hold what was
-/// agreed with every server this device was paired with, and a save id is one server's: another
-/// server, or a rebuilt RomM, numbers its saves from 1 too, so one of them would otherwise be taken
-/// for a save held from the first.
-pub fn on_device(store: &Path, of: &[(i64, Option<Stamp>)]) -> HashSet<i64> {
+/// Only an entry made with this RomM, about one of `of`, counts — `device` is RomM's id for this
+/// device now ([`Entry::held_as`]). The indexes hold what was agreed with every server this device
+/// was paired with, and a save id is one server's: another server, or a rebuilt RomM, numbers its
+/// saves from 1 too, so one of them would otherwise be taken for a save held from the first.
+pub fn on_device(store: &Path, of: &[(i64, Option<Stamp>)], device: Option<&str>) -> HashSet<i64> {
     ["save-index.json", "state-index.json", "standalone-index.json"]
         .iter()
         .flat_map(|file| {
             Index::load(store.join(file))
                 .iter()
-                .filter(|(_, entry)| of.iter().any(|(rom_id, stamp)| entry.follows(*rom_id, stamp.as_ref())))
+                .filter(|(_, entry)| of.iter().any(|(rom_id, stamp)| entry.held_as(device, *rom_id, stamp.as_ref())))
                 .filter(|(key, entry)| {
                     // A set that lies flat on a card it shares records its own files: a Dolphin
                     // memory card's folder is there as long as Dolphin is, so without them the save
@@ -1001,7 +1001,10 @@ impl<'a> Run<'a> {
         let newest = newest_on_server(server, &save.stem, &name);
 
         match (plan(&hash, self.index.agreed(&save.path, rom_id, self.stamp.as_ref()), newest.map(|s| s.id)), newest) {
-            (Plan::InSync, _) => self.report.agreed(Some(rom_id), &name, false),
+            (Plan::InSync, _) => {
+                self.reaffirm(&save.path, rom_id);
+                self.report.agreed(Some(rom_id), &name, false);
+            }
             (Plan::Push, _) => {
                 if self.push(save, rom_id, &name, local, hash).await {
                     self.report.up(Some(rom_id), &name, false);
@@ -1117,13 +1120,31 @@ impl<'a> Run<'a> {
     }
 
     fn remember(&mut self, save: &LocalSave, rom_id: i64, hash: String, save_id: i64, name: &str) -> bool {
-        match self.index.set(&save.path, Entry { rom_id, hash, save_id, stamp: self.stamp.clone(), ..Default::default() }) {
+        let device = self.connection.device_id.clone();
+        match self.index.set(&save.path, Entry { rom_id, hash, save_id, stamp: self.stamp.clone(), device, ..Default::default() }) {
             Ok(()) => true,
             Err(e) => {
                 self.report.fail(Some(rom_id), name, false, format!("synced, but could not record it ({e})"));
                 false
             }
         }
+    }
+
+    /// The agreement on `key` this run has just found still holds, brought up to date: the device it
+    /// is for ([`Entry::device`]), and the rom's stamp where it has none. What lets the Saves page
+    /// count an entry written before either was kept ([`Entry::held_as`]), which a save nobody
+    /// touches would otherwise never be again.
+    ///
+    /// Nothing else changes, and the index is written only when this does. Not news when that write
+    /// fails: the sync stands, and the next one tries again.
+    fn reaffirm(&mut self, key: &Path, rom_id: i64) {
+        let Some(entry) = self.index.agreed(key, rom_id, self.stamp.as_ref()) else { return };
+        let renewed = Entry {
+            device: self.connection.device_id.clone().or_else(|| entry.device.clone()),
+            stamp: entry.stamp.clone().or_else(|| self.stamp.clone()),
+            ..entry.clone()
+        };
+        let _ = self.index.set(key, renewed);
     }
 
     /// Copy a save that is about to be overwritten into the backups folder — see
@@ -1645,7 +1666,7 @@ mod tests {
         fs::create_dir_all(&store).unwrap();
         let here = store.join("here.srm");
         fs::write(&here, "progress").unwrap();
-        let entry = |save_id| Entry { rom_id: 1, hash: "h".into(), save_id, ..Default::default() };
+        let entry = |save_id| Entry { rom_id: 1, hash: "h".into(), save_id, device: Some("deck".into()), ..Default::default() };
         let mut saves = Index::load(store.join("save-index.json"));
         saves.set(&here, entry(10)).unwrap();
         saves.set(&store.join("deleted.srm"), entry(11)).unwrap();
@@ -1667,7 +1688,7 @@ mod tests {
         sets.set(&gci.join("GALE01.gci.zip"), flat(40, "01-GALE-here.gci")).unwrap();
         sets.set(&gci.join("GMSE01.gci.zip"), flat(41, "01-GMSE-deleted.gci")).unwrap();
 
-        let ids = on_device(&store, &[(1, None)]);
+        let ids = on_device(&store, &[(1, None)], Some("deck"));
         assert_eq!(ids, [10, 20, 40].into_iter().collect(), "a deleted save, a missing folder or an emptied card is not here");
         let _ = fs::remove_dir_all(&store);
     }
@@ -1681,16 +1702,55 @@ mod tests {
         fs::write(&here, "progress").unwrap();
         let stamp = |born: &str| Some(Stamp { stem: "here".into(), born: Some(born.into()) });
         let first = stamp("2026-08-01T22:26:48+00:00");
-        let entry = Entry { rom_id: 7, hash: "h".into(), save_id: 10, stamp: first.clone(), ..Default::default() };
-        Index::load(store.join("save-index.json")).set(&here, entry).unwrap();
+        let rebuilt = stamp("2026-10-12T19:00:00+00:00");
+        // A sibling build: RomM lists it without its date, so its stamp is the file name alone, which
+        // a RomM rebuilt from the same library keeps.
+        let sibling = Some(Stamp { stem: "here".into(), born: None });
+        let mut index = Index::load(store.join("save-index.json"));
+        let mut hold = |entry: Entry| index.set(&here, Entry { rom_id: 7, hash: "h".into(), save_id: 10, ..entry }).unwrap();
 
-        assert_eq!(on_device(&store, &[(7, first)]), [10].into_iter().collect());
-        assert!(on_device(&store, &[(9, stamp("2026-10-12T19:00:00+00:00"))]).is_empty(), "another game's page");
+        // Recorded for this device: RomM's id for it is the first RomM's own.
+        hold(Entry { stamp: first.clone(), device: Some("first".into()), ..Default::default() });
+        assert_eq!(on_device(&store, &[(7, first.clone())], Some("first")), [10].into_iter().collect());
+        assert!(on_device(&store, &[(9, first.clone())], Some("first")).is_empty(), "another game's page");
         assert!(
-            on_device(&store, &[(7, stamp("2026-10-12T19:00:00+00:00"))]).is_empty(),
-            "the same id on another server, whose save 10 is some other save"
+            on_device(&store, &[(7, first.clone())], Some("rebuilt")).is_empty(),
+            "the same id and file on a rebuilt RomM, whose save 10 is some other save"
         );
+        hold(Entry { stamp: sibling.clone(), device: Some("first".into()), ..Default::default() });
+        assert_eq!(on_device(&store, &[(7, sibling.clone())], Some("first")), [10].into_iter().collect());
+        assert!(on_device(&store, &[(7, sibling.clone())], Some("rebuilt")).is_empty(), "nor a sibling build's");
+
+        // From before devices were recorded: only by the rom's row, which a rebuilt RomM made anew.
+        hold(Entry { stamp: first.clone(), ..Default::default() });
+        assert_eq!(on_device(&store, &[(7, first.clone())], Some("rebuilt")), [10].into_iter().collect());
+        assert!(on_device(&store, &[(7, rebuilt.clone())], Some("rebuilt")).is_empty());
+        hold(Entry { stamp: sibling.clone(), ..Default::default() });
+        assert!(on_device(&store, &[(7, sibling)], Some("rebuilt")).is_empty(), "a sibling build has no row to go by");
+        hold(Entry::default());
+        assert!(on_device(&store, &[(7, rebuilt)], Some("rebuilt")).is_empty(), "nor an entry from before stamps");
         let _ = fs::remove_dir_all(&store);
+    }
+
+    #[tokio::test]
+    async fn a_save_found_in_sync_records_the_device_and_stamp_it_was_written_without() {
+        let device = Device::new("reaffirm");
+        let path = device.save(&format!("{CHRONO}.srm"), "progress");
+        let before_stamps = Entry { rom_id: 1, hash: md5_hex(b"progress"), save_id: 10, ..Default::default() };
+        Index::load(device.store().join("save-index.json")).set(&path, before_stamps.clone()).unwrap();
+        let stamp = stamp_of(&chrono(), 1);
+        assert!(on_device(&device.store(), &[(1, stamp.clone())], Some("d-1")).is_empty(), "nothing says it is this RomM's");
+
+        let host = stub_server::start(vec![("GET /api/saves", 200, format!("[{}]", server_save(10, "2026-06-29_13-48-43", "2026-06-29T13:48:43Z")))]).await;
+        let install = retroarch::read(&device.root.join("ra/retroarch.cfg")).unwrap();
+        let conn = Connection { device_id: Some("d-1".into()), ..connection(host) };
+        let report = run(&RommClient::new().unwrap(), &conn, &install, &chrono(), &device.store(), &[], None).await.unwrap();
+        assert_eq!(report.in_sync, 1, "{report:?}");
+
+        let entry = Index::load(device.store().join("save-index.json")).get(&path).cloned().unwrap();
+        assert_eq!(entry, Entry { device: Some("d-1".into()), stamp: stamp.clone(), ..before_stamps }, "nothing else changes");
+        assert_eq!(on_device(&device.store(), &[(1, stamp.clone())], Some("d-1")), [10].into_iter().collect());
+        assert!(on_device(&device.store(), &[(1, stamp)], Some("d-2")).is_empty(), "and only for this RomM");
     }
 
     #[tokio::test]

@@ -55,6 +55,13 @@ pub struct Entry {
     /// it was kept, and in one a run without a library to ask wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stamp: Option<Stamp>,
+    /// RomM's id for this device when this was written ([`crate::config::Connection::device_id`]):
+    /// which RomM the agreement was made with. RomM makes the id up at random when a device first
+    /// registers and gives the same one back to it registering again, so another server, or a RomM
+    /// rebuilt from an empty database, knows this device under another. None in an entry from before
+    /// it was kept, and in one written for a RomM this device is not registered with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
 }
 
 impl Entry {
@@ -72,6 +79,32 @@ impl Entry {
                 (Some(then), Some(now)) => then.same_row(now),
                 _ => true,
             }
+    }
+
+    /// Whether this is an agreement this device made with the RomM it now knows it as `device`, about
+    /// the rom `rom_id` stamped `stamp`: a save the Saves page can call on this device.
+    ///
+    /// Stricter than [`Entry::follows`], which lets an entry through wherever nothing says otherwise.
+    /// The index holds the agreements made with every RomM this device was paired with, and a save
+    /// id is only one database's: another server, or a rebuilt RomM, numbers its saves from 1 too.
+    /// So an entry counts only when something says it is this RomM's:
+    ///
+    /// - the device it was written for, which is this one — then the rom is followed as the sync
+    ///   follows it, since the ids are this database's;
+    /// - without one, the very row of RomM's the rom is, by when RomM added it, which both sides
+    ///   have to know. A sibling build is listed without that, and an entry from before stamps has
+    ///   none, so neither counts until a sync that agrees on it records the device
+    ///   ([`super::Run::reaffirm`]).
+    pub fn held_as(&self, device: Option<&str>, rom_id: i64, stamp: Option<&Stamp>) -> bool {
+        match (self.device.as_deref(), device) {
+            (Some(then), Some(now)) => then == now && self.follows(rom_id, stamp),
+            // Written for a RomM that registered this device, and this one has not: another server.
+            (Some(_), None) => false,
+            (None, _) => {
+                self.rom_id == rom_id
+                    && matches!((&self.stamp, stamp), (Some(then), Some(now)) if then.born.is_some() && then.born == now.born)
+            }
+        }
     }
 }
 
@@ -187,6 +220,50 @@ mod tests {
         );
         assert!(entry.follows(7, None), "nothing to say otherwise");
         assert!(Entry { stamp: None, ..entry }.follows(7, Some(&mana)), "an entry from before stamps");
+    }
+
+    #[test]
+    fn a_save_is_held_here_only_where_something_says_it_is_this_romm_s() {
+        let stamp = |born: Option<&str>| Stamp { stem: "Final Fantasy VII (USA) (Disc 2)".into(), born: born.map(str::to_string) };
+        let born = stamp(Some("2026-08-01T22:26:48+00:00"));
+        let rebuilt = stamp(Some("2026-10-12T19:00:00+00:00"));
+        let sibling = stamp(None);
+        let entry = |stamp: Option<Stamp>, device: Option<&str>| Entry {
+            rom_id: 7,
+            hash: "abc".into(),
+            save_id: 42,
+            stamp,
+            device: device.map(str::to_string),
+            ..Default::default()
+        };
+
+        // Written for this device: this RomM's, so the rom is followed as the sync follows it.
+        assert!(entry(Some(sibling.clone()), Some("deck")).held_as(Some("deck"), 7, Some(&sibling)));
+        assert!(entry(None, Some("deck")).held_as(Some("deck"), 7, Some(&born)), "an entry from before stamps");
+        assert!(!entry(Some(born.clone()), Some("deck")).held_as(Some("deck"), 9, Some(&born)), "another game's");
+        assert!(!entry(Some(born.clone()), Some("deck")).held_as(Some("deck"), 7, Some(&rebuilt)), "another row");
+        // Written for another device: another server, or this one rebuilt, which registered this
+        // device afresh — whatever the stamps say.
+        assert!(!entry(Some(sibling.clone()), Some("deck")).held_as(Some("deck-again"), 7, Some(&sibling)));
+        assert!(!entry(Some(born.clone()), Some("deck")).held_as(None, 7, Some(&born)), "a RomM this device is not registered with");
+
+        // From before devices were recorded: only by the rom's very row, which both sides know.
+        assert!(entry(Some(born.clone()), None).held_as(Some("deck"), 7, Some(&born)));
+        assert!(entry(Some(born.clone()), None).held_as(None, 7, Some(&born)));
+        assert!(!entry(Some(born.clone()), None).held_as(Some("deck"), 7, Some(&rebuilt)), "a rebuilt RomM's row");
+        assert!(!entry(Some(sibling.clone()), None).held_as(Some("deck"), 7, Some(&sibling)), "a sibling build, by its file alone");
+        assert!(!entry(Some(born.clone()), None).held_as(Some("deck"), 7, Some(&sibling)), "nothing to say it is the row");
+        assert!(!entry(None, None).held_as(Some("deck"), 7, Some(&born)), "an entry from before stamps");
+        assert!(!entry(Some(born.clone()), None).held_as(Some("deck"), 7, None), "a rom whose row is not known");
+    }
+
+    #[test]
+    fn an_entry_from_before_devices_were_kept_reads_without_one() {
+        let json = r#"{"saves/Game.srm":{"rom_id":7,"hash":"abc","save_id":42}}"#;
+        let entries: BTreeMap<String, Entry> = serde_json::from_str(json).unwrap();
+        assert_eq!(entries["saves/Game.srm"].device, None);
+        let written = serde_json::to_string(&Entry { rom_id: 7, hash: "abc".into(), save_id: 42, ..Default::default() }).unwrap();
+        assert!(!written.contains("device"), "{written}");
     }
 
     #[test]
