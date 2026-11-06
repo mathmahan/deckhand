@@ -583,7 +583,10 @@ impl Run<'_> {
         let local_changed = agreed.as_ref().is_none_or(|e| e.hash != hash);
         let server_changed = pair.remote.is_some_and(|r| agreed.as_ref().is_none_or(|e| !same_version(e, r)));
         match (local_changed, server_changed, pair.remote) {
-            (false, false, _) => self.report.agreed(Some(rom_id), &name, true),
+            (false, false, _) => {
+                self.reaffirm(&pair.key, rom_id);
+                self.report.agreed(Some(rom_id), &name, true);
+            }
             (true, false, remote) => {
                 // A slot new to the index that holds one of the old history's states as it came: RomM
                 // has it, and this slot sends its own up the next time it changes.
@@ -721,7 +724,8 @@ impl Run<'_> {
 
     /// The slot and RomM agree on `hash`, RomM's state `save_id` as it was at `synced_at`.
     fn remember_state(&mut self, key: &Path, rom_id: i64, hash: String, save_id: i64, synced_at: Option<String>, name: &str) -> bool {
-        match self.index.set(key, Entry { rom_id, hash, save_id, synced_at, stamp: self.stamp.clone(), ..Default::default() }) {
+        let device = self.connection.device_id.clone();
+        match self.index.set(key, Entry { rom_id, hash, save_id, synced_at, stamp: self.stamp.clone(), device, ..Default::default() }) {
             Ok(()) => true,
             Err(e) => {
                 self.report.fail(Some(rom_id), name, true, format!("synced, but could not record it ({e})"));

@@ -495,7 +495,10 @@ impl Run<'_> {
         }
         let hash = set_hash(&local);
         match (plan(&hash, self.index.agreed(&bundle.key, rom_id, self.stamp.as_ref()), remote.map(|r| r.id)), remote) {
-            (Plan::InSync, _) => self.report.agreed(Some(rom_id), &name, false),
+            (Plan::InSync, _) => {
+                self.reaffirm(&bundle.key, rom_id);
+                self.report.agreed(Some(rom_id), &name, false);
+            }
             (Plan::Push, _) => {
                 self.push_bundle(bundle, rom_id, tag, &local, hash, &name).await;
             }
@@ -592,7 +595,8 @@ impl Run<'_> {
             Some(written) => written.iter().map(path_name).collect(),
             None => bundle.files.iter().map(|(_, path)| path_name(path)).collect(),
         });
-        match self.index.set(&bundle.key, Entry { rom_id, hash, save_id, files, stamp: self.stamp.clone(), ..Default::default() }) {
+        let device = self.connection.device_id.clone();
+        match self.index.set(&bundle.key, Entry { rom_id, hash, save_id, files, stamp: self.stamp.clone(), device, ..Default::default() }) {
             Ok(()) => true,
             Err(e) => {
                 self.report.fail(Some(rom_id), name, false, format!("synced, but could not record it ({e})"));
@@ -1708,7 +1712,7 @@ mod tests {
         };
         let zipped = pack(&[("01-GALE-save.gci".to_string(), b"progress".to_vec())]).unwrap();
         let host = crate::stub_server::start_bytes(vec![("GET /api/raw/assets/saves/40.zip", 200, zipped)]).await;
-        let conn = Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: None };
+        let conn = Connection { host, token: "t".into(), insecure: false, token_id: None, token_name: None, device_id: Some("deck".into()) };
         let remote: SaveAsset = serde_json::from_value(serde_json::json!({
             "id": 40, "rom_id": 1, "file_name": "GALE01.gci [2026-07-01_10-00-00].zip",
             "updated_at": "2026-07-01T10:00:00Z", "download_path": "/api/raw/assets/saves/40.zip",
@@ -1722,7 +1726,7 @@ mod tests {
         assert_eq!(fs::read(card.join("01-GALE-save.gci")).unwrap(), b"progress");
         // Against the file it landed in, not the none it was built from — otherwise the Saves page
         // would say the set it has just taken is not on this device.
-        assert_eq!(super::super::on_device(&store, &[(1, None)]), [40].into_iter().collect());
+        assert_eq!(super::super::on_device(&store, &[(1, None)], Some("deck")), [40].into_iter().collect());
         let _ = fs::remove_dir_all(&dir);
     }
 
