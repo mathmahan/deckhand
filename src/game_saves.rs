@@ -58,7 +58,8 @@ impl GameSaves {
 
 /// Fetch them: the records from RomM, the "on this device" ids from the indexes in `store` — and from
 /// RomM's own record of which devices hold which save, where it keeps one. `roms` are the game's,
-/// each with its stamp, which an index entry has to follow to count ([`crate::sync::on_device`]).
+/// each with its stamp, which an index entry has to be about, agreed with this RomM, to count
+/// ([`crate::sync::on_device`]).
 /// `core` is the one the game runs under here, which decides the states that land in a slot.
 pub async fn load(
     client: RommClient,
@@ -75,7 +76,9 @@ pub async fn load(
     };
     newest_first(&mut saves);
     newest_first(&mut states);
-    let mut on_device = tokio::task::spawn_blocking(move || crate::sync::on_device(&store, &roms)).await.unwrap_or_default();
+    let device = connection.device_id.clone();
+    let mut on_device =
+        tokio::task::spawn_blocking(move || crate::sync::on_device(&store, &roms, device.as_deref())).await.unwrap_or_default();
     let mut elsewhere = HashMap::new();
     for save in &saves {
         for sync in save.device_syncs.iter().filter(|s| s.is_current && !s.is_untracked) {

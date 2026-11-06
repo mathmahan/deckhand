@@ -1249,6 +1249,7 @@ impl<'a> Run<'a> {
             unconfirmed: !confirmed,
             files: thread.set_files(written),
             stamp: thread.stamp.clone(),
+            device: Some(self.device.clone()),
         };
         let key = thread.key();
         if let Err(e) = self.index(thread).set(&key, entry) {
@@ -1443,6 +1444,7 @@ mod tests {
             unconfirmed: false,
             files: None,
             stamp: None,
+            device: None,
         }
     }
 
