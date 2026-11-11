@@ -349,6 +349,29 @@ pub fn game_mode() -> bool {
         || std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_ascii_lowercase().contains("gamescope"))
 }
 
+/// Started by Steam: the player's own shortcut to Deckhand, or a game's `deckhand play`. Steam names
+/// the game it started in `SteamGameId`, a shortcut as much as a store game.
+fn started_by_steam() -> bool {
+    std::env::var_os("SteamGameId").is_some_and(|id| !id.is_empty() && id != "0")
+}
+
+/// Under Steam on a Wayland desktop, open the window — and the games started from it — through
+/// XWayland. Steam Input gives a pad the game's layout only while the game's window has focus, and it
+/// only sees X11 windows: a native Wayland one never has focus as far as Steam can tell, so the pad
+/// kept the Desktop layout, a Steam Controller worked the mouse, and the virtual pad Deckhand reads
+/// said nothing. Game Mode is left alone: gamescope tells Steam which window has focus itself, which
+/// is why a Deck never showed this. Call before anything starts a thread.
+pub fn x11_for_steam_input() {
+    let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    if started_by_steam() && !game_mode() && set("WAYLAND_DISPLAY") && set("DISPLAY") {
+        // Emptied rather than removed: a Wayland client given none tries `wayland-0`, which on most
+        // desktops is the session's own, so an emulator started from here would still open there.
+        // An empty one names no socket at all, and winit takes it as none.
+        // SAFETY: called first thing in `main`, before any thread exists to read the environment.
+        unsafe { std::env::set_var("WAYLAND_DISPLAY", "") };
+    }
+}
+
 /// The art a shortcut shows, as RomM serves it.
 #[derive(Debug, Clone, Default)]
 pub struct Art {
