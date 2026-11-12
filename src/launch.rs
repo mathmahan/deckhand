@@ -1198,12 +1198,17 @@ const HEARTBEAT: Duration = Duration::from_secs(HEARTBEAT_LASTS.as_secs() / 3);
 /// know this device or does not let it say so is not asked again this session; any other failure is
 /// one heartbeat missed, and the next goes as usual.
 async fn while_playing<T>(ctx: &Context, rom_id: i64, held: Option<&crate::playing::Held>, game: impl Future<Output = T>) -> T {
+    // Each of these runs until the game ends, so each ends in waiting forever. That wait is the
+    // block's last word rather than something returned: `return` of a wait that never finishes is
+    // dead code, and Rust 1.100 says so.
     let ticks = async {
-        let Some(held) = held else { return std::future::pending::<std::convert::Infallible>().await };
-        loop {
-            tokio::time::sleep(crate::playing::TICK).await;
-            held.touch();
+        if let Some(held) = held {
+            loop {
+                tokio::time::sleep(crate::playing::TICK).await;
+                held.touch();
+            }
         }
+        std::future::pending::<std::convert::Infallible>().await
     };
     let Some((conn, device)) = ctx.connection.as_ref().and_then(|c| Some((c, c.device_id.as_deref()?))) else {
         return tokio::select! {
@@ -1216,10 +1221,11 @@ async fn while_playing<T>(ctx: &Context, rom_id: i64, held: Option<&crate::playi
             if let Err(e) = ctx.client.heartbeat(conn, device, rom_id).await
                 && matches!(e.status, 401 | 403 | 404 | 405 | 422)
             {
-                return std::future::pending::<std::convert::Infallible>().await;
+                break;
             }
             tokio::time::sleep(HEARTBEAT).await;
         }
+        std::future::pending::<std::convert::Infallible>().await
     };
     let out = tokio::select! {
         out = game => out,
