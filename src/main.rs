@@ -77,6 +77,8 @@ fn main() -> iced::Result {
     // Before any thread exists — see `memory`.
     memory::gpu_backends();
     memory::tune();
+    // And before a game a Steam shortcut starts through `cli` — see `steam`.
+    steam::x11_for_steam_input();
 
     // `deckhand pre|post|sync` is the save-sync wrapper a launcher calls around a game, and it must
     // be done before anything starts drawing — see `cli`.
