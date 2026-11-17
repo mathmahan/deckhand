@@ -45,7 +45,7 @@ sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2"
 ruzstd = "0.9"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 
-dirs = "6"
+dirs = "7"
 
 # The QR code a phone scans to approve this device in RomM — drawn as an image here, so only the
 # encoder.
