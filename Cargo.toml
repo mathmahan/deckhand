@@ -2,7 +2,7 @@
 name = "deckhand"
 version = "0.9.10"
 edition = "2024"
-rust-version = "1.93"  # edition 2024; sevenz-rust2 0.23 requires 1.93
+rust-version = "1.93"  # edition 2024; sevenz-rust2 0.25 requires 1.93
 description = "A gamepad-first desktop companion for the RomM ROM manager — Rust/iced port"
 license = "MIT"
 # Where new versions are published — see `release`.
@@ -39,7 +39,7 @@ gilrs = "0.11"
 # deflate64 (what Windows' own zipper uses past 2 GB), bzip2 and LZMA.
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma"] }
 # A downloaded rom in a .7z is unpacked too. Pure Rust; reading only.
-sevenz-rust2 = { version = "0.23", default-features = false, features = ["bzip2", "ppmd"] }
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2", "ppmd"] }
 # DuckStation's state pictures, stored raw in its own header, zstd-compressed by default and
 # zlib-compressed by choice. Pure Rust, as above.
 ruzstd = "0.9"
@@ -73,7 +73,7 @@ cc = "1"
 
 [dev-dependencies]
 # Writes the .7z archives the unpacking tests read.
-sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress", "util"] }
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress", "util"] }
 # Renders a page headlessly to a PNG, for looking at one without a window — see the ignored
 # `render_*` tests in `app`.
 iced_test = "0.14"
