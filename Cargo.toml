@@ -53,9 +53,9 @@ qrcode = { version = "0.14", default-features = false }
 
 # Save sync: a save's identity is its content. MD5 rather than anything stronger because it is
 # what RomM's own sync protocol carries as `content_hash`, so the index stays comparable with it.
-md-5 = "0.10"
+md-5 = "0.11"
 # A new AppImage is checked against the SHA-256 its release notes give before it replaces this one.
-sha2 = "0.10"
+sha2 = "0.11"
 # A Steam shortcut's app id is a CRC-32 of its program and name — see `steam`.
 crc32fast = "1"
 
