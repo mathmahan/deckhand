@@ -51,7 +51,7 @@ fn entries(bytes: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
     let mut out = Vec::with_capacity(archive.len());
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).ok()?;
-        let name = entry.name().to_string();
+        let name = entry.name().ok()?.into_owned();
         let mut content = Vec::new();
         if !name.ends_with('/') {
             entry.read_to_end(&mut content).ok()?;
