@@ -171,6 +171,13 @@ impl Unit {
             Err(e) if e.is_not_found() => {
                 return Err("RomM's copy holds none of this game's saves, so the ones here were left as they are".into());
             }
+            // A PCSX2 file card fills up; a folder card shows each game its own saves alone.
+            Err(e) if e.is_no_space() && self.request.layout == "pcsx2_standalone" => {
+                return Err(format!(
+                    "{e}: the PCSX2 memory card it goes on is full — free some space on it, or move to a single folder card \
+                     in slot 1, which doesn't fill up this way"
+                ));
+            }
             Err(e) => return Err(e.to_string()),
         };
         // A file of its own takes RomM's time rather than now, as a battery save always has: a later

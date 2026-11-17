@@ -151,6 +151,10 @@ pub async fn sync(
     stamp: Option<&Stamp>,
     plays: Vec<PlaySession>,
 ) -> Result<Report, String> {
+    // Neither way, states included, until the player settles it: no engine's run of it is safe.
+    if let Some(held) = held_back(emulator, rom) {
+        return Err(held.why);
+    }
     let _one_at_a_time = session::exclusive(store).await?;
     let keys = title_keys(title, rom);
     // Through sigil — see [`super::units`] — and the engine before for a game sigil cannot take.
@@ -955,12 +959,17 @@ fn pcsx2_ini() -> Result<(PathBuf, HashMap<String, String>), String> {
     Ok((ini, settings))
 }
 
+/// PCSX2's memory cards folder: `MemoryCards` in its `PCSX2.ini`, relative to PCSX2's own folder —
+/// the one holding `inis/` — else `memcards` in it.
+fn pcsx2_memcards(ini: &Path, settings: &HashMap<String, String>) -> PathBuf {
+    let base = ini.parent().and_then(Path::parent).unwrap_or(Path::new("/"));
+    settings.get("MemoryCards").map_or_else(|| base.join("memcards"), |m| base.join(m))
+}
+
 /// The folder cards PCSX2 has inserted, from its own `PCSX2.ini`.
 fn pcsx2_cards() -> Result<Vec<PathBuf>, String> {
     let (ini, settings) = pcsx2_ini()?;
-    // Relative to PCSX2's own folder, the one holding `inis/`.
-    let base = ini.parent().and_then(Path::parent).unwrap_or(Path::new("/"));
-    let folder = settings.get("MemoryCards").map_or_else(|| base.join("memcards"), |m| base.join(m));
+    let folder = pcsx2_memcards(&ini, &settings);
     let cards: Vec<PathBuf> = ["Slot1", "Slot2"]
         .iter()
         .filter(|slot| settings.get(&format!("{slot}_Enable")).is_none_or(|v| v.eq_ignore_ascii_case("true")))
@@ -1001,6 +1010,102 @@ fn pcsx2(rom: &Path, server: &[String]) -> Result<Vec<Bundle>, String> {
         }
     }
     Ok(bundles)
+}
+
+/// Why a game's saves must not sync for now, where they must not: what the player has to settle
+/// first, and the files it is about.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldBack {
+    pub why: String,
+    pub cards: Vec<PathBuf>,
+}
+
+/// Whether `emulator`'s saves of the game in `rom` are held back from syncing, and why.
+///
+/// One case so far: a PS2 save on both cards PCSX2 has in its slots, under the same name. sigil keeps
+/// one copy of a name and drops the other — a file card's over a folder card's, whichever is newer
+/// — so the game's unit could be the older save, nothing would go up, and a pull would replace both
+/// copies after backing up only the one it read. Until sigil keeps the newer copy (the test
+/// `sigil_keeps_a_file_cards_copy_of_a_save_over_a_folder_cards` says when), the game is left alone
+/// both ways, and the player told to keep the save on one card.
+pub fn held_back(emulator: Emulator, rom: &Path) -> Option<HeldBack> {
+    if emulator != Emulator::Pcsx2 {
+        return None;
+    }
+    let (ini, settings) = pcsx2_ini().ok()?;
+    on_two_cards(&pcsx2_slot_cards(&ini, &settings), || disc_serials(Emulator::Pcsx2, rom).ok())
+}
+
+/// The cards sigil reads for PCSX2: each slot's, by the name `PCSX2.ini` gives it or sigil's own
+/// default, under PCSX2's memory cards folder — whether the slot is enabled or not, as sigil reads it.
+fn pcsx2_slot_cards(ini: &Path, settings: &HashMap<String, String>) -> Vec<PathBuf> {
+    let folder = pcsx2_memcards(ini, settings);
+    let mut cards: Vec<PathBuf> = crate::sigil::layout("pcsx2_standalone")
+        .map(|layout| layout.options)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|option| option.key.ends_with("_Filename"))
+        .map(|option| folder.join(settings.get(&option.key).filter(|v| !v.is_empty()).unwrap_or(&option.default)))
+        .collect();
+    cards.dedup();
+    cards
+}
+
+/// The game's saves on more than one of `cards`, as a [`HeldBack`]. The game's are told by the disc
+/// serials `serials` gives, read only when some save is on two cards at all.
+fn on_two_cards(cards: &[PathBuf], serials: impl FnOnce() -> Option<Vec<String>>) -> Option<HeldBack> {
+    let mut holding: Vec<(String, Vec<&PathBuf>)> = Vec::new();
+    for card in cards {
+        for name in saves_on_card(card) {
+            match holding.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, on)) => on.push(card),
+                None => holding.push((name, vec![card])),
+            }
+        }
+    }
+    holding.retain(|(_, on)| on.len() > 1);
+    if holding.is_empty() {
+        return None;
+    }
+    let serials = serials()?;
+    holding.retain(|(name, _)| of_serials(Emulator::Pcsx2, name, &serials));
+    if holding.is_empty() {
+        return None;
+    }
+    holding.sort();
+    // In slot order.
+    let involved: Vec<PathBuf> = cards.iter().filter(|c| holding.iter().any(|(_, on)| on.contains(c))).cloned().collect();
+    let card_names: Vec<String> = involved.iter().filter_map(|c| c.file_name()).map(|n| n.to_string_lossy().into_owned()).collect();
+    let names: Vec<&str> = holding.iter().map(|(name, _)| name.as_str()).collect();
+    let (saves, is, it) = match names.as_slice() {
+        [one] => (one.to_string(), "is", "it"),
+        [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "are", "them"),
+        [] => unreachable!("held back only for a save on two cards"),
+    };
+    let why = format!(
+        "{saves} {is} on both of PCSX2's memory cards, {}, and Deckhand can't tell which copy is the one \
+         in play — keep {it} on one card. A single folder card in slot 1, with slot 2 ejected, avoids this",
+        card_names.join(" and "),
+    );
+    Some(HeldBack { why, cards: involved })
+}
+
+/// The names of the saves on a PCSX2 card: a folder card's save folders, a file card's saves as sigil
+/// lists them. None for a card that isn't there or can't be read — the sync says so itself.
+fn saves_on_card(card: &Path) -> Vec<String> {
+    if card.is_file() {
+        return crate::sigil::card_saves(card).unwrap_or_default();
+    }
+    // A folder sigil sees only by the files in it, and never this app's or a file syncer's own.
+    let holds_files = |dir: &Path| fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+    fs::read_dir(card)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().is_dir() && holds_files(&entry.path()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !name.contains("sync-conflict") && !name.contains(".deckhand-"))
+        .collect()
 }
 
 // ---- PPSSPP -------------------------------------------------------------------------------------
@@ -1317,8 +1422,7 @@ pub(super) fn sigil_request(emulator: Emulator, rom: &Path) -> Result<crate::sig
         }
         Emulator::Pcsx2 => {
             let (ini, settings) = pcsx2_ini()?;
-            let base = ini.parent().and_then(Path::parent).unwrap_or(Path::new("/"));
-            let cards = settings.get("MemoryCards").map_or_else(|| base.join("memcards"), |m| base.join(m));
+            let cards = pcsx2_memcards(&ini, &settings);
             ("pcsx2_standalone", "ps2", named(&cards, "memcards", "PCSX2's memory cards folder")?, vec![ini], None)
         }
         Emulator::Ppsspp => {
@@ -1953,5 +2057,78 @@ mod tests {
         profiles(&[ryu, guest], "00000000000000000000000000000099");
         assert_eq!(ryujinx_profile(&base), None, "a user since removed is no one's");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_ps2_save_on_both_inserted_cards_holds_the_game_back_and_says_how_to_fix_it() {
+        use crate::sigil::tests::{ps2_file_card, ps2_folder_card};
+        let root = temp("two-cards");
+        let memcards = root.join("memcards");
+        let (new, old) = (memcards.join("PS2_1.ps2"), memcards.join("Mcd001.ps2"));
+        let san_andreas = || Some(vec!["SLUS-20946".to_string()]);
+        ps2_file_card(&root, "Mcd001.ps2", "BASLUS-20946GTA50000", b"before the move");
+        ps2_folder_card(&root, "PS2_1.ps2", "BASLUS-21590GTA40001", b"another game");
+        assert_eq!(on_two_cards(&[new.clone(), old.clone()], san_andreas), None, "on one card each");
+
+        ps2_folder_card(&root, "PS2_1.ps2", "BASLUS-20946GTA50000", b"played since, on the new card");
+        let mut asked = false;
+        let none = on_two_cards(&[new.clone(), old.clone()], || {
+            asked = true;
+            Some(vec!["SLUS-21590".to_string()])
+        });
+        assert!(asked, "the disc read once a save is on two cards");
+        assert_eq!(none, None, "another game's save on two cards is that game's to settle");
+
+        let held = on_two_cards(&[new.clone(), old.clone()], san_andreas).expect("held back");
+        assert_eq!(held.cards, [new.clone(), old.clone()], "in slot order");
+        assert_eq!(
+            held.why,
+            "BASLUS-20946GTA50000 is on both of PCSX2's memory cards, PS2_1.ps2 and Mcd001.ps2, and Deckhand can't tell \
+             which copy is the one in play — keep it on one card. A single folder card in slot 1, with slot 2 ejected, \
+             avoids this"
+        );
+
+        // Ejected to a card that isn't there, or the save taken off one of them: free to sync again.
+        assert_eq!(on_two_cards(&[new.clone(), memcards.join("Mcd002.ps2")], san_andreas), None);
+        fs::remove_dir_all(new.join("BASLUS-20946GTA50000")).unwrap();
+        assert_eq!(on_two_cards(&[new.clone(), old.clone()], san_andreas), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_folder_cards_with_saves_of_one_game_name_them_all_and_ignore_empty_and_leftover_folders() {
+        let root = temp("folder-cards");
+        let (a, b) = (root.join("memcards/A.ps2"), root.join("memcards/B.ps2"));
+        for card in [&a, &b] {
+            for folder in ["BASLUS-20946GTA50000", "BASLUS-20946GTA50001"] {
+                fs::create_dir_all(card.join(folder)).unwrap();
+                fs::write(card.join(folder).join("SAVE.DAT"), b"save").unwrap();
+            }
+            // Nothing in it is no save to sigil; a syncer's copy is no save at all.
+            fs::create_dir_all(card.join("BASLUS-20946GTA59999")).unwrap();
+            fs::create_dir_all(card.join("BASLUS-20946GTA50000.sync-conflict-1")).unwrap();
+            fs::write(card.join("BASLUS-20946GTA50000.sync-conflict-1/SAVE.DAT"), b"copy").unwrap();
+        }
+        let held = on_two_cards(&[a, b], || Some(vec!["SLUS-20946".to_string()])).expect("held back");
+        assert!(
+            held.why.starts_with("BASLUS-20946GTA50000 and BASLUS-20946GTA50001 are on both of PCSX2's memory cards, A.ps2 and B.ps2"),
+            "{}",
+            held.why
+        );
+        assert!(held.why.contains("keep them on one card"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pcsx2s_slots_name_its_cards_as_sigil_reads_them() {
+        let ini = Path::new("/home/deck/.config/PCSX2/inis/PCSX2.ini");
+        let settings = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+        let cards = pcsx2_slot_cards(ini, &settings(&[("Slot1_Filename", "PS2_1.ps2"), ("Slot2_Filename", "Mcd001.ps2")]));
+        assert_eq!(cards, [PathBuf::from("/home/deck/.config/PCSX2/memcards/PS2_1.ps2"), PathBuf::from("/home/deck/.config/PCSX2/memcards/Mcd001.ps2")]);
+        // Ejected is no name: sigil's default, as the sync's request has it.
+        let moved = settings(&[("MemoryCards", "/run/media/deck/Emulation/memcards"), ("Slot1_Filename", "Mcd001.ps2"), ("Slot2_Filename", "")]);
+        assert_eq!(pcsx2_slot_cards(ini, &moved), [PathBuf::from("/run/media/deck/Emulation/memcards/Mcd001.ps2"), PathBuf::from("/run/media/deck/Emulation/memcards/Mcd002.ps2")]);
+        // One card in both slots is one card.
+        assert_eq!(pcsx2_slot_cards(ini, &settings(&[("Slot2_Filename", "Mcd001.ps2")])), [PathBuf::from("/home/deck/.config/PCSX2/memcards/Mcd001.ps2")]);
     }
 }
