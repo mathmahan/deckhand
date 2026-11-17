@@ -322,6 +322,13 @@ impl Report {
         self.saw(rom_id, name, state, Happened::Failed(why));
     }
 
+    /// Games whose saves were held back, each by its id and title — see [`standalone::held_back`].
+    fn held(&mut self, held: &[(i64, String, standalone::HeldBack)]) {
+        for (rom_id, title, why) in held {
+            self.fail(Some(*rom_id), title, false, &why.why);
+        }
+    }
+
     /// A save changed on both sides, settled — `said` in a line, for [`Report::conflicts`].
     pub(crate) fn settled(&mut self, rom_id: Option<i64>, name: &str, state: bool, kept_here: bool, aside: Option<PathBuf>, said: String) {
         self.conflicts.push(said);
@@ -445,7 +452,14 @@ pub async fn run(
     // another game is reconciled when the window loads the library, and until then its saves wait
     // rather than going up as that game's.
     let games: Vec<&crate::launch::Plan> = games.iter().filter(|g| matcher.holds(g)).collect();
+    // Games whose saves no engine can be trusted with as they lie — see [`standalone::held_back`]:
+    // left alone both ways, RomM not asked about them, and each a failure the player is told of.
+    let mut held: Vec<(i64, String, standalone::HeldBack)> = Vec::new();
     for game in &games {
+        if let Some(why) = held_back(game) {
+            held.push((game.rom_id, game.title.clone(), why));
+            continue;
+        }
         let stamp = matcher.stamp(game.rom_id).or_else(|| game.stamp.clone());
         // Through sigil, whatever runs it — see [`units`]. The engine before is what a game sigil
         // cannot take keeps.
@@ -487,7 +501,7 @@ pub async fn run(
             }
         }
     }
-    let mut scope: Vec<i64> = games.iter().map(|g| g.rom_id).collect();
+    let mut scope: Vec<i64> = games.iter().map(|g| g.rom_id).filter(|id| !held.iter().any(|(held, ..)| held == id)).collect();
     // Only what changed: those games' saves, and RomM asked about those games alone. A watcher's
     // sync after one save was written once read, zipped and hashed every save on the device.
     //
@@ -499,11 +513,14 @@ pub async fn run(
         let touched: HashSet<i64> = threads.iter().filter(|t| t.covers(changed)).map(|t| t.rom_id).collect();
         threads.retain(|t| touched.contains(&t.rom_id));
         scope.retain(|id| touched.contains(id));
+        // A held game is told of again when its own cards were written, not on every change.
+        held.retain(|(.., why)| why.cards.iter().any(|card| changed.iter().any(|path| path.starts_with(card))));
         unmatched.clear();
         states = changed_states(client, connection, install, store, &games, builds, changed).await;
         if threads.is_empty() && scope.is_empty() {
             let mut report = Report { folder: install.saves.clone(), ..Report::default() };
             report.absorb(states);
+            report.held(&held);
             return Ok(report);
         }
     }
@@ -532,12 +549,14 @@ pub async fn run(
                 report.notes.push(format!("{others} older copies kept under another core's folder were left as they are"));
             }
             report.absorb(states);
+            report.held(&held);
             Ok(report)
         }
         Outcome::Unsupported(why) => {
             let mut report = sweep(client, connection, install, builds, store, changed).await?;
             report.notes.push(format!("synced without a RomM sync session: {why}"));
             report.absorb(states);
+            report.held(&held);
             Ok(report)
         }
     }
@@ -596,6 +615,12 @@ fn runner(game: &crate::launch::Plan) -> Option<units::Runner<'_>> {
     }
 }
 
+/// Why `game`'s saves are held back from syncing, where they are — see [`standalone::held_back`].
+fn held_back(game: &crate::launch::Plan) -> Option<standalone::HeldBack> {
+    let crate::launch::Emulator::Other(name) = &game.emulator else { return None };
+    standalone::held_back(standalone::Emulator::for_launch(&game.system, name)?, &game.rom)
+}
+
 /// The game a local save belongs to: the one it was matched to before, else by its name.
 fn rom_of(matcher: &Matcher, index: &Index, save: &LocalSave) -> Match {
     // A save matched once stays with that game: a rename in the library must not move it. Only while
@@ -620,6 +645,9 @@ fn modified(path: &Path) -> Option<SystemTime> {
 /// `install` is RetroArch's, which only a game RetroArch runs needs — a standalone emulator's game
 /// goes on without one.
 pub fn threads_of(install: Result<&Install, &str>, game: &crate::launch::Plan) -> Result<Vec<Thread>, String> {
+    if let Some(held) = held_back(game) {
+        return Err(held.why);
+    }
     if let Some(runner) = runner(game)
         && let Ok(thread) = units::thread(units::Game::of(game, game.stamp.as_ref()), runner, install)
     {

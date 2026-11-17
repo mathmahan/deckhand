@@ -49,6 +49,11 @@ impl Error {
     pub fn is_not_found(&self) -> bool {
         self.code == ffi::SIGIL_ERR_NOT_FOUND
     }
+
+    /// A save that does not fit on the card or volume it goes on.
+    pub fn is_no_space(&self) -> bool {
+        self.code == ffi::SIGIL_ERR_NO_SPACE
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -751,6 +756,54 @@ pub fn layout(layout: &str) -> Option<Layout> {
     all.iter().find(|l| l.id == layout).or_else(|| all.iter().find(|l| l.id == "libretro")).cloned()
 }
 
+/// The names of the saves on the memory card file at `path` — a PS2 card's `BASLUS-20946GTA50000`.
+/// sigil tells the format from the content; one it cannot read is an error.
+///
+/// Remembered for as long as the file is unchanged, as [`identify`] remembers a disc: a sync over
+/// every game on the device asks once for each game the card holds.
+pub fn card_saves(path: &Path) -> Result<Vec<String>, Error> {
+    type Key = (PathBuf, u64, Option<SystemTime>);
+    type Listed = Result<Vec<String>, Error>;
+    static SEEN: OnceLock<Mutex<HashMap<Key, Listed>>> = OnceLock::new();
+    let meta = fs::metadata(path).map_err(|e| Error { code: -2, message: e.to_string(), problem: Some(path.display().to_string()) })?;
+    let key: Key = (path.to_path_buf(), meta.len(), meta.modified().ok());
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return known.clone();
+    }
+    let found = list_card(path);
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    // Only the card as it is now: an older listing of the same file is never asked for again.
+    seen.retain(|(p, ..), _| p != path);
+    seen.insert(key, found.clone());
+    found
+}
+
+fn list_card(path: &Path) -> Result<Vec<String>, Error> {
+    let file = c_path(path)?;
+    // SAFETY: a valid path; NULL when it cannot be opened.
+    let io = unsafe { ffi::sigil_io_open_file(file.as_ptr()) };
+    if io.is_null() {
+        return Err(Error { code: -2, message: "can't open it".into(), problem: Some(path.display().to_string()) });
+    }
+    let mut listing: *mut ffi::sigil_card_listing = std::ptr::null_mut();
+    // SAFETY: an open stream, and a place for the listing sigil allocates.
+    let rc = unsafe { ffi::sigil_card_list(io, &mut listing) };
+    // SAFETY: opened above, closed once.
+    unsafe { ffi::sigil_io_close(io) };
+    if rc != ffi::SIGIL_OK || listing.is_null() {
+        return Err(Error::new(rc, Some(path.display().to_string())));
+    }
+    // SAFETY: a listing sigil filled in, its `entry_count` entries alive until it is freed below.
+    let names = unsafe {
+        let listing = &*listing;
+        slice(listing.entries, listing.entry_count).iter().map(|e| text(&e.name)).collect()
+    };
+    // SAFETY: freed once.
+    unsafe { ffi::sigil_card_listing_free(listing) };
+    Ok(names)
+}
+
 // ---- Strings and arrays across the boundary ----------------------------------------------------
 
 fn c_path(path: &Path) -> Result<CString, Error> {
@@ -796,7 +849,7 @@ fn fill(buf: &mut [c_char], value: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn temp(name: &str) -> PathBuf {
@@ -824,6 +877,8 @@ mod tests {
             assert_eq!(size_of::<ffi::sigil_layout_info>(), ffi::deckhand_sigil_sizeof_layout_info());
             assert_eq!(size_of::<ffi::sigil_sync_request>(), ffi::deckhand_sigil_sizeof_sync_request());
             assert_eq!(size_of::<ffi::sigil_sync_result>(), ffi::deckhand_sigil_sizeof_sync_result());
+            assert_eq!(size_of::<ffi::sigil_card_entry>(), ffi::deckhand_sigil_sizeof_card_entry());
+            assert_eq!(size_of::<ffi::sigil_card_listing>(), ffi::deckhand_sigil_sizeof_card_listing());
             assert_eq!(offset_of!(ffi::sigil_sync_result, unowned_changed), ffi::deckhand_sigil_offsetof_sync_result_unowned_changed());
             assert_eq!(offset_of!(ffi::sigil_sync_request, repair), ffi::deckhand_sigil_offsetof_sync_request_repair());
             assert_eq!(offset_of!(ffi::sigil_save_unit, alternate_count), ffi::deckhand_sigil_offsetof_save_unit_alternate_count());
@@ -1114,5 +1169,65 @@ mod tests {
         assert_eq!(subdirs("eden"), ["nand/user/save/0000000000000000", "nand/system/save/8000000000000010/su/avators"]);
         assert_eq!(platform_of("gc"), Some("gamecube"));
         assert_eq!(platform_of("genesis"), None);
+    }
+
+    /// A PCSX2 folder card `card` under `root/memcards`, holding save folder `folder`.
+    pub(crate) fn ps2_folder_card(root: &Path, card: &str, folder: &str, save: &[u8]) {
+        let dir = root.join("memcards").join(card).join(folder);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SAVE.DAT"), save).unwrap();
+        fs::write(dir.join("icon.sys"), b"icon").unwrap();
+    }
+
+    /// San Andreas's saves under PCSX2 rooted at `root`, with these cards in its slots.
+    pub(crate) fn san_andreas(root: &Path, slot1: &str, slot2: &str) -> Request {
+        Request {
+            layout: "pcsx2_standalone".into(),
+            platform: Some("ps2".into()),
+            content: PathBuf::from("/roms/ps2/Grand Theft Auto - San Andreas (USA).chd"),
+            // FOLDER_PREFIX: every folder starting with BASLUS-20946.
+            identity: Some(Identity::made_up("ps2", "SLUS-20946", "BASLUS-20946", 1)),
+            options: vec![("Slot1_Filename".into(), slot1.into()), ("Slot2_Filename".into(), slot2.into())],
+            root: root.to_path_buf(),
+            profile: None,
+            game_ids: vec!["SLUS-20946".into()],
+        }
+    }
+
+    /// A PCSX2 file card `card` under `root/memcards` holding `folder`: sigil's own unit of a folder
+    /// card with it, which is an 8 MB card image.
+    pub(crate) fn ps2_file_card(root: &Path, card: &str, folder: &str, save: &[u8]) {
+        let scratch = root.join(format!(".{card}-scratch"));
+        ps2_folder_card(&scratch, "Mcd001.ps2", folder, save);
+        let unit = san_andreas(&scratch, "Mcd001.ps2", "Mcd002.ps2").collect(None).unwrap();
+        fs::create_dir_all(root.join("memcards")).unwrap();
+        fs::write(root.join("memcards").join(card), unit.data.expect("a card with the save on it")).unwrap();
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_memory_card_lists_its_saves_by_name() {
+        let root = temp("card-saves");
+        ps2_file_card(&root, "Mcd001.ps2", "BASLUS-20946GTA50000", b"grove street");
+        assert_eq!(card_saves(&root.join("memcards/Mcd001.ps2")).unwrap(), ["BASLUS-20946GTA50000"]);
+        fs::write(root.join("notes.txt"), b"not a card").unwrap();
+        assert!(card_saves(&root.join("notes.txt")).is_err());
+        assert!(card_saves(&root.join("missing.ps2")).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// What [`crate::sync::standalone`] holds a game back for. Should this start failing after a
+    /// sigil update — sigil keeping the newer copy, or refusing — that stopgap can go.
+    #[test]
+    fn sigil_keeps_a_file_cards_copy_of_a_save_over_a_folder_cards() {
+        let root = temp("two-cards");
+        ps2_file_card(&root, "Mcd001.ps2", "BASLUS-20946GTA50000", b"before the move");
+        let old = san_andreas(&root, "Mcd001.ps2", "Mcd002.ps2").collect(None).unwrap().content_hash;
+        ps2_folder_card(&root, "PS2_1.ps2", "BASLUS-20946GTA50000", b"played since, on the new card");
+        let new = san_andreas(&root, "PS2_1.ps2", "Mcd002.ps2").collect(None).unwrap().content_hash;
+        assert_ne!(old, new);
+        let both = san_andreas(&root, "PS2_1.ps2", "Mcd001.ps2").collect(None).unwrap().content_hash;
+        assert_eq!(both, old, "slot 1's newer copy is dropped for slot 2's file card's");
+        let _ = fs::remove_dir_all(&root);
     }
 }
