@@ -967,7 +967,7 @@ pub(crate) mod tests {
         let unit = request.collect(None).unwrap();
         let data = unit.data.unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(data.clone())).unwrap();
-        let mut names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().to_string()).collect();
+        let mut names: Vec<String> = (0..zip.len()).map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned()).collect();
         names.sort();
         assert_eq!(names, ["ULUS10538/SD.BIN", "ULUS10538DATA00/DATA.BIN"], "its folders, and not a half-written file or another game's");
         assert_eq!(unit.content_hash, crate::sync::hash::of_upload(&data), "RomM's hash of a zip");

@@ -660,7 +660,9 @@ pub(super) fn unpack(
         if entry.is_dir() {
             continue;
         }
-        let relative = entry.enclosed_name().ok_or_else(|| format!("{} would land outside the save folder", entry.name()))?;
+        let relative = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("{} would land outside the save folder", String::from_utf8_lossy(entry.name_raw())))?;
         // Flat sets live straight in the card folder, whatever path the zip gave them.
         let relative = if folder { relative } else { PathBuf::from(relative.file_name().unwrap_or_default()) };
         let mut content = Vec::new();
