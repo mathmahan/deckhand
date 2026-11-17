@@ -94,10 +94,11 @@ fn entries(archive: &Path) -> Result<Vec<Entry>, Failure> {
             (0..zip.len())
                 .map(|index| {
                     let entry = zip.by_index_raw(index).map_err(|e| Failure::Unreadable(format!("{name}: {e}")))?;
+                    let inside = entry.name().map_err(|e| Failure::Unreadable(format!("{name}: {e}")))?.into_owned();
                     Ok(Entry {
                         index,
-                        name: entry.name().to_string(),
-                        relative: safe_relative(entry.name()),
+                        relative: safe_relative(&inside),
+                        name: inside,
                         size: entry.size(),
                         directory: entry.is_dir(),
                     })

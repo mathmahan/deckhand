@@ -213,7 +213,7 @@ pub fn install(target: &Target, source: &Path, firmware: &[Firmware], store: &Pa
 /// The NCA names the firmware `zip` leaves in `kind`'s registered folder, sorted.
 fn nca_names(zip: &Path, kind: Kind) -> Result<Vec<String>, String> {
     let archive = zip::ZipArchive::new(fs::File::open(zip).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    let mut names: Vec<String> = archive.file_names().filter_map(|entry| placed(entry, kind)).collect();
+    let mut names: Vec<String> = archive.file_names().filter_map(|entry| placed(&entry.ok()?, kind)).collect();
     names.sort();
     names.dedup();
     Ok(names)
@@ -264,7 +264,7 @@ fn unpack(zip: &Path, registered: &Path, kind: Kind) -> Result<(), String> {
     let unpacked = (|| -> Result<(), String> {
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-            let Some(name) = placed(entry.name(), kind) else { continue };
+            let Some(name) = entry.name().ok().and_then(|name| placed(&name, kind)) else { continue };
             // The name came from the zip: one plain name, or nothing is written under it.
             if name.contains(['/', '\\']) || name.starts_with('.') {
                 continue;

@@ -37,7 +37,7 @@ gilrs = "0.11"
 # Standalone emulators' saves travel to RomM as one zip per game's save set, the format the
 # Kotlin app uses — and a downloaded rom in a zip is unpacked. Pure Rust throughout: deflate,
 # deflate64 (what Windows' own zipper uses past 2 GB), bzip2 and LZMA.
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64", "bzip2", "lzma"] }
 # A downloaded rom in a .7z is unpacked too. Pure Rust; reading only.
 sevenz-rust2 = { version = "0.23", default-features = false, features = ["bzip2", "ppmd"] }
 # DuckStation's state pictures, stored raw in its own header, zstd-compressed by default and
