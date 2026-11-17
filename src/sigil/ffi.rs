@@ -17,6 +17,7 @@ pub const SIGIL_OK: c_int = 0;
 pub const SIGIL_ERR_UNSUPPORTED_FORMAT: c_int = -4;
 pub const SIGIL_ERR_NOT_FOUND: c_int = -5;
 pub const SIGIL_ERR_CONFLICT: c_int = -9;
+pub const SIGIL_ERR_NO_SPACE: c_int = -11;
 
 pub const SIGIL_SAVE_SHAPE_NONE: c_int = 0;
 pub const SIGIL_SAVE_SHAPE_SINGLE: c_int = 1;
@@ -35,6 +36,7 @@ pub const SIGIL_SAVE_ENTRY_MAX: usize = 256;
 pub const SIGIL_PROFILE_ID_MAX: usize = 64;
 pub const SIGIL_PROFILE_NAME_MAX: usize = 64;
 pub const SIGIL_CARD_NAME_MAX: usize = 64;
+pub const SIGIL_CARD_OWNER_MAX: usize = 16;
 pub const SIGIL_LAYOUT_OPTION_VALUES: usize = 8;
 pub const SIGIL_LAYOUT_OPTIONS: usize = 16;
 
@@ -83,6 +85,30 @@ pub struct sigil_options {
 #[repr(C)]
 pub struct sigil_io {
     _private: [u8; 0],
+}
+
+/// One save on a memory card, as `sigil_card_list` lists it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct sigil_card_entry {
+    pub name: [c_char; SIGIL_CARD_NAME_MAX],
+    pub owner_id: [c_char; SIGIL_CARD_OWNER_MAX],
+    pub blocks: u32,
+    pub first_block: u32,
+}
+
+#[repr(C)]
+pub struct sigil_card_listing {
+    pub struct_version: u32,
+    pub format: c_int,
+    pub total_blocks: u32,
+    pub free_blocks: u32,
+    pub free_slots: u32,
+    pub corrupt_count: u32,
+    pub entries: *mut sigil_card_entry,
+    pub entry_count: usize,
+    pub corrupt_entries: *mut sigil_card_entry,
+    pub corrupt_entry_count: usize,
 }
 
 #[repr(C)]
@@ -249,6 +275,10 @@ unsafe extern "C" {
     pub fn sigil_platform_from_slug(slug: *const c_char) -> sigil_platform;
     pub fn sigil_platform_to_slug(platform: sigil_platform) -> *const c_char;
     pub fn sigil_io_open_file(path: *const c_char) -> *mut sigil_io;
+    pub fn sigil_io_close(io: *mut sigil_io);
+
+    pub fn sigil_card_list(io: *const sigil_io, out: *mut *mut sigil_card_listing) -> c_int;
+    pub fn sigil_card_listing_free(listing: *mut sigil_card_listing);
 
     pub fn sigil_save_resolve(req: *const sigil_save_request, out: *mut *mut sigil_save_unit) -> c_int;
     pub fn sigil_save_unit_free(unit: *mut sigil_save_unit);
@@ -275,6 +305,8 @@ unsafe extern "C" {
     pub fn deckhand_sigil_sizeof_layout_info() -> usize;
     pub fn deckhand_sigil_sizeof_sync_request() -> usize;
     pub fn deckhand_sigil_sizeof_sync_result() -> usize;
+    pub fn deckhand_sigil_sizeof_card_entry() -> usize;
+    pub fn deckhand_sigil_sizeof_card_listing() -> usize;
     pub fn deckhand_sigil_offsetof_sync_result_unowned_changed() -> usize;
     pub fn deckhand_sigil_offsetof_sync_request_repair() -> usize;
     pub fn deckhand_sigil_offsetof_save_unit_alternate_count() -> usize;

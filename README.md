@@ -47,6 +47,12 @@ in sync.
 For Switch, pick Eden or Ryubing in Settings ▸ Playing ▸ *Emulator for each system*. Keys and
 firmware uploaded to RomM's Switch platform are put in place for it.
 
+For PlayStation 2, keep PCSX2 to one memory card, in slot 1, with slot 2 ejected. A folder card is
+best: PCSX2 shows each game only its own saves on one, so it doesn't fill up. A game whose save is on
+both inserted cards isn't synced until it's on just one, since there's no telling which copy is
+current. To move from a file card, convert it in PCSX2 (Settings ▸ Memory Cards) and put the new
+card in slot 1.
+
 ## Getting started
 
 Download the AppImage from [Releases](https://github.com/mathmahan/deckhand/releases) and run it. You
