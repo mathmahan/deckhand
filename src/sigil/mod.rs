@@ -416,8 +416,11 @@ impl Request {
             unsafe { ffi::sigil_save_unit_free(out) };
             return Err(Error::new(rc, None));
         }
-        // SAFETY: on success `out` is a unit sigil allocated, read here and freed below.
-        let unit = unsafe { &*out };
+        // SAFETY: on success `out` is a unit sigil allocated, read here and freed below — or NULL,
+        // which sigil never answers a success with, and which is no unit to read.
+        let Some(unit) = (unsafe { out.as_ref() }) else {
+            return Err(Error { code: -1, message: "sigil resolved no unit".into(), problem: None });
+        };
         let member = |m: &ffi::sigil_save_member| Member { path: self.root.join(text(&m.path)), entry: text(&m.entry) };
         // SAFETY: arrays of the counts sigil gave.
         let members = unsafe { slice(unit.members, unit.member_count) }.iter().map(member).collect();
@@ -791,17 +794,17 @@ fn list_card(path: &Path) -> Result<Vec<String>, Error> {
     let rc = unsafe { ffi::sigil_card_list(io, &mut listing) };
     // SAFETY: opened above, closed once.
     unsafe { ffi::sigil_io_close(io) };
-    if rc != ffi::SIGIL_OK || listing.is_null() {
-        return Err(Error::new(rc, Some(path.display().to_string())));
-    }
-    // SAFETY: a listing sigil filled in, its `entry_count` entries alive until it is freed below.
-    let names = unsafe {
-        let listing = &*listing;
-        slice(listing.entries, listing.entry_count).iter().map(|e| text(&e.name)).collect()
+    // SAFETY: a listing sigil filled in on success, its `entry_count` entries alive until it is
+    // freed below; NULL where it filled in none.
+    let names = match unsafe { listing.as_ref() } {
+        // SAFETY: the entries of the listing just read, as many as it says.
+        Some(found) if rc == ffi::SIGIL_OK => Ok(unsafe { slice(found.entries, found.entry_count) }.iter().map(|e| text(&e.name)).collect()),
+        None if rc == ffi::SIGIL_OK => Err(Error { code: -1, message: "sigil listed no card".into(), problem: Some(path.display().to_string()) }),
+        _ => Err(Error::new(rc, Some(path.display().to_string()))),
     };
-    // SAFETY: freed once.
+    // SAFETY: what sigil allocated, or NULL, which it takes; freed once.
     unsafe { ffi::sigil_card_listing_free(listing) };
-    Ok(names)
+    names
 }
 
 // ---- Strings and arrays across the boundary ----------------------------------------------------
