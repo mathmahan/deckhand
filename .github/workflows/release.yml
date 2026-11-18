@@ -15,6 +15,10 @@ on:
   push:
     tags: ['[0-9]*']
 
+# The build only reads the code; the draft job asks for what it writes on its own.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
